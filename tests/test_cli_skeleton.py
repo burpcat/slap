@@ -9,9 +9,9 @@ from pathlib import Path
 
 SLAP_PY = Path(__file__).resolve().parent.parent / "slap.py"
 ALL_COMMANDS = ["list", "send", "dashboard", "doctor", "domains", "rebuild"]
-# 'list' (step 3) and 'rebuild' (step 5) are wired to real implementations
-# and are no longer stubs — see their dedicated tests below.
-NO_ARG_COMMANDS = ["dashboard", "doctor", "domains"]
+# 'list' (step 3), 'rebuild' (step 5), and 'domains' (step 7) are wired to
+# real implementations and are no longer stubs — see their dedicated tests.
+NO_ARG_COMMANDS = ["dashboard", "doctor"]
 
 
 def run(*args, cwd=None):
@@ -107,3 +107,22 @@ def test_rebuild_works_on_a_fresh_db(tmp_path):
     assert "0 recipients" in result.stdout
     assert "0 events" in result.stdout
     assert (tmp_path / "slap.db").exists()
+
+
+def test_domains_works_on_a_fresh_db(tmp_path):
+    # Isolated cwd for the same reason as rebuild above — 'domains' also
+    # creates slap.db in the CWD via tracking.connect().
+    (tmp_path / "consumer_domains.txt").write_text(
+        (Path(__file__).resolve().parent.parent / "consumer_domains.txt").read_text()
+    )
+    result = run("domains", cwd=tmp_path)
+    assert result.returncode == 0
+    assert "No contacts tracked yet." in result.stdout
+    assert (tmp_path / "slap.db").exists()
+
+
+def test_domains_fails_loud_without_consumer_domains_file(tmp_path):
+    result = run("domains", cwd=tmp_path)
+    assert result.returncode != 0
+    assert "consumer_domains.txt" in result.stderr
+    assert not (tmp_path / "slap.db").exists()  # fails before ever touching the DB

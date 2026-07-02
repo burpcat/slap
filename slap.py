@@ -8,7 +8,7 @@ import argparse
 import sys
 
 from slap.config import ConfigError, discover_campaigns, load_campaign, load_global_config
-from slap import tracking
+from slap import domains, tracking
 
 
 def cmd_list(args):
@@ -55,10 +55,24 @@ def cmd_doctor(args):
 
 
 def cmd_domains(args):
-    sys.exit(
-        "slap: 'domains' is not yet implemented — Build Order step 7 "
-        "(domain/recipient dedup + domains command). See SLAP_BUILD_PROMPT.md §14."
-    )
+    try:
+        consumer_domains = domains.load_consumer_domains()
+    except domains.DomainsError as e:
+        sys.exit(f"slap: {e}")
+
+    conn = tracking.connect()
+    index = domains.domain_index(conn)
+    if not index:
+        print("No contacts tracked yet.")
+        return
+
+    for domain in sorted(index):
+        tag = " (consumer)" if domain in consumer_domains else ""
+        contacts = index[domain]
+        print(f"{domain}{tag} — {len(contacts)} contact(s)")
+        for ctx in contacts:
+            state = "replied" if ctx.replied_at else ctx.status
+            print(f"  {ctx.recipient}  campaign={ctx.campaign}  {state}  first_sent={ctx.first_sent_at}")
 
 
 def cmd_rebuild(args):
