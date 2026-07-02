@@ -1,0 +1,24 @@
+# Copy to config.yaml and fill in your own sender details.
+# See SLAP_BUILD_PROMPT.md §4 for the full schema; slap/config.py enforces it.
+sender:
+  from_email: everythingforgenius@gmail.com
+  from_name: <Owner Name>
+
+gmass:
+  api_key_env: GMASS_API_KEY # read from env; never store the key here
+
+personas: # cadences are FIXED per persona
+  hiring_manager: { stages: [2, 4, 6] }
+  recruiter: { stages: [2, 3, 5] }
+  founder: { stages: [2, 5, 7] }
+
+schedule:
+  fire_window_start: "09:00" # runner rolls a random fire moment in this window
+  fire_window_end: "09:15"
+  send_delay_min: 10 # seconds between emails during a drain
+  send_delay_max: 15
+  daily_cap: 500 # Gmail ceiling; drain stops here, overflow re-queues
+  drain_retries: 3 # transient-failure retries before surfacing run_failed
+
+tracking:
+  consumer_domains_file: consumer_domains.txt

@@ -7,12 +7,29 @@ current build state / package layout.
 import argparse
 import sys
 
+from slap.config import ConfigError, discover_campaigns, load_campaign, load_global_config
+from slap import tracking
+
 
 def cmd_list(args):
-    sys.exit(
-        "slap: 'list' is not yet implemented — Build Order step 3 "
-        "(config loader + campaign auto-discovery). See SLAP_BUILD_PROMPT.md §14."
-    )
+    try:
+        global_config = load_global_config()
+    except ConfigError as e:
+        sys.exit(f"slap: {e}")
+
+    names = discover_campaigns()
+    if not names:
+        print("No campaigns found under campaigns/.")
+        return
+
+    for name in names:
+        try:
+            campaign = load_campaign(name, global_config)
+        except ConfigError as e:
+            print(f"{name}: ERROR — {e}")
+            continue
+        latex_state = "latex on" if campaign.latex_enabled else "latex off"
+        print(f"{name}  persona={campaign.persona}  {latex_state}")
 
 
 def cmd_send(args):
@@ -45,10 +62,11 @@ def cmd_domains(args):
 
 
 def cmd_rebuild(args):
-    sys.exit(
-        "slap: 'rebuild' is not yet implemented — Build Order step 5 "
-        "(tracking store + rebuild). See SLAP_BUILD_PROMPT.md §14."
-    )
+    conn = tracking.connect()
+    event_count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    tracking.rebuild(conn)
+    recipient_count = conn.execute("SELECT COUNT(*) FROM recipients").fetchone()[0]
+    print(f"Rebuilt recipients cache ({recipient_count} recipients) from {event_count} events.")
 
 
 def build_parser():

@@ -9,5 +9,16 @@ __pycache__/
 # probe outputs (raw captures are auditable but not committed)
 probes/findings/
 
+# tracking store (runtime data, not source)
+slap.db
+slap.db-journal
+slap.db-wal
+slap.db-shm
+
 # macOS
 .DS_Store
+
+# Claude Code tooling/config and internal build docs — kept local, not committed
+.claude/
+CONTROL_SHEET.md
+SLAP_BUILD_PROMPT.md

@@ -1,0 +1,205 @@
+"""Config loader tests (Build Order step 3), per SLAP_BUILD_PROMPT.md §13 B:
+valid load; missing stage file for a defined cadence fails loud; initial.txt
+without Subject/blank-line fails loud; auto-discovery finds folders.
+"""
+import pytest
+
+from slap.config import ConfigError, discover_campaigns, load_campaign, load_global_config
+
+VALID_CONFIG_YAML = """
+sender:
+  from_email: everythingforgenius@gmail.com
+  from_name: Test Owner
+
+gmass:
+  api_key_env: GMASS_API_KEY
+
+personas:
+  hiring_manager: { stages: [2, 4, 6] }
+  recruiter:      { stages: [2, 3, 5] }
+  founder:        { stages: [2, 5, 7] }
+
+schedule:
+  fire_window_start: "09:00"
+  fire_window_end:   "09:15"
+  send_delay_min: 10
+  send_delay_max: 15
+  daily_cap: 500
+  drain_retries: 3
+
+tracking:
+  consumer_domains_file: consumer_domains.txt
+"""
+
+VALID_CAMPAIGN_YAML = """
+persona: recruiter
+latex:
+  enabled: true
+  attachment_name: "Firstname_Lastname_Resume.pdf"
+fields:
+  - { key: email,        label: Email }
+  - { key: role_catted,  label: Role }
+  - { key: company,      label: Company }
+  - { key: req_id,       label: Req ID, optional: true }
+  - { key: byebye,       label: Signoff }
+"""
+
+VALID_INITIAL_TXT = "Subject: Quick note about the {{role_catted}} role at {{company}}\n\nHi {{company}} team,\n{{byebye}}\n"
+
+
+def write_global_config(tmp_path, text=VALID_CONFIG_YAML):
+    path = tmp_path / "config.yaml"
+    path.write_text(text)
+    return path
+
+
+def write_campaign(tmp_path, name="coldpost-recruiter", campaign_yaml=VALID_CAMPAIGN_YAML,
+                    initial_txt=VALID_INITIAL_TXT, stage_count=3):
+    campaigns_dir = tmp_path / "campaigns"
+    campaign_dir = campaigns_dir / name
+    campaign_dir.mkdir(parents=True)
+    (campaign_dir / "campaign.yaml").write_text(campaign_yaml)
+    (campaign_dir / "initial.txt").write_text(initial_txt)
+    for i in range(1, stage_count + 1):
+        (campaign_dir / f"stage{i}.txt").write_text(f"Following up — stage {i}.\n")
+    return campaigns_dir, campaign_dir
+
+
+# --- load_global_config -------------------------------------------------
+
+def test_load_global_config_valid(tmp_path):
+    path = write_global_config(tmp_path)
+    cfg = load_global_config(path)
+    assert cfg.from_email == "everythingforgenius@gmail.com"
+    assert cfg.from_name == "Test Owner"
+    assert cfg.api_key_env == "GMASS_API_KEY"
+    assert cfg.personas == {
+        "hiring_manager": [2, 4, 6],
+        "recruiter": [2, 3, 5],
+        "founder": [2, 5, 7],
+    }
+    assert cfg.schedule.daily_cap == 500
+    assert cfg.consumer_domains_file == "consumer_domains.txt"
+
+
+def test_load_global_config_missing_file(tmp_path):
+    with pytest.raises(ConfigError, match="not found"):
+        load_global_config(tmp_path / "config.yaml")
+
+
+def test_load_global_config_missing_key_fails_loud(tmp_path):
+    bad = VALID_CONFIG_YAML.replace("api_key_env: GMASS_API_KEY", "")
+    path = write_global_config(tmp_path, bad)
+    with pytest.raises(ConfigError, match="gmass.api_key_env"):
+        load_global_config(path)
+
+
+def test_load_global_config_invalid_yaml_fails_loud(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text("sender: [this is not\n  a valid: mapping")
+    with pytest.raises(ConfigError, match="invalid YAML"):
+        load_global_config(path)
+
+
+# --- discover_campaigns ---------------------------------------------------
+
+def test_discover_campaigns_finds_folders_with_campaign_yaml(tmp_path):
+    campaigns_dir, _ = write_campaign(tmp_path, name="foo")
+    write_campaign(tmp_path, name="baz")
+    (campaigns_dir / "bar").mkdir()  # no campaign.yaml — must be excluded
+    (campaigns_dir / "bar" / "notes.txt").write_text("not a campaign")
+
+    assert discover_campaigns(campaigns_dir) == ["baz", "foo"]
+
+
+def test_discover_campaigns_missing_dir_returns_empty(tmp_path):
+    assert discover_campaigns(tmp_path / "campaigns") == []
+
+
+# --- load_campaign ---------------------------------------------------------
+
+def test_load_campaign_valid(tmp_path):
+    global_config = load_global_config(write_global_config(tmp_path))
+    campaigns_dir, _ = write_campaign(tmp_path)
+    campaign = load_campaign("coldpost-recruiter", global_config, campaigns_dir)
+    assert campaign.persona == "recruiter"
+    assert campaign.cadence == [2, 3, 5]
+    assert campaign.latex_enabled is True
+    assert campaign.attachment_name == "Firstname_Lastname_Resume.pdf"
+    assert [f.key for f in campaign.fields] == ["email", "role_catted", "company", "req_id", "byebye"]
+    req_id_field = next(f for f in campaign.fields if f.key == "req_id")
+    assert req_id_field.optional is True
+    assert campaign.subject_template == "Quick note about the {{role_catted}} role at {{company}}"
+    assert campaign.body_template == "Hi {{company}} team,\n{{byebye}}"
+    assert campaign.stage_bodies == [
+        "Following up — stage 1.\n",
+        "Following up — stage 2.\n",
+        "Following up — stage 3.\n",
+    ]
+
+
+def test_load_campaign_missing_stage_file_fails_loud(tmp_path):
+    global_config = load_global_config(write_global_config(tmp_path))
+    # recruiter cadence has 3 stages; only provide 2.
+    campaigns_dir, _ = write_campaign(tmp_path, stage_count=2)
+    with pytest.raises(ConfigError, match="stage3.txt"):
+        load_campaign("coldpost-recruiter", global_config, campaigns_dir)
+
+
+def test_load_campaign_extra_stage_file_fails_loud(tmp_path):
+    global_config = load_global_config(write_global_config(tmp_path))
+    # recruiter cadence has 3 stages; provide 4.
+    campaigns_dir, _ = write_campaign(tmp_path, stage_count=4)
+    with pytest.raises(ConfigError, match="stage4.txt"):
+        load_campaign("coldpost-recruiter", global_config, campaigns_dir)
+
+
+def test_load_campaign_initial_txt_missing_subject_fails_loud(tmp_path):
+    global_config = load_global_config(write_global_config(tmp_path))
+    campaigns_dir, _ = write_campaign(tmp_path, initial_txt="Hi there,\n\nno subject line\n")
+    with pytest.raises(ConfigError, match="Subject:"):
+        load_campaign("coldpost-recruiter", global_config, campaigns_dir)
+
+
+def test_load_campaign_initial_txt_missing_blank_line_fails_loud(tmp_path):
+    global_config = load_global_config(write_global_config(tmp_path))
+    bad_initial = "Subject: Quick note\nHi there, no blank line separator\n"
+    campaigns_dir, _ = write_campaign(tmp_path, initial_txt=bad_initial)
+    with pytest.raises(ConfigError, match="blank"):
+        load_campaign("coldpost-recruiter", global_config, campaigns_dir)
+
+
+def test_load_campaign_unknown_persona_fails_loud(tmp_path):
+    global_config = load_global_config(write_global_config(tmp_path))
+    bad_campaign_yaml = VALID_CAMPAIGN_YAML.replace("persona: recruiter", "persona: nonexistent")
+    campaigns_dir, _ = write_campaign(tmp_path, campaign_yaml=bad_campaign_yaml)
+    with pytest.raises(ConfigError, match="not defined"):
+        load_campaign("coldpost-recruiter", global_config, campaigns_dir)
+
+
+def test_load_campaign_unknown_placeholder_fails_loud(tmp_path):
+    global_config = load_global_config(write_global_config(tmp_path))
+    bad_initial = "Subject: Hi\n\nWelcome, {{nonexistent_field}}!\n"
+    campaigns_dir, _ = write_campaign(tmp_path, initial_txt=bad_initial)
+    with pytest.raises(ConfigError, match="nonexistent_field"):
+        load_campaign("coldpost-recruiter", global_config, campaigns_dir)
+
+
+def test_load_campaign_malformed_placeholder_fails_loud(tmp_path):
+    # {{company }} (stray internal space) isn't \w+, so the well-formed
+    # placeholder regex would silently miss it — must be caught separately.
+    global_config = load_global_config(write_global_config(tmp_path))
+    bad_initial = "Subject: Hi\n\nWelcome, {{company }}!\n"
+    campaigns_dir, _ = write_campaign(tmp_path, initial_txt=bad_initial)
+    with pytest.raises(ConfigError, match="malformed placeholder"):
+        load_campaign("coldpost-recruiter", global_config, campaigns_dir)
+
+
+def test_load_campaign_latex_disabled_requires_attachment_file(tmp_path):
+    global_config = load_global_config(write_global_config(tmp_path))
+    no_attachment_yaml = VALID_CAMPAIGN_YAML.replace(
+        "latex:\n  enabled: true", "latex:\n  enabled: false"
+    )
+    campaigns_dir, _ = write_campaign(tmp_path, campaign_yaml=no_attachment_yaml)
+    with pytest.raises(ConfigError, match="attachment_file"):
+        load_campaign("coldpost-recruiter", global_config, campaigns_dir)

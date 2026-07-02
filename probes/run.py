@@ -9,7 +9,7 @@ of the form everythingforgenius+testmass{N}@gmail.com raises BEFORE any network
 call. See _guard(). This makes emailing a real lead with test data impossible.
 
 Usage:
-    python probes/run.py <auth|attach|casing|stop|thread|reports|verify|swagger|all>
+    python probes/run.py <auth|attach|casing|stop|thread|reports|verify|swagger|client|all>
 """
 import argparse
 import base64
@@ -484,6 +484,49 @@ def probe_verify(key: str) -> None:
     _record("verify", result)
 
 
+def probe_client(key: str) -> None:
+    """Live verification of the PRODUCTION slap.gmass client (Build Order step 6) —
+    not this script's own duplicate HTTP calls. Proves create_draft/send_campaign/
+    get_reports/build_campaign_settings work end-to-end against the real API exactly
+    as the mocked unit tests (tests/test_gmass.py) assume they do. Real send, to the
+    guarded test address only — never a real lead."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from slap import gmass  # local import: only this probe needs the production package
+
+    print("[client] live-verify slap.gmass.* against the real API (self-send only)")
+    recipient = _guard("everythingforgenius+testmass6@gmail.com")
+    tiny_pdf = _tiny_pdf()
+
+    draft = gmass.create_draft(
+        key, recipient=recipient, subject="slap probe client (production gmass.py)",
+        message="probe client body", attachment=("resume.pdf", tiny_pdf, "application/pdf"),
+    )
+    print(f"  create_draft: draft_id={draft['draft_id']}")
+    result = {"probe": "client", "recipient": recipient, "draft": draft}
+
+    cadence = [2, 3, 5]
+    stage_bodies = ["stage one body", "stage two body", "stage three body"]
+    settings = gmass.build_campaign_settings(cadence, stage_bodies, create_drafts=False)
+    result["campaign_settings"] = settings
+
+    sent = gmass.send_campaign(key, draft["draft_id"], campaign_settings=settings)
+    print(f"  send_campaign: campaign_id={sent['campaign_id']}")
+    result["send"] = sent
+
+    recipients_polls = []
+    report_items = []
+    for attempt in range(8):
+        time.sleep(15)
+        report_items = gmass.get_reports(key, sent["campaign_id"], "recipients")
+        recipients_polls.append({"attempt": attempt + 1, "record_count": len(report_items)})
+        print(f"  get_reports(recipients) poll {attempt + 1}: records={len(report_items)}")
+        if report_items:
+            break
+    result["recipients_polls"] = recipients_polls
+    result["recipients_report_items"] = report_items
+    _record("client", result)
+
+
 def _tiny_pdf() -> bytes:
     """Smallest valid one-page PDF."""
     return (b"%PDF-1.1\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
@@ -502,7 +545,7 @@ def _padded_pdf(total_bytes: int) -> bytes:
 PROBES = {
     "auth": probe_auth, "attach": probe_attach, "casing": probe_casing,
     "stop": probe_stop, "thread": probe_thread, "reports": probe_reports,
-    "verify": probe_verify, "swagger": probe_swagger,
+    "verify": probe_verify, "swagger": probe_swagger, "client": probe_client,
 }
 
 
