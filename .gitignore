@@ -1,0 +1,13 @@
+# secrets
+.env
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# probe outputs (raw captures are auditable but not committed)
+probes/findings/
+
+# macOS
+.DS_Store
