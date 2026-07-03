@@ -93,6 +93,35 @@ def test_due_recipients_includes_queued_excludes_already_sent(tmp_path):
     assert [r["recipient"] for r in due] == ["queued-only@acme.com"]
 
 
+def test_due_recipients_includes_recipient_re_staged_after_a_prior_campaigns_send(tmp_path):
+    # Real BLOCKER: a recipient already sent to in an EARLIER, different
+    # campaign (dedup hard-warn fired, owner confirmed proceed-anyway per
+    # §6's warn-don't-block) has a permanent, first-write-wins
+    # recipients.first_sent_at from that prior send. Re-staging them for a
+    # NEW campaign must still make them due — checking first_sent_at IS NULL
+    # (the old, buggy query) would silently and permanently exclude them
+    # from every future drain the instant they'd ever been sent anything.
+    conn = connect(tmp_path / "test.db")
+    attachment = make_attachment(tmp_path)
+    recipient = "already-contacted@acme.com"
+
+    append_event(conn, type="queued", recipient=recipient, campaign="old-campaign", stage=0,
+                 meta={"persona": "recruiter"})
+    append_event(conn, type="sent", recipient=recipient, campaign="old-campaign", stage=0,
+                 gmass_campaign_id="111")
+    assert due_recipients(conn) == []  # fully resolved, nothing due yet
+
+    stage_recipient(
+        conn, campaign="new-campaign", recipient=recipient, persona="founder", cadence=[2, 5, 7],
+        subject="Hi", body="Body", stage_bodies=["s1", "s2", "s3"],
+        attachment_path=attachment, attachment_name="r.pdf", workdir_root=tmp_path / "workdir",
+    )
+
+    due = due_recipients(conn)
+    assert [r["recipient"] for r in due] == [recipient]
+    assert due[0]["campaign"] == "new-campaign"
+
+
 def test_due_recipients_excludes_bounced_or_replied_before_ever_sending(tmp_path):
     # Edge case: shouldn't happen via the normal flow (reply/bounce implies a
     # prior send), but the query should still be robust to it — a recipient

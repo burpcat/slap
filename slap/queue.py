@@ -53,11 +53,38 @@ def load_manifest(workdir: Path) -> dict:
 
 def due_recipients(conn) -> list:
     """Recipients staged for their initial send but never actually sent yet
-    — the runner's stateless 'what's queued and due?' query (§10). Covers
-    only stage-0 initial sends; due_for_ooo_resend() covers OOO resends."""
+    for THAT staged cycle — the runner's stateless 'what's queued and due?'
+    query (§10). Covers only stage-0 initial sends; due_for_ooo_resend()
+    covers OOO resends.
+
+    Derived from the event log directly (the same "latest relevant event,
+    with no later closing event" pattern as due_for_ooo_resend()/
+    latest_open_draft_id()/needs_triage()), NOT from recipients.first_sent_at
+    — that column is deliberately first-write-wins (the recipient's first
+    EVER send, across all campaigns, permanent) and is the wrong thing to
+    check here. A recipient already contacted in an earlier campaign (hard
+    dedup warn, explicit proceed-anyway per §6's warn-don't-block) gets a
+    fresh `queued` event when re-staged for a new campaign, but their
+    first_sent_at never changes — checking it would silently exclude them
+    from every future drain forever, which is exactly the real BLOCKER this
+    fixes (a confirmed proceed-anyway send that vanished: never sent, never
+    failed, never counted as still queued). `send_failed` does not count as
+    closing a queued cycle — a failed attempt stays due for retry on the
+    next drain."""
     rows = conn.execute(
-        "SELECT * FROM recipients WHERE status = 'active' AND first_sent_at IS NULL "
-        "ORDER BY recipient"
+        """
+        SELECT r.* FROM recipients r
+        WHERE r.status = 'active'
+        AND EXISTS (
+            SELECT 1 FROM events e
+            WHERE e.recipient = r.recipient AND e.type = 'queued'
+            AND e.id = (
+                SELECT MAX(id) FROM events
+                WHERE recipient = r.recipient AND type IN ('queued', 'sent')
+            )
+        )
+        ORDER BY r.recipient
+        """
     ).fetchall()
     return [dict(r) for r in rows]
 

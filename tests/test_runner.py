@@ -107,6 +107,31 @@ def test_drain_sends_a_staged_recipient(conn, tmp_path):
     assert due_recipients(conn) == []
 
 
+def test_drain_sends_a_recipient_already_contacted_in_an_earlier_campaign(conn, tmp_path):
+    # Real BLOCKER repro, end-to-end: dedup hard-warn fires for an
+    # already-contacted recipient, owner confirms proceed-anyway, recipient
+    # is re-staged for a NEW campaign. drain() must actually send them, not
+    # silently report "0 sent, 0 failed, 0 still queued" while a real queued
+    # event sits unprocessed in the log forever (recipients.first_sent_at
+    # from the EARLIER campaign's send is permanent/first-write-wins and
+    # must never be checked as a "not yet sent" proxy for a re-staged cycle).
+    gc = make_global_config(tmp_path)
+    recipient = "already-contacted@acme.com"
+    append_event(conn, type="queued", recipient=recipient, campaign="old-campaign", stage=0,
+                 meta={"persona": "recruiter"})
+    append_event(conn, type="sent", recipient=recipient, campaign="old-campaign", stage=0,
+                 gmass_campaign_id="111")
+
+    stage_one(conn, tmp_path, recipient=recipient)  # re-staged for a new campaign ("c")
+    create_fn, send_fn, calls = fake_gmass()
+
+    result = drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+                    create_draft_fn=create_fn, send_campaign_fn=send_fn)
+
+    assert result == DrainResult(ran=True, sent=1, failed=0, remaining_queued=0, preflight_error=None)
+    assert calls == {"create": 1, "send": 1}
+
+
 def test_drain_writes_run_started_and_run_completed(conn, tmp_path):
     gc = make_global_config(tmp_path)
     stage_one(conn, tmp_path)
