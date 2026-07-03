@@ -1,5 +1,10 @@
-# secrets
+# secrets / personal config — real, owner-filled-in files, never shipped
+# (the .example templates ARE committed)
 .env
+config.yaml
+
+# personal campaign content (real outreach copy, not source/example data)
+campaigns/
 
 # python
 .venv/
@@ -25,3 +30,4 @@ workdir/
 .claude/
 CONTROL_SHEET.md
 SLAP_BUILD_PROMPT.md
+CLAUDE.md

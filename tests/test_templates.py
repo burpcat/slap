@@ -22,6 +22,17 @@ def test_parse_drop_basic():
     assert values["company"] == "Acme Corp"
 
 
+def test_parse_drop_matches_label_case_insensitively():
+    # Real bug: a drop typed with the label's casing off (e.g. "email:"
+    # against a field declared `label: Email`) must still match — a pasted
+    # drop shouldn't silently lose a field just because a human typed it in
+    # a different case than campaign.yaml happens to declare.
+    drop = "email: jane@acme.com\ncompany: Acme Corp\n"
+    values = parse_drop(drop, FIELDS)
+    assert values["email"] == "jane@acme.com"
+    assert values["company"] == "Acme Corp"
+
+
 def test_parse_drop_req_id_colon_in_value_example_from_brief():
     # The brief's own example: "Req ID: 6900" (no space before the colon).
     drop = "Req ID: 6900\n"

@@ -196,10 +196,11 @@ def test_dashboard_fails_loud_without_api_key(tmp_path):
     assert not (tmp_path / "slap.db").exists()
 
 
-def test_list_fails_loud_without_config():
-    # No config.yaml is committed at repo root (owner-supplied, not shipped as
-    # real data) — 'list' must fail loud with a clear message, not a traceback.
-    result = run("list")
+def test_list_fails_loud_without_config(tmp_path):
+    # config.yaml is owner-filled-in, real local data (gitignored, not shipped) —
+    # isolate cwd so this doesn't depend on whether a real one happens to exist
+    # at the actual repo root right now.
+    result = run("list", cwd=tmp_path)
     assert result.returncode != 0
     assert "config.yaml" in result.stderr
     assert "Traceback" not in result.stderr

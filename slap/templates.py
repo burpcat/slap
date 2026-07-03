@@ -34,17 +34,20 @@ def parse_drop(text: str, fields: list) -> dict:
     - split each line on the FIRST colon only (line.partition(':'))
     - strip exactly one separator space after the colon, preserve the rest
     - colon-less lines are ignored
+    - label matching is case-insensitive (a pasted drop typed as "email:" must
+      match a field declared `label: Email` — the casing a human happens to
+      type shouldn't silently drop the whole field to empty)
     - labels not matching any known field are ignored (unknown keys ignored)
     - fields whose label never appears in the drop default to '' (missing keys default empty)
     - paste-only: no interactive field-by-field entry
     """
-    by_label = {f.label: f.key for f in fields}
+    by_label = {f.label.lower(): f.key for f in fields}
     values = {f.key: "" for f in fields}
     for line in text.splitlines():
         label_raw, sep, value_raw = line.partition(":")
         if not sep:
             continue
-        key = by_label.get(label_raw.strip())
+        key = by_label.get(label_raw.strip().lower())
         if key is None:
             continue
         values[key] = value_raw[1:] if value_raw.startswith(" ") else value_raw
