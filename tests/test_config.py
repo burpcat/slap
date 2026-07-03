@@ -195,6 +195,17 @@ def test_load_campaign_malformed_placeholder_fails_loud(tmp_path):
         load_campaign("coldpost-recruiter", global_config, campaigns_dir)
 
 
+def test_load_campaign_requires_an_email_field(tmp_path):
+    # send (step 9) needs to know which drop field is the recipient address.
+    global_config = load_global_config(write_global_config(tmp_path))
+    no_email_yaml = VALID_CAMPAIGN_YAML.replace(
+        "  - { key: email,        label: Email }\n", ""
+    )
+    campaigns_dir, _ = write_campaign(tmp_path, campaign_yaml=no_email_yaml)
+    with pytest.raises(ConfigError, match="email"):
+        load_campaign("coldpost-recruiter", global_config, campaigns_dir)
+
+
 def test_load_campaign_latex_disabled_requires_attachment_file(tmp_path):
     global_config = load_global_config(write_global_config(tmp_path))
     no_attachment_yaml = VALID_CAMPAIGN_YAML.replace(

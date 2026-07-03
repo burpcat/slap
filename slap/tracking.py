@@ -20,6 +20,35 @@ CONTROL_SHEET.md, revisit when steps 6/9/10 wire in real callers):
   event's `meta` (e.g. `{"persona": "recruiter"}`) — the caller knows it at
   queue time. This keeps `recipients` a pure function of `events` alone
   (rebuildable without consulting live, possibly-since-changed config).
+- `draft_created` (added at step 9) is not in the brief's original §5 enum.
+  §3's idempotency rule requires recording the draft ID "the instant step 1
+  returns, before step 2 fires" — the original enum had no event type for
+  "a GMass draft exists but hasn't been sent yet," which is exactly the
+  window a crash/retry needs to detect to avoid orphaning or double-creating
+  a draft. It's recipient-scoped but cache-inert (an audit/idempotency
+  marker only — `_apply_event_to_cache` no-ops on it), so it doesn't disturb
+  the `recipients` status machine.
+- `ooo_tagged`/`requeued` (step 10) mirror `queued`/`sent`: `ooo_tagged` is
+  the "due for an OOO resend" marker (owner tagged a reply as OOO — a rare
+  false-positive safety net, §7); `requeued` is the completion marker,
+  written once the app's own resend of the recipient's next stage actually
+  succeeds. `requeued` advances `current_stage`/`last_gmass_campaign_id`
+  exactly like `sent` does, and flips status back to `'active'` — which is
+  *why* no new schema column was needed to track "still pending resend":
+  `slap.queue.due_for_ooo_resend()` just queries `status = 'ooo_requeued'`,
+  since a successful `requeued` naturally removes a recipient from that set.
+- `reply_reviewed` (added at step 11) is not in the brief's original §5 enum.
+  §8's dashboard lets the owner tag a reply real/OOO/not-interested; OOO
+  already has a real event (`ooo_tagged`) with backend consequences, but
+  "real"/"not-interested" have none — they're pure triage bookkeeping, not
+  state transitions, since neither is a valid `recipients.status` value.
+  Without SOME event marking "the owner already looked at this reply,"
+  every reply would show as needing triage on the dashboard forever.
+  `reply_reviewed` (meta `{"tag": "real"|"not_interested"}`) is cache-inert,
+  like `draft_created` — `slap.dashboard.needs_triage()` finds replies whose
+  latest reply-lifecycle event (`reply`/`ooo_tagged`/`reply_reviewed`) is
+  still `reply`, the same "any later closing event resolves it" pattern as
+  `due_for_ooo_resend()`.
 """
 from __future__ import annotations
 
@@ -31,8 +60,8 @@ from pathlib import Path
 DB_PATH = Path("slap.db")
 
 EVENT_TYPES = {
-    "queued", "sent", "click", "reply", "bounce", "ooo_tagged", "requeued",
-    "run_started", "run_completed", "send_failed", "run_failed",
+    "queued", "draft_created", "sent", "click", "reply", "bounce", "ooo_tagged",
+    "requeued", "reply_reviewed", "run_started", "run_completed", "send_failed", "run_failed",
 }
 # Event types describing a runner/drain's own lifecycle, not a specific
 # recipient — appended to the log but never applied to the recipients cache.
@@ -45,8 +74,8 @@ CREATE TABLE IF NOT EXISTS events (
     recipient TEXT,
     campaign TEXT,
     type TEXT NOT NULL CHECK (type IN (
-        'queued','sent','click','reply','bounce','ooo_tagged','requeued',
-        'run_started','run_completed','send_failed','run_failed'
+        'queued','draft_created','sent','click','reply','bounce','ooo_tagged','requeued',
+        'reply_reviewed','run_started','run_completed','send_failed','run_failed'
     )),
     stage INTEGER,
     gmass_campaign_id TEXT,
@@ -113,6 +142,27 @@ def append_event(conn: sqlite3.Connection, *, type: str, recipient: str = None,
     return event_id
 
 
+def latest_open_draft_id(conn: sqlite3.Connection, recipient: str):
+    """The draft_id from the most recent draft_created event for `recipient`
+    that has no later `sent`/`requeued` event — i.e. a draft that exists but
+    was never confirmed sent. Lets a retry resume without creating an
+    orphan/duplicate draft (§3 idempotency). `requeued` (step 10's OOO
+    resend completion marker) closes an open draft exactly like `sent`
+    does — without it, a SECOND OOO cycle would see the FIRST cycle's
+    already-`requeued` draft_created and wrongly treat it as still open."""
+    rows = conn.execute(
+        "SELECT type, gmass_draft_id FROM events WHERE recipient = ? "
+        "AND type IN ('draft_created', 'sent', 'requeued') ORDER BY id DESC",
+        (recipient,),
+    ).fetchall()
+    for row in rows:
+        if row["type"] in ("sent", "requeued"):
+            return None  # already resolved since the last draft_created — nothing open
+        if row["type"] == "draft_created":
+            return row["gmass_draft_id"]
+    return None
+
+
 def rebuild(conn: sqlite3.Connection) -> None:
     """Regenerate the recipients cache entirely by replaying events in the
     order they were appended (id ASC). This is the crash-recovery guarantee:
@@ -167,6 +217,8 @@ def _apply_event_to_cache(conn: sqlite3.Connection, event: dict) -> None:
     if etype == "queued":
         _upsert_recipient(conn, recipient, campaign=campaign, persona=meta.get("persona"),
                            status="active", current_stage=event["stage"], last_event_at=ts)
+    elif etype == "draft_created":
+        return  # audit/idempotency marker only — no recipients-cache-visible state change
     elif etype == "sent":
         status = "done" if meta.get("is_final_stage") else "active"
         _upsert_recipient(conn, recipient, campaign=campaign, status=status,
@@ -183,4 +235,14 @@ def _apply_event_to_cache(conn: sqlite3.Connection, event: dict) -> None:
     elif etype == "ooo_tagged":
         _upsert_recipient(conn, recipient, campaign=campaign, status="ooo_requeued", last_event_at=ts)
     elif etype == "requeued":
-        _upsert_recipient(conn, recipient, campaign=campaign, status="active", last_event_at=ts)
+        # Mirrors `sent`'s pattern (§7 step 10: ooo_tagged ~ queued, requeued
+        # ~ sent) — advances current_stage and last_gmass_campaign_id so the
+        # resend is reflected the same way an initial send would be, and so
+        # status flipping back to 'active' is what naturally removes this
+        # recipient from the "due for OOO resend" query (no new column
+        # needed — see slap.queue.due_for_ooo_resend).
+        _upsert_recipient(conn, recipient, campaign=campaign, status="active",
+                           current_stage=event["stage"],
+                           last_gmass_campaign_id=event["gmass_campaign_id"], last_event_at=ts)
+    elif etype == "reply_reviewed":
+        return  # audit/triage marker only (step 11) — no recipients-cache-visible state change

@@ -191,6 +191,8 @@ def load_campaign(name: str, global_config: GlobalConfig, campaigns_dir: Path = 
         if not isinstance(f, dict) or "key" not in f or "label" not in f:
             raise ConfigError(f"{yaml_path}: each field needs 'key' and 'label' — got {f!r}")
         fields.append(CampaignField(key=f["key"], label=f["label"], optional=bool(f.get("optional", False))))
+    if not any(f.key == "email" for f in fields):
+        raise ConfigError(f"{yaml_path}: 'fields' must include a field with key 'email' — send needs it")
 
     subject_template, body_template = _validate_initial_txt(campaign_path / "initial.txt")
     _validate_stage_files(campaign_path, cadence)

@@ -3,23 +3,29 @@
 Scoped strictly to what step 2 builds: argparse dispatch and fail-loud stubs.
 Does not test config/templates/tracking/etc. — those land in later steps.
 """
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 SLAP_PY = Path(__file__).resolve().parent.parent / "slap.py"
-ALL_COMMANDS = ["list", "send", "dashboard", "doctor", "domains", "rebuild"]
-# 'list' (step 3), 'rebuild' (step 5), and 'domains' (step 7) are wired to
-# real implementations and are no longer stubs — see their dedicated tests.
-NO_ARG_COMMANDS = ["dashboard", "doctor"]
+ALL_COMMANDS = ["list", "send", "dashboard", "doctor", "domains", "rebuild", "runner"]
+# 'list' (step 3), 'rebuild' (step 5), 'domains' (step 7), 'send'/'runner'
+# (step 9), and 'dashboard' (step 11) are wired to real implementations and
+# are no longer stubs — see their dedicated tests. 'dashboard' in particular
+# is NOT exercised here at all beyond its fail-loud-without-config path,
+# since a successful run calls Flask's app.run() and blocks forever.
+NO_ARG_COMMANDS = ["doctor"]
 
 
-def run(*args, cwd=None):
+def run(*args, cwd=None, env=None):
     return subprocess.run(
         [sys.executable, str(SLAP_PY), *args],
         capture_output=True,
         text=True,
         cwd=cwd,
+        env=env,
+        timeout=10,  # defensive: 'runner' must never reach a real sleep in these tests
     )
 
 
@@ -43,10 +49,64 @@ def test_send_without_campaign_is_argparse_usage_error():
     assert "not yet implemented" not in result.stderr
 
 
-def test_send_with_campaign_hits_stub():
-    result = run("send", "somecampaign")
+def test_send_fails_loud_for_unknown_campaign(tmp_path):
+    # Fails during load_campaign, before ever reading stdin — safe to run
+    # via subprocess without needing to script any interactive input.
+    (tmp_path / "config.yaml").write_text(
+        (Path(__file__).resolve().parent.parent / "config.yaml.example")
+        .read_text()
+        .replace("<Owner Name>", "Test Owner")
+    )
+    result = run("send", "somecampaign", cwd=tmp_path)
     assert result.returncode != 0
-    assert "not yet implemented" in result.stderr
+    assert "not found" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_runner_fails_loud_without_config(tmp_path):
+    # Must fail during load_global_config, before ever reaching
+    # wait_for_fire_window (which can sleep for minutes) — critical for this
+    # test to actually be fast and not hang the suite.
+    result = run("runner", cwd=tmp_path)
+    assert result.returncode != 0
+    assert "config.yaml" in result.stderr
+    assert not (tmp_path / "slap.db").exists()
+
+
+def test_dashboard_fails_loud_without_config(tmp_path):
+    # Must fail during load_global_config, before ever reaching
+    # dashboard.create_app()/app.run() (which would block the test forever
+    # serving on 127.0.0.1:5000).
+    result = run("dashboard", cwd=tmp_path)
+    assert result.returncode != 0
+    assert "config.yaml" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not (tmp_path / "slap.db").exists()
+
+
+def test_dashboard_fails_loud_without_api_key(tmp_path):
+    # config.yaml + consumer_domains.txt both present so the ONLY missing
+    # thing is the API key — must fail loud before ever reaching
+    # tracking.connect()/create_app()/app.run().
+    (tmp_path / "config.yaml").write_text(
+        (Path(__file__).resolve().parent.parent / "config.yaml.example")
+        .read_text()
+        .replace("<Owner Name>", "Test Owner")
+    )
+    (tmp_path / "consumer_domains.txt").write_text(
+        (Path(__file__).resolve().parent.parent / "consumer_domains.txt").read_text()
+    )
+    # Explicitly set to "" rather than deleted: slap.py's load_dotenv() finds
+    # the real repo-root .env (it searches from slap.py's own file location,
+    # not the subprocess cwd) and, with its default override=False, would
+    # silently repopulate a *deleted* key from that real file — but never
+    # overwrites a key that's already present, even as an empty string.
+    env_without_key = {**os.environ, "GMASS_API_KEY": ""}
+    result = run("dashboard", cwd=tmp_path, env=env_without_key)
+    assert result.returncode != 0
+    assert "GMASS_API_KEY" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not (tmp_path / "slap.db").exists()
 
 
 def test_list_fails_loud_without_config():

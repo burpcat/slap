@@ -484,6 +484,49 @@ def probe_verify(key: str) -> None:
     _record("verify", result)
 
 
+def probe_resend(key: str) -> None:
+    """Resolves iron-audit SHOULD-FIX #2 (step 9): if a runner crashes AFTER
+    send_campaign succeeds server-side but BEFORE the local 'sent' event
+    commits, a retry (which correctly reuses the existing draft_id per §3
+    idempotency) will call POST /api/campaigns/{draftId} a SECOND time on a
+    draft that's already been sent. Is that safe (rejected/no-op) or does it
+    actually double-send? Real send, to the guarded test address only —
+    genuinely calls the same endpoint twice on purpose to observe this."""
+    print("[resend] real send, then call POST /api/campaigns/{draftId} a second time on the SAME draft")
+    recipient = "everythingforgenius+testmass7@gmail.com"
+    draft = _create_draft(key, recipient, subject="slap probe resend (idempotency check)",
+                          message="probe resend body")
+    print(f"  draft: HTTP {draft['response']['status']}, draft_id={draft['draft_id']}")
+    result = {"probe": "resend", "recipient": recipient, "draft": draft}
+    if not draft["draft_id"]:
+        _record("resend", result)
+        return
+
+    send_fields = {
+        "openTracking": False, "clickTracking": True, "createDrafts": False,
+        "stageOneDays": 2, "stageOneCampaignText": "resend probe stage one", "stageOneAction": "r",
+    }
+    r1 = _post_campaign(key, draft["draft_id"], send_fields, "path")
+    s1 = _summarize(r1)
+    cid1 = _campaign_id(s1)
+    print(f"  first send: HTTP {r1.status_code}, campaign_id={cid1}")
+    result["first_send"] = {"sent_fields": send_fields, "response": s1, "campaign_id": cid1}
+    if cid1:
+        _RUN_STATE["campaign_ids"].append(cid1)
+
+    # The actual question: call send_campaign AGAIN on the exact same draft_id.
+    r2 = _post_campaign(key, draft["draft_id"], send_fields, "path")
+    s2 = _summarize(r2)
+    cid2 = _campaign_id(s2)
+    print(f"  second send (same draft_id): HTTP {r2.status_code}, campaign_id={cid2}")
+    result["second_send"] = {"sent_fields": send_fields, "response": s2, "campaign_id": cid2}
+    if cid2:
+        _RUN_STATE["campaign_ids"].append(cid2)
+
+    result["same_campaign_id"] = (cid1 == cid2) if (cid1 and cid2) else None
+    _record("resend", result)
+
+
 def probe_client(key: str) -> None:
     """Live verification of the PRODUCTION slap.gmass client (Build Order step 6) —
     not this script's own duplicate HTTP calls. Proves create_draft/send_campaign/
@@ -546,6 +589,7 @@ PROBES = {
     "auth": probe_auth, "attach": probe_attach, "casing": probe_casing,
     "stop": probe_stop, "thread": probe_thread, "reports": probe_reports,
     "verify": probe_verify, "swagger": probe_swagger, "client": probe_client,
+    "resend": probe_resend,
 }
 
 

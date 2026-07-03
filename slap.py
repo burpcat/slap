@@ -5,10 +5,40 @@ See SLAP_BUILD_PROMPT.md for the full spec and CONTROL_SHEET.md for the
 current build state / package layout.
 """
 import argparse
+import os
 import sys
 
+from dotenv import load_dotenv
+
 from slap.config import ConfigError, discover_campaigns, load_campaign, load_global_config
-from slap import domains, tracking
+from slap.latex import recipient_workdir, run_latex_loop
+from slap.queue import stage_recipient
+from slap.templates import fill_template, parse_drop
+from slap import dashboard, domains, gmass, runner, tracking
+
+load_dotenv()
+
+PASTE_TERMINATOR = "EOF"
+
+
+def read_paste(prompt: str, read_line=input) -> str:
+    """Reads a multi-line paste terminated by a line containing only
+    PASTE_TERMINATOR, not a blocking read-until-EOF. A real read-until-EOF
+    (sys.stdin.read()) would consume the entire stdin stream, leaving
+    nothing for any later input() prompt (Add another?, confirmations) to
+    read — this works correctly for both a live terminal and piped/scripted
+    input, and doesn't rely on TTY-specific Ctrl-D-per-read semantics."""
+    print(f"{prompt} (end with a line containing only {PASTE_TERMINATOR}):")
+    lines = []
+    while True:
+        try:
+            line = read_line()
+        except EOFError:
+            break
+        if line.strip() == PASTE_TERMINATOR:
+            break
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def cmd_list(args):
@@ -33,18 +63,117 @@ def cmd_list(args):
 
 
 def cmd_send(args):
-    sys.exit(
-        "slap: 'send' is not yet implemented — depends on Build Order steps 3-9 "
-        "(config, templates, tracking, GMass client, domain dedup, LaTeX loop, "
-        "queue+runner). See SLAP_BUILD_PROMPT.md §14."
+    try:
+        global_config = load_global_config()
+        campaign = load_campaign(args.campaign, global_config)
+        consumer_domains = domains.load_consumer_domains()
+    except (ConfigError, domains.DomainsError) as e:
+        sys.exit(f"slap: {e}")
+
+    conn = tracking.connect()
+
+    while True:
+        drop_text = read_paste(f"\nPaste the drop for campaign '{campaign.name}'")
+        values = parse_drop(drop_text, campaign.fields)
+
+        recipient = values.get("email", "").strip()
+        if not recipient:
+            print("No 'Email' value found in the drop — skipping this recipient.")
+        else:
+            _prep_one_recipient(conn, campaign, consumer_domains, values, recipient)
+
+        if input("\nAdd another? [Y/n]: ").strip().lower() == "n":
+            break
+
+    if args.now:
+        print("\n--now: draining the queue immediately...")
+        result = runner.drain(conn, global_config, os.environ.get(global_config.api_key_env, ""))
+        _print_drain_result(result)
+
+
+def _prep_one_recipient(conn, campaign, consumer_domains, values, recipient):
+    if campaign.latex_enabled:
+        tex_source = read_paste(f"\nPaste the LaTeX résumé source for {recipient}")
+        workdir = recipient_workdir(campaign.name, recipient)
+        staged = run_latex_loop(workdir, tex_source, campaign.attachment_name)
+        if staged is None:
+            print("Aborted — nothing staged for this recipient.")
+            return
+        attachment_path = staged.path
+    else:
+        attachment_path = campaign.path / campaign.attachment_file
+
+    dedup = domains.check_recipient(conn, recipient, consumer_domains)
+    if dedup.hard_warning:
+        w = dedup.hard_warning
+        replied = "yes" if w.replied_at else "no"
+        print(f"\n⚠ HARD WARN: {recipient} already contacted — campaign={w.campaign} "
+              f"status={w.status} first_sent={w.first_sent_at} replied={replied}")
+    if dedup.soft_warning_contacts:
+        print(f"\n⚠ SOFT WARN: {len(dedup.soft_warning_contacts)} other contact(s) already on "
+              f"domain {dedup.soft_warning_domain}:")
+        for c in dedup.soft_warning_contacts:
+            print(f"    {c.recipient}  campaign={c.campaign}  status={c.status}")
+    if (dedup.hard_warning or dedup.soft_warning_contacts) and \
+            input("Proceed anyway? [y/N]: ").strip().lower() != "y":
+        print("Skipped.")
+        return
+
+    subject = fill_template(campaign.subject_template, values, campaign.fields)
+    body = fill_template(campaign.body_template, values, campaign.fields)
+    stage_bodies = [fill_template(s, values, campaign.fields) for s in campaign.stage_bodies]
+
+    print(f"\n--- Preview for {recipient} ---\nSubject: {subject}\n\n{body}\n")
+    print(f"Attachment: {campaign.attachment_name}")
+    print(f"Cadence (persona={campaign.persona}): {campaign.cadence}")
+
+    if input("\nStage this send? [y/N]: ").strip().lower() != "y":
+        print("Skipped.")
+        return
+
+    stage_recipient(
+        conn, campaign=campaign.name, recipient=recipient, persona=campaign.persona,
+        cadence=campaign.cadence, subject=subject, body=body, stage_bodies=stage_bodies,
+        attachment_path=attachment_path, attachment_name=campaign.attachment_name,
     )
+    print(f"Staged {recipient}.")
+
+
+def cmd_runner(args):
+    try:
+        global_config = load_global_config()
+    except ConfigError as e:
+        sys.exit(f"slap: {e}")
+    conn = tracking.connect()
+    runner.wait_for_fire_window(global_config.schedule)
+    result = runner.drain(conn, global_config, os.environ.get(global_config.api_key_env, ""))
+    _print_drain_result(result)
+
+
+def _print_drain_result(result):
+    if not result.ran:
+        print(f"Preflight failed: {result.preflight_error}. Wrote run_failed; queue is untouched.")
+        return
+    print(f"Drain complete: {result.sent} sent, {result.failed} failed, "
+          f"{result.remaining_queued} still queued.")
 
 
 def cmd_dashboard(args):
-    sys.exit(
-        "slap: 'dashboard' is not yet implemented — Build Order step 11 "
-        "(localhost dashboard). See SLAP_BUILD_PROMPT.md §14."
-    )
+    try:
+        global_config = load_global_config()
+        consumer_domains = domains.load_consumer_domains()
+    except (ConfigError, domains.DomainsError) as e:
+        sys.exit(f"slap: {e}")
+
+    api_key = os.environ.get(global_config.api_key_env, "").strip()
+    if not api_key:
+        sys.exit(f"slap: {global_config.api_key_env} is not set — the dashboard's on-open "
+                  f"GMass poll (replies/clicks/bounces) needs it. See .env.example.")
+
+    tracking.connect().close()  # ensure the DB file + schema exist before serving
+    app = dashboard.create_app(tracking.DB_PATH, global_config, consumer_domains, api_key)
+    print("Dashboard running at http://127.0.0.1:5000 — Ctrl-C to stop.")
+    app.run(host="127.0.0.1", port=5000)
 
 
 def cmd_doctor(args):
@@ -98,6 +227,9 @@ def build_parser():
     sub.add_parser("doctor", help="Run preflight checks").set_defaults(func=cmd_doctor)
     sub.add_parser("domains", help="Regenerate/print the domain index").set_defaults(func=cmd_domains)
     sub.add_parser("rebuild", help="Rebuild the recipients cache from events").set_defaults(func=cmd_rebuild)
+    sub.add_parser(
+        "runner", help="Unattended drain — invoked by launchd, see LAUNCHD.md"
+    ).set_defaults(func=cmd_runner)
     return parser
 
 

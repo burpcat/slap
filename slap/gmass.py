@@ -136,3 +136,19 @@ def build_campaign_settings(cadence: list, stage_bodies: list, *, open_tracking:
         settings[f"stage{ordinal}CampaignText"] = body
         settings[f"stage{ordinal}Action"] = stop_action
     return settings
+
+
+def build_reply_settings(campaign_id_to_reply_to: int, *, open_tracking: bool = False,
+                          click_tracking: bool = True, create_drafts: bool = False) -> dict:
+    """Build the flat send_campaign() body for an OOO resend (§7, step 10):
+    a single stage sent as a reply into the original conversation via
+    `sendAsReply` + `campaignIdToReplyTo` — deterministic threading, never
+    GMass's own "last conversation" auto-detection. `campaignIdToReplyTo` is
+    an integer per the Phase-0-verified contract (see CONTROL_SHEET.md)."""
+    return {
+        "openTracking": open_tracking,
+        "clickTracking": click_tracking,
+        "createDrafts": create_drafts,
+        "sendAsReply": True,
+        "campaignIdToReplyTo": int(campaign_id_to_reply_to),
+    }

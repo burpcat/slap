@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>slap dashboard</title>
+<style>
+  :root {
+    --surface-1: #fcfcfb; --page: #f9f9f7;
+    --text-primary: #0b0b0b; --text-secondary: #52514e; --text-muted: #898781;
+    --hairline: #e1e0d9; --border: rgba(11,11,11,0.10);
+    --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
+    --series-1: #2a78d6;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--page); color: var(--text-primary);
+    margin: 0; padding: 24px; font-size: 14px;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.04em;
+       color: var(--text-secondary); margin: 0 0 12px; }
+  .synced { color: var(--text-muted); font-size: 12px; margin-bottom: 20px; }
+  .panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+  .panel { background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+  .panel.full { grid-column: 1 / -1; }
+  .stat-row { display: flex; gap: 24px; flex-wrap: wrap; margin-bottom: 8px; }
+  .stat-tile { min-width: 90px; }
+  .stat-tile .value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat-tile .label { font-size: 12px; color: var(--text-secondary); }
+  .gauge-track { background: var(--hairline); border-radius: 6px; height: 10px; overflow: hidden; margin: 6px 0; }
+  .gauge-fill { height: 100%; border-radius: 6px; }
+  .gauge-fill.good { background: var(--good); }
+  .gauge-fill.warning { background: var(--warning); }
+  .gauge-fill.critical { background: var(--critical); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--hairline); }
+  th { color: var(--text-secondary); font-weight: 500; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .badge { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 11px; }
+  .badge.critical { background: var(--critical); color: white; }
+  .badge.warn { background: var(--warning); color: var(--text-primary); }
+  .muted { color: var(--text-muted); }
+  form.tag-form { display: inline; }
+  button.tag-btn {
+    font-size: 12px; padding: 3px 8px; margin-right: 4px; border-radius: 4px;
+    border: 1px solid var(--border); background: var(--surface-1); cursor: pointer;
+  }
+  button.tag-btn:hover { background: var(--hairline); }
+  .empty { color: var(--text-muted); font-style: italic; }
+  ul.plain { list-style: none; padding: 0; margin: 0; }
+  ul.plain li { padding: 3px 0; }
+</style>
+</head>
+<body>
+
+<h1>slap dashboard</h1>
+<p class="synced">
+  last synced: {{ sync_result.synced_at | to_local }}
+  &middot; +{{ sync_result.new_replies }} replies, +{{ sync_result.new_clicks }} clicks, +{{ sync_result.new_bounces }} bounces this sync
+</p>
+{% if sync_result.errors %}
+<div class="panel full" style="border-color: var(--critical);">
+  <h2 style="color: var(--critical);">Sync errors — some replies/clicks/bounces may be missing</h2>
+  <ul class="plain">
+    {% for err in sync_result.errors %}
+    <li><span class="badge critical">error</span> {{ err }}</li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+
+<div class="panels">
+
+  <div class="panel">
+    <h2>Today</h2>
+    <div class="stat-row">
+      <div class="stat-tile"><div class="value">{{ today.sent.new }}</div><div class="label">new</div></div>
+      <div class="stat-tile"><div class="value">{{ today.sent.follow_up }}</div><div class="label">follow-up</div></div>
+      <div class="stat-tile"><div class="value">{{ today.sent.total }}</div><div class="label">sent total</div></div>
+      <div class="stat-tile"><div class="value">{{ today.replies_today }}</div><div class="label">replies</div></div>
+      <div class="stat-tile"><div class="value">{{ today.clicks_today }}</div><div class="label">clicks</div></div>
+    </div>
+    <div>
+      <div class="label">Daily cap: {{ today.sent.total }} / {{ today.daily_cap }} ({{ today.cap_used_pct }}%)</div>
+      <div class="gauge-track">
+        <div class="gauge-fill {{ 'critical' if today.cap_used_pct >= 90 else ('warning' if today.cap_used_pct >= 70 else 'good') }}"
+             style="width: {{ [today.cap_used_pct, 100] | min }}%"></div>
+      </div>
+    </div>
+    <p class="label">Active campaigns: {{ today.active_campaigns | join(', ') if today.active_campaigns else 'none' }}</p>
+  </div>
+
+  <div class="panel">
+    <h2>This week ({{ week.range_start }} &ndash; {{ week.range_end }})</h2>
+    <div class="stat-row">
+      <div class="stat-tile"><div class="value">{{ week.sent.new }}</div><div class="label">new</div></div>
+      <div class="stat-tile"><div class="value">{{ week.sent.follow_up }}</div><div class="label">follow-up</div></div>
+      <div class="stat-tile"><div class="value">{{ week.sent.total }}</div><div class="label">sent total</div></div>
+      <div class="stat-tile"><div class="value">{{ week.replies }}</div><div class="label">replies</div></div>
+      <div class="stat-tile"><div class="value">{{ week.clicks }}</div><div class="label">clicks</div></div>
+    </div>
+  </div>
+
+  <div class="panel full">
+    <h2>Engagement intelligence</h2>
+    <div class="panels">
+      <div>
+        <table>
+          <tr><th>Persona</th><th class="num">Reply rate</th></tr>
+          {% for persona, rate in engagement.reply_rate_by_persona.items() %}
+          <tr><td>{{ persona }}</td><td class="num">{{ rate }}%</td></tr>
+          {% else %}
+          <tr><td colspan="2" class="empty">no data yet</td></tr>
+          {% endfor %}
+        </table>
+      </div>
+      <div>
+        <table>
+          <tr><th>Stage</th><th class="num">Replies</th><th class="num">Clicks</th></tr>
+          {% for stage in [0, 1, 2, 3] %}
+          <tr>
+            <td>{{ 'initial' if stage == 0 else 'stage ' + stage|string }}</td>
+            <td class="num">{{ engagement.reply_by_stage.get(stage, 0) }}</td>
+            <td class="num">{{ engagement.click_by_stage.get(stage, 0) }}</td>
+          </tr>
+          {% endfor %}
+        </table>
+      </div>
+      <div>
+        <table>
+          <tr><th>Time to first reply</th><th class="num">Count</th></tr>
+          <tr><td>Same day</td><td class="num">{{ engagement.time_to_first_reply.same_day }}</td></tr>
+          <tr><td>1-2 days</td><td class="num">{{ engagement.time_to_first_reply['1_2_days'] }}</td></tr>
+          <tr><td>3-7 days</td><td class="num">{{ engagement.time_to_first_reply['3_7_days'] }}</td></tr>
+          <tr><td>8+ days</td><td class="num">{{ engagement.time_to_first_reply['8_plus_days'] }}</td></tr>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel full">
+    <h2>Replies needing triage</h2>
+    {% if replies %}
+    <table>
+      <tr><th>Recipient</th><th>Campaign</th><th>Prior contact</th><th>Tag</th></tr>
+      {% for r in replies %}
+      <tr>
+        <td>{{ r.recipient }}</td>
+        <td>{{ r.campaign }}</td>
+        <td>
+          {% if r.dedup_context.hard_warning %}
+            <span class="badge warn">seen before</span>
+            {{ r.dedup_context.hard_warning.campaign }}, {{ r.dedup_context.hard_warning.status }}
+          {% else %}
+            <span class="muted">first contact</span>
+          {% endif %}
+        </td>
+        <td>
+          <form class="tag-form" method="post" action="/reply/{{ r.recipient }}/tag">
+            <button class="tag-btn" name="tag" value="real">Real</button>
+            <button class="tag-btn" name="tag" value="ooo">OOO</button>
+            <button class="tag-btn" name="tag" value="not_interested">Not interested</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <p class="empty">Nothing needs triage.</p>
+    {% endif %}
+  </div>
+
+  <div class="panel">
+    <h2>Pipeline</h2>
+    <p class="label">Mid-sequence by stage:</p>
+    <ul class="plain">
+      {% for stage, recipients in pipeline.mid_sequence_by_stage.items() %}
+      <li>{{ 'initial' if stage == 0 else 'stage ' + stage|string }}: {{ recipients | length }}</li>
+      {% else %}
+      <li class="empty">nobody active</li>
+      {% endfor %}
+    </ul>
+    <p class="label">Follow-ups firing today: {{ pipeline.followups_scheduled.today | length }}</p>
+    <p class="label">Follow-ups firing tomorrow: {{ pipeline.followups_scheduled.tomorrow | length }}</p>
+  </div>
+
+  <div class="panel">
+    <h2>Today's runs</h2>
+    <p class="label">Current queue depth: {{ runs.current_queue_depth }}</p>
+    {% if runs.runs %}
+    <table>
+      <tr><th>Fired</th><th class="num">Sent</th><th class="num">Failed</th><th class="num">Queued</th><th>Status</th></tr>
+      {% for run in runs.runs %}
+      <tr>
+        <td>{{ run.fired_at | to_local }}</td>
+        <td class="num">{{ run.sent if run.sent is not none else '-' }}</td>
+        <td class="num">{{ run.failed if run.failed is not none else '-' }}</td>
+        <td class="num">{{ run.still_queued if run.still_queued is not none else '-' }}</td>
+        <td>
+          {% if run.run_failed %}
+            <span class="badge critical">RUN FAILED</span> {{ run.error }} (retries: {{ run.retry_count }})
+          {% else %}
+            ok
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <p class="empty">No runs today yet.</p>
+    {% endif %}
+  </div>
+
+</div>
+</body>
+</html>

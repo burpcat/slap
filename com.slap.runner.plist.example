@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.slap.runner</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/ABSOLUTE/PATH/TO/slap/.venv/bin/python</string>
+        <string>/ABSOLUTE/PATH/TO/slap/slap.py</string>
+        <string>runner</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/ABSOLUTE/PATH/TO/slap</string>
+
+    <!-- StartCalendarInterval (not a plain interval/cron) is what makes
+         launchd catch up on wake if the Mac was asleep at 09:00 — this is
+         the anchor time; slap.py runner itself then rolls a random moment
+         within schedule.fire_window_start/end (see config.yaml) and sleeps
+         until it, or fires immediately if that moment has already passed
+         (the wake-catch-up case). Plain cron does NOT catch up on wake. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/ABSOLUTE/PATH/TO/slap/runner.log</string>
+    <key>StandardErrorPath</key>
+    <string>/ABSOLUTE/PATH/TO/slap/runner.err.log</string>
+</dict>
+</plist>

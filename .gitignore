@@ -15,6 +15,9 @@ slap.db-journal
 slap.db-wal
 slap.db-shm
 
+# LaTeX compile workdirs (runtime staging, not source)
+workdir/
+
 # macOS
 .DS_Store
 

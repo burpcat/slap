@@ -1,0 +1,475 @@
+"""Localhost dashboard (Build Order step 11). See SLAP_BUILD_PROMPT.md §8.
+
+sync_reports() is the on-open GMass poll: "Polls GMass reports on open
+(writes new click/reply/bounce events), then renders." Every create_draft()
+call is for exactly one recipient, so a gmass_campaign_id maps 1:1 back to a
+recipient — polling is keyed off every distinct campaign_id this app has
+ever recorded, not a live "list my campaigns" call GMass doesn't offer.
+
+Dedup strategy per report type (none of clicks/bounces carry a stable
+GMass-issued ID in the verified schema, per CONTROL_SHEET.md):
+- replies: GMass's own `replyId` (stable, verified in the swagger capture).
+- clicks: (url, clickTime) — a recipient clicking the identical link at the
+  identical GMass-recorded timestamp twice is not realistically distinct.
+- bounces: (bounceReason, bounceTime) — same reasoning.
+Each already-recorded item's key is reconstructed from that event's own
+`meta` (written using the same field names), so re-polling never re-inserts
+the same real-world item as a second event.
+"""
+from __future__ import annotations
+
+import json
+import sqlite3
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+import requests
+from flask import Flask, g, redirect, request, render_template, url_for
+
+from slap import gmass
+from slap.config import discover_campaigns
+from slap.domains import check_recipient
+from slap.queue import due_for_ooo_resend, due_recipients, tag_ooo as _tag_ooo
+from slap.runner import cap_headroom
+from slap.tracking import append_event
+
+TEMPLATE_FOLDER = str(Path(__file__).parent / "dashboard_templates")
+
+
+def _all_campaign_ids(conn) -> list:
+    """Every distinct GMass campaign this app has ever created, mapped back
+    to the recipient/campaign it belongs to."""
+    rows = conn.execute(
+        "SELECT DISTINCT gmass_campaign_id, recipient, campaign FROM events "
+        "WHERE gmass_campaign_id IS NOT NULL AND recipient IS NOT NULL"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _event_meta_values(conn, recipient: str, event_type: str) -> list:
+    rows = conn.execute(
+        "SELECT meta FROM events WHERE recipient = ? AND type = ?", (recipient, event_type)
+    ).fetchall()
+    return [json.loads(r["meta"]) for r in rows if r["meta"]]
+
+
+def _current_stage(conn, recipient: str):
+    row = conn.execute("SELECT current_stage FROM recipients WHERE recipient = ?", (recipient,)).fetchone()
+    return row["current_stage"] if row else None
+
+
+def _sync_replies(conn, api_key: str, campaign_id, recipient: str, campaign: str):
+    try:
+        items = gmass.get_reports(api_key, campaign_id, "replies")
+    except requests.exceptions.RequestException:
+        return 0, None  # transient network failure — tolerate, next poll retries
+    except gmass.GMassError as e:
+        return 0, str(e)  # a real API-level problem (bad key, schema drift) — surface it
+    seen = {m["reply_id"] for m in _event_meta_values(conn, recipient, "reply") if "reply_id" in m}
+    # Recorded on the reply's own `stage` column (not just in meta) so the
+    # dashboard's "reply-by-stage" panel (§8) can group by it directly —
+    # stage can't change mid-poll (reply events don't advance current_stage),
+    # so it's safe to look up once rather than per item.
+    stage = _current_stage(conn, recipient)
+    count = 0
+    for item in items:
+        reply_id = item.get("replyId")
+        if reply_id is None or reply_id in seen:
+            continue
+        append_event(conn, type="reply", recipient=recipient, campaign=campaign, stage=stage,
+                     meta={"reply_id": reply_id, "reply_time": item.get("replyTime")})
+        seen.add(reply_id)
+        count += 1
+    return count, None
+
+
+def _sync_clicks(conn, api_key: str, campaign_id, recipient: str, campaign: str):
+    try:
+        items = gmass.get_reports(api_key, campaign_id, "clicks")
+    except requests.exceptions.RequestException:
+        return 0, None
+    except gmass.GMassError as e:
+        return 0, str(e)
+    seen = {(m["url"], m["click_time"]) for m in _event_meta_values(conn, recipient, "click")
+            if "url" in m and "click_time" in m}
+    stage = _current_stage(conn, recipient)  # §8's "click-by-stage" panel
+    count = 0
+    for item in items:
+        key = (item.get("url"), item.get("clickTime"))
+        if key in seen:
+            continue
+        append_event(conn, type="click", recipient=recipient, campaign=campaign, stage=stage,
+                     meta={"url": item.get("url"), "click_time": item.get("clickTime")})
+        seen.add(key)
+        count += 1
+    return count, None
+
+
+def _sync_bounces(conn, api_key: str, campaign_id, recipient: str, campaign: str):
+    try:
+        items = gmass.get_reports(api_key, campaign_id, "bounces")
+    except requests.exceptions.RequestException:
+        return 0, None
+    except gmass.GMassError as e:
+        return 0, str(e)
+    seen = {(m["bounce_reason"], m["bounce_time"]) for m in _event_meta_values(conn, recipient, "bounce")
+            if "bounce_reason" in m and "bounce_time" in m}
+    count = 0
+    for item in items:
+        key = (item.get("bounceReason"), item.get("bounceTime"))
+        if key in seen:
+            continue
+        append_event(conn, type="bounce", recipient=recipient, campaign=campaign,
+                     meta={"bounce_reason": item.get("bounceReason"), "bounce_time": item.get("bounceTime")})
+        seen.add(key)
+        count += 1
+    return count, None
+
+
+def sync_reports(conn, api_key: str) -> dict:
+    """Poll every known campaign for new replies/clicks/bounces, write
+    events for anything not already recorded, and return a summary
+    including the UTC "last synced" instant (§8) — convert to local only at
+    display time.
+
+    A transient network failure (timeout, connection refused) on one
+    campaign's poll is tolerated silently — one campaign's poll failing must
+    not block syncing the rest, and the next on-open poll retries it. A real
+    API-level problem (bad/expired key, GMass schema drift) raises
+    `gmass.GMassError` instead, which is NOT swallowed the same way: it's
+    collected into `errors` and surfaced in the dashboard header, so an
+    auth failure doesn't silently look like "nothing new" forever."""
+    new_replies = new_clicks = new_bounces = 0
+    errors = []
+    for row in _all_campaign_ids(conn):
+        cid, recipient, campaign = row["gmass_campaign_id"], row["recipient"], row["campaign"]
+        count, error = _sync_replies(conn, api_key, cid, recipient, campaign)
+        new_replies += count
+        if error:
+            errors.append(error)
+        count, error = _sync_clicks(conn, api_key, cid, recipient, campaign)
+        new_clicks += count
+        if error:
+            errors.append(error)
+        count, error = _sync_bounces(conn, api_key, cid, recipient, campaign)
+        new_bounces += count
+        if error:
+            errors.append(error)
+    return {
+        "synced_at": datetime.now(timezone.utc),
+        "new_replies": new_replies,
+        "new_clicks": new_clicks,
+        "new_bounces": new_bounces,
+        "errors": errors,
+    }
+
+
+# --- panels (§8) -------------------------------------------------------
+
+def _local_date(iso_timestamp: str) -> date:
+    """UTC event timestamp (as stored in `events`, §5) -> the LOCAL calendar
+    date it falls on. Every place the dashboard buckets events by "day" for
+    display must convert to local first, exactly like the `to_local` filter
+    does for individual timestamps — otherwise a send made late at night
+    local time (e.g. 11pm EDT = 3am UTC the next day) lands in the wrong
+    day's panel when compared against a local `date.today()`."""
+    dt = datetime.fromisoformat(iso_timestamp)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone().date()
+
+
+def _count_events_on(conn, event_type: str, day: date) -> int:
+    rows = conn.execute("SELECT timestamp FROM events WHERE type = ?", (event_type,)).fetchall()
+    return sum(1 for r in rows if _local_date(r["timestamp"]) == day)
+
+
+def _count_events_in_range(conn, event_type: str, start: date, end: date) -> int:
+    rows = conn.execute("SELECT timestamp FROM events WHERE type = ?", (event_type,)).fetchall()
+    return sum(1 for r in rows if start <= _local_date(r["timestamp"]) <= end)
+
+
+def _sent_split(conn, start: date, end: date) -> dict:
+    """new (stage 0) vs follow-up (stage>0, includes OOO 'requeued' resends)
+    sent/requeued events in [start, end] inclusive."""
+    rows = conn.execute("SELECT stage, timestamp FROM events WHERE type IN ('sent', 'requeued')").fetchall()
+    new_count = follow_up_count = 0
+    for row in rows:
+        d = _local_date(row["timestamp"])
+        if not (start <= d <= end):
+            continue
+        if row["stage"] == 0:
+            new_count += 1
+        else:
+            follow_up_count += 1
+    return {"new": new_count, "follow_up": follow_up_count, "total": new_count + follow_up_count}
+
+
+def today_strip(conn, global_config, *, today: date = None, campaigns_dir: Path = None) -> dict:
+    today = today or date.today()
+    sent = _sent_split(conn, today, today)
+    daily_cap = global_config.schedule.daily_cap
+    # cap_used_pct is driven by the SAME headroom calculation the runner
+    # itself enforces (§8: gauge must include follow-ups firing today, not
+    # just events already sent) — reusing runner.cap_headroom rather than a
+    # second, independent estimate keeps the gauge from ever disagreeing
+    # with what the runner will actually do.
+    headroom = cap_headroom(conn, global_config, today=today)
+    cap_used = daily_cap - headroom
+    return {
+        "active_campaigns": discover_campaigns(campaigns_dir) if campaigns_dir else discover_campaigns(),
+        "sent": sent,
+        "daily_cap": daily_cap,
+        "cap_used_pct": round(100 * cap_used / daily_cap) if daily_cap else 0,
+        "replies_today": _count_events_on(conn, "reply", today),
+        "clicks_today": _count_events_on(conn, "click", today),
+    }
+
+
+def this_week(conn, *, today: date = None) -> dict:
+    """Rolling 7-day window ending today (not a calendar Mon-Sun week)."""
+    today = today or date.today()
+    week_start = today - timedelta(days=6)
+    return {
+        "range_start": week_start,
+        "range_end": today,
+        "sent": _sent_split(conn, week_start, today),
+        "replies": _count_events_in_range(conn, "reply", week_start, today),
+        "clicks": _count_events_in_range(conn, "click", week_start, today),
+    }
+
+
+def _count_by_stage(conn, event_type: str) -> dict:
+    rows = conn.execute(
+        "SELECT stage, COUNT(*) AS c FROM events WHERE type = ? GROUP BY stage", (event_type,)
+    ).fetchall()
+    return {r["stage"]: r["c"] for r in rows}
+
+
+def _reply_rate_by_persona(conn) -> dict:
+    persona_totals: dict = {}
+    persona_of: dict = {}
+    for row in conn.execute("SELECT recipient, persona FROM recipients WHERE persona IS NOT NULL"):
+        persona_totals[row["persona"]] = persona_totals.get(row["persona"], 0) + 1
+        persona_of[row["recipient"]] = row["persona"]
+
+    persona_replied: dict = {}
+    replied_recipients = {r["recipient"] for r in conn.execute("SELECT DISTINCT recipient FROM events WHERE type = 'reply'")}
+    for recipient in replied_recipients:
+        persona = persona_of.get(recipient)
+        if persona:
+            persona_replied[persona] = persona_replied.get(persona, 0) + 1
+
+    return {
+        persona: round(100 * persona_replied.get(persona, 0) / total, 1)
+        for persona, total in persona_totals.items()
+    }
+
+
+def _time_to_first_reply_distribution(conn) -> dict:
+    rows = conn.execute(
+        "SELECT first_sent_at, replied_at FROM recipients "
+        "WHERE replied_at IS NOT NULL AND first_sent_at IS NOT NULL"
+    ).fetchall()
+    buckets = {"same_day": 0, "1_2_days": 0, "3_7_days": 0, "8_plus_days": 0}
+    for row in rows:
+        sent = datetime.fromisoformat(row["first_sent_at"])
+        replied = datetime.fromisoformat(row["replied_at"])
+        delta_days = (replied - sent).total_seconds() / 86400
+        if delta_days < 1:
+            buckets["same_day"] += 1
+        elif delta_days < 3:
+            buckets["1_2_days"] += 1
+        elif delta_days < 8:
+            buckets["3_7_days"] += 1
+        else:
+            buckets["8_plus_days"] += 1
+    return buckets
+
+
+def engagement_intelligence(conn) -> dict:
+    return {
+        "reply_rate_by_persona": _reply_rate_by_persona(conn),
+        "reply_by_stage": _count_by_stage(conn, "reply"),
+        "click_by_stage": _count_by_stage(conn, "click"),
+        "time_to_first_reply": _time_to_first_reply_distribution(conn),
+    }
+
+
+def needs_triage(conn) -> list:
+    """Recipients who replied but haven't been tagged real/OOO/not-interested
+    yet (§8's actionable Replies section). A later `ooo_tagged` or
+    `reply_reviewed` event resolves the reply — the same 'any later closing
+    event' pattern as due_for_ooo_resend()/latest_open_draft_id()."""
+    rows = conn.execute(
+        """
+        SELECT r1.recipient, r1.campaign, r1.stage, r1.timestamp FROM events r1
+        WHERE r1.type = 'reply'
+        AND r1.id = (SELECT MAX(id) FROM events WHERE recipient = r1.recipient AND type = 'reply')
+        AND NOT EXISTS (
+            SELECT 1 FROM events e2
+            WHERE e2.recipient = r1.recipient AND e2.type IN ('ooo_tagged', 'reply_reviewed')
+            AND e2.id > r1.id
+        )
+        ORDER BY r1.timestamp DESC
+        """
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def actionable_replies(conn, consumer_domains: set) -> list:
+    """needs_triage() plus prior-contact domain context (§8: "each row shows
+    prior-contact context from the domain history"), reusing step 7's
+    dedup check rather than re-deriving the same aggregation."""
+    result = []
+    for reply in needs_triage(conn):
+        result.append({**reply, "dedup_context": check_recipient(conn, reply["recipient"], consumer_domains)})
+    return result
+
+
+def tag_reply(conn, recipient: str, tag: str) -> None:
+    """The dashboard's single write action (§8): tag a reply real/OOO/
+    not-interested. 'ooo' triggers the real re-queue mechanism (step 10);
+    'real'/'not_interested' are pure triage bookkeeping with no state
+    transition (neither is a valid recipients.status value)."""
+    if tag not in ("real", "ooo", "not_interested"):
+        raise ValueError(f"unknown tag {tag!r} — must be 'real', 'ooo', or 'not_interested'")
+    if tag == "ooo":
+        _tag_ooo(conn, recipient)
+        return
+    row = conn.execute("SELECT campaign FROM recipients WHERE recipient = ?", (recipient,)).fetchone()
+    campaign = row["campaign"] if row else None
+    append_event(conn, type="reply_reviewed", recipient=recipient, campaign=campaign, meta={"tag": tag})
+
+
+def _followups_scheduled(conn, global_config, *, today: date = None) -> dict:
+    today = today or date.today()
+    tomorrow = today + timedelta(days=1)
+    rows = conn.execute(
+        "SELECT recipient, persona, current_stage, first_sent_at FROM recipients "
+        "WHERE status = 'active' AND first_sent_at IS NOT NULL"
+    ).fetchall()
+    due_today, due_tomorrow = [], []
+    for row in rows:
+        cadence = global_config.personas.get(row["persona"])
+        if not cadence:
+            continue
+        next_stage = row["current_stage"] + 1
+        if next_stage > len(cadence):
+            continue
+        cumulative_days = sum(cadence[:next_stage])
+        fire_date = _local_date(row["first_sent_at"]) + timedelta(days=cumulative_days)
+        entry = {"recipient": row["recipient"], "next_stage": next_stage, "fire_date": fire_date}
+        if fire_date == today:
+            due_today.append(entry)
+        elif fire_date == tomorrow:
+            due_tomorrow.append(entry)
+    return {"today": due_today, "tomorrow": due_tomorrow}
+
+
+def pipeline(conn, global_config, *, today: date = None) -> dict:
+    rows = conn.execute("SELECT recipient, current_stage FROM recipients WHERE status = 'active'").fetchall()
+    by_stage: dict = {}
+    for row in rows:
+        by_stage.setdefault(row["current_stage"], []).append(row["recipient"])
+    return {
+        "mid_sequence_by_stage": by_stage,
+        "followups_scheduled": _followups_scheduled(conn, global_config, today=today),
+    }
+
+
+def todays_runs(conn, *, today: date = None) -> dict:
+    today = today or date.today()
+    rows = conn.execute(
+        "SELECT timestamp, type, meta FROM events WHERE type IN "
+        "('run_started', 'run_completed', 'run_failed') ORDER BY id"
+    ).fetchall()
+    runs = []
+    current = None
+    for row in rows:
+        if _local_date(row["timestamp"]) != today:
+            continue
+        meta = json.loads(row["meta"]) if row["meta"] else {}
+        if row["type"] == "run_started":
+            current = {"fired_at": row["timestamp"], "sent": None, "failed": None,
+                       "still_queued": None, "run_failed": False, "error": None, "retry_count": None}
+            runs.append(current)
+        elif row["type"] == "run_completed" and current is not None:
+            current["sent"] = meta.get("sent")
+            current["failed"] = meta.get("failed")
+            current["still_queued"] = meta.get("remaining_queued")
+        elif row["type"] == "run_failed":
+            runs.append({"fired_at": row["timestamp"], "sent": None, "failed": None, "still_queued": None,
+                        "run_failed": True, "error": meta.get("error"), "retry_count": meta.get("retry_count")})
+            current = None
+    return {
+        "runs": runs,
+        "current_queue_depth": len(due_recipients(conn)) + len(due_for_ooo_resend(conn)),
+    }
+
+
+def _to_local(value) -> str:
+    """UTC (a datetime, or an ISO string as stored in `events`) -> local
+    display string. Convert to local only at dashboard display (§5)."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str) -> Flask:
+    """§8: reads SQLite, polls GMass reports on open, renders read-only
+    panels except the single write action (reply tagging).
+
+    Takes a `db_path`, not an open connection: Flask's dev server (and any
+    real WSGI server) dispatches each request on its own thread, and
+    sqlite3 connections are only usable on the thread that created them
+    (`check_same_thread` defaults to True). A connection opened once at
+    startup and closed over by the route functions works for the first
+    request and then raises `sqlite3.ProgrammingError` on every request
+    handled by a different thread. Each request instead lazily opens its
+    own connection (cached on Flask's per-request `g`) and closes it via
+    `teardown_appcontext`, the standard Flask SQLite pattern."""
+    app = Flask(__name__, template_folder=TEMPLATE_FOLDER)
+    app.jinja_env.filters["to_local"] = _to_local
+
+    def get_conn():
+        if "db_conn" not in g:
+            g.db_conn = sqlite3.connect(db_path)
+            g.db_conn.row_factory = sqlite3.Row
+        return g.db_conn
+
+    @app.teardown_appcontext
+    def close_conn(exception=None):
+        conn = g.pop("db_conn", None)
+        if conn is not None:
+            conn.close()
+
+    @app.route("/")
+    def index():
+        conn = get_conn()
+        sync_result = sync_reports(conn, api_key)
+        return render_template(
+            "dashboard.html",
+            sync_result=sync_result,
+            today=today_strip(conn, global_config),
+            week=this_week(conn),
+            engagement=engagement_intelligence(conn),
+            replies=actionable_replies(conn, consumer_domains),
+            pipeline=pipeline(conn, global_config),
+            runs=todays_runs(conn),
+        )
+
+    @app.route("/reply/<string:recipient>/tag", methods=["POST"])
+    def reply_tag(recipient):
+        tag = request.form.get("tag", "")
+        try:
+            tag_reply(get_conn(), recipient, tag)
+        except ValueError as e:
+            return str(e), 400
+        return redirect(url_for("index"))
+
+    return app

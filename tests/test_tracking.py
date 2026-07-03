@@ -6,7 +6,7 @@ import sqlite3
 
 import pytest
 
-from slap.tracking import TrackingError, append_event, connect, rebuild
+from slap.tracking import TrackingError, append_event, connect, latest_open_draft_id, rebuild
 
 
 @pytest.fixture
@@ -146,6 +146,21 @@ def test_requeued_returns_to_active_status(conn):
     assert recipient_row(conn, "a@x.com")["status"] == "active"
 
 
+def test_requeued_advances_stage_and_campaign_id_like_sent_does(conn):
+    # Step 10: requeued mirrors sent so a successful OOO resend looks the
+    # same to the cache as any other send, and status='active' (not
+    # 'ooo_requeued') is what naturally removes it from the OOO due-query.
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0)
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=0, gmass_campaign_id="1")
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
+    append_event(conn, type="ooo_tagged", recipient="a@x.com", campaign="c")
+    append_event(conn, type="requeued", recipient="a@x.com", campaign="c", stage=1, gmass_campaign_id="2")
+    row = recipient_row(conn, "a@x.com")
+    assert row["status"] == "active"
+    assert row["current_stage"] == 1
+    assert row["last_gmass_campaign_id"] == "2"
+
+
 def test_click_does_not_change_status(conn):
     append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0)
     append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=0, timestamp=_ts(1))
@@ -171,15 +186,101 @@ def test_run_level_events_never_touch_recipients_cache(conn):
     assert len(all_events(conn)) == 3
 
 
+def test_draft_created_is_cache_inert(conn):
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter"})
+    before = recipient_row(conn, "a@x.com")
+    append_event(conn, type="draft_created", recipient="a@x.com", campaign="c", stage=0,
+                 gmass_draft_id="r-1")
+    after = recipient_row(conn, "a@x.com")
+    assert before == after
+
+
+def test_reply_reviewed_is_cache_inert(conn):
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter"})
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
+    before = recipient_row(conn, "a@x.com")
+    append_event(conn, type="reply_reviewed", recipient="a@x.com", campaign="c",
+                 meta={"tag": "not_interested"})
+    after = recipient_row(conn, "a@x.com")
+    assert before == after  # status stays 'replied' — real/not_interested aren't cache states
+
+
+# --- latest_open_draft_id (§3 idempotency support) --------------------------
+
+def test_latest_open_draft_id_none_when_never_drafted(conn):
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0)
+    assert latest_open_draft_id(conn, "a@x.com") is None
+
+
+def test_latest_open_draft_id_returns_open_draft(conn):
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0)
+    append_event(conn, type="draft_created", recipient="a@x.com", campaign="c",
+                 stage=0, gmass_draft_id="r-1")
+    assert latest_open_draft_id(conn, "a@x.com") == "r-1"
+
+
+def test_latest_open_draft_id_none_once_sent(conn):
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0)
+    append_event(conn, type="draft_created", recipient="a@x.com", campaign="c",
+                 stage=0, gmass_draft_id="r-1")
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=0,
+                 gmass_campaign_id="1")
+    assert latest_open_draft_id(conn, "a@x.com") is None
+
+
+def test_latest_open_draft_id_picks_the_newest_after_a_completed_cycle(conn):
+    # A second queued/draft_created cycle for the same recipient (e.g. a
+    # future OOO resend, step 10) must not resurrect the OLD, already-sent
+    # draft as "open".
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0)
+    append_event(conn, type="draft_created", recipient="a@x.com", campaign="c",
+                 stage=0, gmass_draft_id="r-1")
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=0,
+                 gmass_campaign_id="1")
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=1)
+    append_event(conn, type="draft_created", recipient="a@x.com", campaign="c",
+                 stage=1, gmass_draft_id="r-2")
+    assert latest_open_draft_id(conn, "a@x.com") == "r-2"
+
+
+def test_latest_open_draft_id_none_once_requeued(conn):
+    # requeued (step 10's OOO resend completion marker) must close an open
+    # draft exactly like sent does — a real bug found while testing multiple
+    # OOO cycles: without this, a SECOND cycle's latest_open_draft_id lookup
+    # would wrongly resurrect the FIRST cycle's already-resolved draft.
+    append_event(conn, type="ooo_tagged", recipient="a@x.com", campaign="c")
+    append_event(conn, type="draft_created", recipient="a@x.com", campaign="c",
+                 stage=1, gmass_draft_id="r-1")
+    append_event(conn, type="requeued", recipient="a@x.com", campaign="c", stage=1,
+                 gmass_campaign_id="1")
+    assert latest_open_draft_id(conn, "a@x.com") is None
+
+
+def test_latest_open_draft_id_picks_the_newest_across_two_ooo_cycles(conn):
+    append_event(conn, type="ooo_tagged", recipient="a@x.com", campaign="c")
+    append_event(conn, type="draft_created", recipient="a@x.com", campaign="c",
+                 stage=1, gmass_draft_id="r-1")
+    append_event(conn, type="requeued", recipient="a@x.com", campaign="c", stage=1,
+                 gmass_campaign_id="1")
+    append_event(conn, type="ooo_tagged", recipient="a@x.com", campaign="c")
+    append_event(conn, type="draft_created", recipient="a@x.com", campaign="c",
+                 stage=2, gmass_draft_id="r-2")
+    assert latest_open_draft_id(conn, "a@x.com") == "r-2"
+
+
 # --- the core acceptance test -----------------------------------------------
 
 def test_rebuild_reproduces_cache_identically(conn):
     # A realistic, mixed multi-recipient history exercising every one of the
-    # 11 event types and every status end-state (active, replied, bounced,
+    # 13 event types and every status end-state (active, replied, bounced,
     # done, ooo_requeued — plus a distinct recipient resent out of OOO back
     # to active, so 'requeued' is exercised as a transition too).
     append_event(conn, type="queued", recipient="active@x.com", campaign="c", stage=0,
                  meta={"persona": "recruiter"}, timestamp=_ts(1))
+    append_event(conn, type="draft_created", recipient="active@x.com", campaign="c", stage=0,
+                 gmass_draft_id="r-1", timestamp=_ts(1.5))
     append_event(conn, type="sent", recipient="active@x.com", campaign="c", stage=0,
                  gmass_campaign_id="1", timestamp=_ts(2))
     append_event(conn, type="click", recipient="active@x.com", campaign="c", timestamp=_ts(3))
@@ -189,6 +290,8 @@ def test_rebuild_reproduces_cache_identically(conn):
     append_event(conn, type="sent", recipient="replied@x.com", campaign="c", stage=0,
                  gmass_campaign_id="2", timestamp=_ts(2))
     append_event(conn, type="reply", recipient="replied@x.com", campaign="c", timestamp=_ts(3))
+    append_event(conn, type="reply_reviewed", recipient="replied@x.com", campaign="c",
+                 meta={"tag": "real"}, timestamp=_ts(4))
 
     append_event(conn, type="queued", recipient="bounced@x.com", campaign="c", stage=0,
                  meta={"persona": "hiring_manager"}, timestamp=_ts(1))
@@ -219,8 +322,8 @@ def test_rebuild_reproduces_cache_identically(conn):
     append_event(conn, type="run_failed", meta={"error": "boom", "retry_count": 3}, timestamp=_ts(7))
 
     assert {e["type"] for e in all_events(conn)} == set(
-        ["queued", "sent", "click", "reply", "bounce", "ooo_tagged", "requeued",
-         "run_started", "run_completed", "send_failed", "run_failed"]
+        ["queued", "draft_created", "sent", "click", "reply", "bounce", "ooo_tagged",
+         "requeued", "reply_reviewed", "run_started", "run_completed", "send_failed", "run_failed"]
     )
 
     live_state = all_recipients(conn)

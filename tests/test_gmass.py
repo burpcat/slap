@@ -10,7 +10,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from slap.gmass import GMassError, build_campaign_settings, create_draft, get_reports, send_campaign
+from slap.gmass import (
+    GMassError, build_campaign_settings, build_reply_settings, create_draft, get_reports, send_campaign,
+)
 
 
 def _response(status_code, body):
@@ -172,3 +174,27 @@ def test_build_campaign_settings_overrides():
     assert settings["openTracking"] is True
     assert settings["createDrafts"] is True
     assert settings["stageOneAction"] == "a"
+
+
+# --- build_reply_settings (OOO resend, step 10) ---------------------------
+
+def test_build_reply_settings_basic():
+    settings = build_reply_settings(52120430)
+    assert settings["sendAsReply"] is True
+    assert settings["campaignIdToReplyTo"] == 52120430
+    assert settings["openTracking"] is False
+    assert settings["clickTracking"] is True
+    assert settings["createDrafts"] is False
+
+
+def test_build_reply_settings_coerces_campaign_id_to_int():
+    # recipients.last_gmass_campaign_id is stored as TEXT — must coerce.
+    settings = build_reply_settings("52120430")
+    assert settings["campaignIdToReplyTo"] == 52120430
+    assert isinstance(settings["campaignIdToReplyTo"], int)
+
+
+def test_build_reply_settings_overrides():
+    settings = build_reply_settings(1, open_tracking=True, create_drafts=True)
+    assert settings["openTracking"] is True
+    assert settings["createDrafts"] is True
