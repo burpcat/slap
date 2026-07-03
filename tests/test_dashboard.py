@@ -14,8 +14,9 @@ from werkzeug.serving import make_server
 
 from slap.config import GlobalConfig, ScheduleConfig
 from slap.dashboard import (
-    actionable_replies, create_app, engagement_intelligence, needs_triage, pipeline,
-    sync_reports, tag_reply, this_week, today_strip, todays_runs,
+    actionable_replies, bounces, companies_contacted, create_app, engagement_intelligence,
+    needs_triage, next_drain, pipeline, sync_reports, tag_reply, this_week, today_strip,
+    todays_runs, warm_but_silent,
 )
 from slap.tracking import append_event, connect
 
@@ -339,6 +340,29 @@ def test_reply_and_click_by_stage(conn):
     assert result["click_by_stage"] == {0: 1}
 
 
+def test_engagement_intelligence_has_data_false_when_nothing_happened_yet(conn):
+    # Before any campaign activity, the three sub-tables would otherwise
+    # show four rows of zeros — has_data lets the template collapse them to
+    # a single honest "no data yet" line instead.
+    result = engagement_intelligence(conn)
+    assert result["has_data"] is False
+
+
+def test_engagement_intelligence_has_data_true_once_a_persona_has_been_contacted(conn):
+    # Even a 0% reply rate is real data once someone's actually been
+    # contacted — not a fabricated placeholder.
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
+    result = engagement_intelligence(conn)
+    assert result["has_data"] is True
+    assert result["reply_rate_by_persona"]["recruiter"] == 0.0
+
+
+def test_engagement_intelligence_has_data_true_from_a_click_alone(conn):
+    append_event(conn, type="click", recipient="a@x.com", campaign="c", stage=0)
+    result = engagement_intelligence(conn)
+    assert result["has_data"] is True
+
+
 def test_time_to_first_reply_distribution_buckets(conn):
     append_event(conn, type="queued", recipient="same_day@x.com", campaign="c", stage=0,
                  meta={"persona": "recruiter"}, timestamp=_ts(0))
@@ -490,6 +514,164 @@ def test_todays_runs_current_queue_depth(conn):
     append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
     result = todays_runs(conn, today=date(2026, 1, 15))
     assert result["current_queue_depth"] == 1
+
+
+def test_todays_runs_excludes_zero_activity_completed_runs(conn):
+    # A drain that found nothing to do (sent=0, failed=0, nothing left
+    # queued) is a passive no-op — it shouldn't clutter the runs list.
+    append_event(conn, type="run_started", timestamp=_ts(0))
+    append_event(conn, type="run_completed", meta={"sent": 0, "failed": 0, "remaining_queued": 0},
+                 timestamp=_ts(0) + timedelta(minutes=1))
+    result = todays_runs(conn, today=date(2026, 1, 15))
+    assert result["runs"] == []
+
+
+def test_todays_runs_keeps_run_with_any_real_activity(conn):
+    append_event(conn, type="run_started", timestamp=_ts(0))
+    append_event(conn, type="run_completed", meta={"sent": 0, "failed": 0, "remaining_queued": 3},
+                 timestamp=_ts(0) + timedelta(minutes=1))
+    result = todays_runs(conn, today=date(2026, 1, 15))
+    assert len(result["runs"]) == 1  # still_queued=3 is real information, not a no-op
+
+
+def test_todays_runs_keeps_run_failed_even_though_counts_are_zero_like(conn):
+    # run_failed entries never got real sent/failed/queued counts (they're
+    # None, not 0) — but even so, a failure must never be filtered as a
+    # "zero-activity" no-op.
+    append_event(conn, type="run_failed", meta={"error": "no api key", "retry_count": 3}, timestamp=_ts(0))
+    result = todays_runs(conn, today=date(2026, 1, 15))
+    assert len(result["runs"]) == 1
+    assert result["runs"][0]["run_failed"] is True
+
+
+def test_todays_runs_caps_to_last_8_with_earlier_count(conn):
+    for i in range(10):
+        started_at = _ts(0) + timedelta(minutes=2 * i)
+        append_event(conn, type="run_started", timestamp=started_at)
+        append_event(conn, type="run_completed", meta={"sent": 1, "failed": 0, "remaining_queued": 0},
+                     timestamp=started_at + timedelta(minutes=1))
+    result = todays_runs(conn, today=date(2026, 1, 15))
+    assert len(result["runs"]) == 8
+    assert result["earlier_count"] == 2
+
+
+def test_todays_runs_earlier_count_zero_when_under_the_cap(conn):
+    append_event(conn, type="run_started", timestamp=_ts(0))
+    append_event(conn, type="run_completed", meta={"sent": 1, "failed": 0, "remaining_queued": 0},
+                 timestamp=_ts(0, 1))
+    result = todays_runs(conn, today=date(2026, 1, 15))
+    assert result["earlier_count"] == 0
+
+
+# --- warm_but_silent / bounces / companies_contacted / next_drain ---------
+
+def test_warm_but_silent_lists_clicked_but_not_replied(conn):
+    append_event(conn, type="click", recipient="a@x.com", campaign="c", stage=0)
+    result = warm_but_silent(conn)
+    assert len(result) == 1
+    assert result[0]["recipient"] == "a@x.com"
+    assert result[0]["campaign"] == "c"
+    assert result[0]["stages_clicked"] == [0]
+
+
+def test_warm_but_silent_excludes_recipients_who_replied(conn):
+    append_event(conn, type="click", recipient="a@x.com", campaign="c", stage=0)
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
+    assert warm_but_silent(conn) == []
+
+
+def test_warm_but_silent_excludes_a_recipient_who_replied_after_a_later_ooo_cycle(conn):
+    # Once replied at all, never "silent" again — even if a later OOO resend
+    # reopened their sequence and they clicked a follow-up link too.
+    append_event(conn, type="click", recipient="a@x.com", campaign="c", stage=0)
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
+    append_event(conn, type="ooo_tagged", recipient="a@x.com", campaign="c")
+    append_event(conn, type="requeued", recipient="a@x.com", campaign="c", stage=1, gmass_campaign_id="1")
+    append_event(conn, type="click", recipient="a@x.com", campaign="c", stage=1)
+    assert warm_but_silent(conn) == []
+
+
+def test_warm_but_silent_dedupes_multiple_stage_clicks_for_one_recipient(conn):
+    append_event(conn, type="click", recipient="a@x.com", campaign="c", stage=0)
+    append_event(conn, type="click", recipient="a@x.com", campaign="c", stage=0)
+    append_event(conn, type="click", recipient="a@x.com", campaign="c", stage=1)
+    result = warm_but_silent(conn)
+    assert len(result) == 1
+    assert result[0]["stages_clicked"] == [0, 1]
+
+
+def test_warm_but_silent_empty_when_no_clicks(conn):
+    assert warm_but_silent(conn) == []
+
+
+def test_bounces_lists_bounced_recipients(conn):
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
+    append_event(conn, type="bounce", recipient="a@x.com", campaign="c")
+    result = bounces(conn)
+    assert len(result) == 1
+    assert result[0]["recipient"] == "a@x.com"
+
+
+def test_bounces_empty_when_none(conn):
+    assert bounces(conn) == []
+
+
+def test_bounces_excludes_non_bounced_recipients(conn):
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=0)
+    assert bounces(conn) == []
+
+
+def test_companies_contacted_counts_distinct_non_consumer_domains(conn):
+    append_event(conn, type="queued", recipient="a@acme.com", campaign="c", stage=0, meta={"persona": "recruiter"})
+    append_event(conn, type="sent", recipient="a@acme.com", campaign="c", stage=0, timestamp=_ts(0))
+    append_event(conn, type="queued", recipient="b@acme.com", campaign="c", stage=0, meta={"persona": "recruiter"})
+    append_event(conn, type="sent", recipient="b@acme.com", campaign="c", stage=0, timestamp=_ts(0))
+    append_event(conn, type="queued", recipient="c@other.com", campaign="c", stage=0, meta={"persona": "recruiter"})
+    append_event(conn, type="sent", recipient="c@other.com", campaign="c", stage=0, timestamp=_ts(0))
+
+    result = companies_contacted(conn, consumer_domains=set(), today=date(2026, 1, 15))
+    assert result["all_time_count"] == 2  # acme.com + other.com, not 3 people
+    assert ("acme.com", 2) in result["top_companies"]
+
+
+def test_companies_contacted_excludes_consumer_domains(conn):
+    append_event(conn, type="queued", recipient="a@gmail.com", campaign="c", stage=0, meta={"persona": "recruiter"})
+    append_event(conn, type="sent", recipient="a@gmail.com", campaign="c", stage=0, timestamp=_ts(0))
+    result = companies_contacted(conn, consumer_domains={"gmail.com"}, today=date(2026, 1, 15))
+    assert result["all_time_count"] == 0
+
+
+def test_companies_contacted_excludes_merely_staged_never_sent(conn):
+    # A "queued" event alone (never actually sent) must not count as
+    # "contacted" — that would overstate real outreach.
+    append_event(conn, type="queued", recipient="a@acme.com", campaign="c", stage=0, meta={"persona": "recruiter"})
+    result = companies_contacted(conn, consumer_domains=set(), today=date(2026, 1, 15))
+    assert result["all_time_count"] == 0
+
+
+def test_companies_contacted_this_week_vs_all_time(conn):
+    append_event(conn, type="queued", recipient="old@acme.com", campaign="c", stage=0, meta={"persona": "recruiter"})
+    append_event(conn, type="sent", recipient="old@acme.com", campaign="c", stage=0, timestamp=_ts(-30))
+    append_event(conn, type="queued", recipient="new@other.com", campaign="c", stage=0, meta={"persona": "recruiter"})
+    append_event(conn, type="sent", recipient="new@other.com", campaign="c", stage=0, timestamp=_ts(0))
+
+    result = companies_contacted(conn, consumer_domains=set(), today=date(2026, 1, 15))
+    assert result["all_time_count"] == 2
+    assert result["this_week_count"] == 1
+
+
+def test_companies_contacted_empty_when_nothing_sent(conn):
+    result = companies_contacted(conn, consumer_domains=set(), today=date(2026, 1, 15))
+    assert result == {"all_time_count": 0, "this_week_count": 0, "top_companies": []}
+
+
+def test_next_drain_reports_window_and_queue_depth(conn):
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
+    result = next_drain(conn, make_global_config())
+    assert result["fire_window_start"] == "09:00"
+    assert result["fire_window_end"] == "09:15"
+    assert result["queue_depth"] == 1
 
 
 # --- create_app: Flask routes ----------------------------------------------

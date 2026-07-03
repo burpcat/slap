@@ -26,7 +26,7 @@ from pathlib import Path
 import requests
 from flask import Flask, g, redirect, request, render_template, url_for
 
-from slap import gmass
+from slap import domains, gmass
 from slap.config import discover_campaigns
 from slap.domains import check_recipient
 from slap.queue import due_for_ooo_resend, due_recipients, tag_ooo as _tag_ooo
@@ -288,11 +288,25 @@ def _time_to_first_reply_distribution(conn) -> dict:
 
 
 def engagement_intelligence(conn) -> dict:
+    reply_rate_by_persona = _reply_rate_by_persona(conn)
+    reply_by_stage = _count_by_stage(conn, "reply")
+    click_by_stage = _count_by_stage(conn, "click")
+    time_to_first_reply = _time_to_first_reply_distribution(conn)
+    # "no engagement data yet" honestly collapses the three sub-tables
+    # instead of showing four rows of zeros before any campaign activity
+    # exists. A non-empty reply_rate_by_persona (even at 0%) still counts as
+    # real data — it means recipients have actually been contacted, so a 0%
+    # rate is informative, not a fabricated placeholder.
+    has_data = (
+        bool(reply_rate_by_persona) or any(reply_by_stage.values())
+        or any(click_by_stage.values()) or any(time_to_first_reply.values())
+    )
     return {
-        "reply_rate_by_persona": _reply_rate_by_persona(conn),
-        "reply_by_stage": _count_by_stage(conn, "reply"),
-        "click_by_stage": _count_by_stage(conn, "click"),
-        "time_to_first_reply": _time_to_first_reply_distribution(conn),
+        "reply_rate_by_persona": reply_rate_by_persona,
+        "reply_by_stage": reply_by_stage,
+        "click_by_stage": click_by_stage,
+        "time_to_first_reply": time_to_first_reply,
+        "has_data": has_data,
     }
 
 
@@ -402,9 +416,105 @@ def todays_runs(conn, *, today: date = None) -> dict:
             runs.append({"fired_at": row["timestamp"], "sent": None, "failed": None, "still_queued": None,
                         "run_failed": True, "error": meta.get("error"), "retry_count": meta.get("retry_count")})
             current = None
+
+    # A drain that found nothing to do (sent=0, failed=0, nothing left
+    # queued) is a passive no-op, not something worth a row on the
+    # dashboard — but a real failure (run_failed) or an in-progress/
+    # never-completed run (fields still None) is never hidden.
+    def _is_zero_activity(run):
+        return not run["run_failed"] and run["sent"] == 0 and run["failed"] == 0 and run["still_queued"] == 0
+
+    meaningful_runs = [r for r in runs if not _is_zero_activity(r)]
+    capped = meaningful_runs[-8:]
     return {
-        "runs": runs,
+        "runs": capped,
+        "earlier_count": len(meaningful_runs) - len(capped),
         "current_queue_depth": len(due_recipients(conn)) + len(due_for_ooo_resend(conn)),
+    }
+
+
+def warm_but_silent(conn) -> list:
+    """Recipients who clicked a link but have NOT replied — the highest-
+    value signal on the dashboard (a click with no reply means the message
+    landed and was read, just not answered yet). Depends entirely on the
+    click-tracking fix (see CONTROL_SHEET.md's post-launch click-tracking
+    section) — stays honestly empty until real click events exist. "Not
+    replied" means no reply event ever, not just "not currently in a reply
+    state" — once someone has replied at all they're no longer silent, even
+    if a later OOO cycle reopened their sequence."""
+    click_rows = conn.execute(
+        "SELECT recipient, campaign, stage FROM events WHERE type = 'click' ORDER BY recipient, stage"
+    ).fetchall()
+    replied = {r["recipient"] for r in conn.execute("SELECT DISTINCT recipient FROM events WHERE type = 'reply'")}
+
+    by_recipient: dict = {}
+    for row in click_rows:
+        if row["recipient"] in replied:
+            continue
+        entry = by_recipient.setdefault(
+            row["recipient"], {"recipient": row["recipient"], "campaign": row["campaign"], "stages_clicked": []}
+        )
+        if row["stage"] not in entry["stages_clicked"]:
+            entry["stages_clicked"].append(row["stage"])
+
+    return sorted(by_recipient.values(), key=lambda e: e["recipient"])
+
+
+def bounces(conn) -> list:
+    """Bounced/undeliverable recipients — already recorded in `events` but
+    previously invisible on the dashboard, so a dead address could keep
+    getting silently "followed up" forever with no owner visibility."""
+    rows = conn.execute(
+        "SELECT recipient, campaign, last_event_at FROM recipients "
+        "WHERE status = 'bounced' ORDER BY last_event_at DESC"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def companies_contacted(conn, consumer_domains: set, *, today: date = None) -> dict:
+    """Distinct non-consumer company domains actually contacted (this week +
+    all-time) plus the top companies by headcount — supports DIY dedup
+    awareness (§6), built on the same domain_index() the `domains` command
+    itself uses (one source of truth). "Contacted" requires an actual send
+    (first_sent_at set) — a merely staged-but-never-sent recipient doesn't
+    count, or this would overstate real outreach."""
+    today = today or date.today()
+    week_start = today - timedelta(days=6)
+    index = domains.domain_index(conn)
+
+    non_consumer = {}
+    for domain, contacts in index.items():
+        if domain in consumer_domains:
+            continue
+        sent_contacts = [c for c in contacts if c.first_sent_at]
+        if sent_contacts:
+            non_consumer[domain] = sent_contacts
+
+    this_week_domains = {
+        d for d, contacts in non_consumer.items()
+        if any(week_start <= _local_date(c.first_sent_at) <= today for c in contacts)
+    }
+    top_companies = sorted(
+        ((d, len(contacts)) for d, contacts in non_consumer.items()), key=lambda t: (-t[1], t[0])
+    )[:5]
+
+    return {
+        "all_time_count": len(non_consumer),
+        "this_week_count": len(this_week_domains),
+        "top_companies": top_companies,
+    }
+
+
+def next_drain(conn, global_config) -> dict:
+    """The next scheduled fire window + current queue depth (§new widget),
+    so "N queued, fires ~9am" is visible at a glance. No new scheduling
+    logic — just surfaces the existing schedule config plus a live count
+    from the same due_recipients()/due_for_ooo_resend() the runner itself
+    drains from."""
+    return {
+        "fire_window_start": global_config.schedule.fire_window_start,
+        "fire_window_end": global_config.schedule.fire_window_end,
+        "queue_depth": len(due_recipients(conn)) + len(due_for_ooo_resend(conn)),
     }
 
 
@@ -461,6 +571,10 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
             replies=actionable_replies(conn, consumer_domains),
             pipeline=pipeline(conn, global_config),
             runs=todays_runs(conn),
+            warm_but_silent=warm_but_silent(conn),
+            bounces=bounces(conn),
+            companies=companies_contacted(conn, consumer_domains),
+            next_drain=next_drain(conn, global_config),
         )
 
     @app.route("/reply/<string:recipient>/tag", methods=["POST"])
