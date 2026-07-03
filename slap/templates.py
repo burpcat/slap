@@ -29,25 +29,33 @@ def find_malformed_placeholders(text: str) -> set:
 
 
 def parse_drop(text: str, fields: list) -> dict:
-    """Parse a pasted 'Label : value' drop into {field.key: value}.
+    """Parse a pasted 'Label : value' (or 'key : value') drop into {field.key: value}.
 
     - split each line on the FIRST colon only (line.partition(':'))
     - strip exactly one separator space after the colon, preserve the rest
     - colon-less lines are ignored
-    - label matching is case-insensitive (a pasted drop typed as "email:" must
-      match a field declared `label: Email` — the casing a human happens to
-      type shouldn't silently drop the whole field to empty)
-    - labels not matching any known field are ignored (unknown keys ignored)
-    - fields whose label never appears in the drop default to '' (missing keys default empty)
+    - each line's left-hand side is matched, case-insensitively, against
+      EITHER a field's `label` (the human-readable name, e.g. "Recruiter
+      name") OR its `key` (the internal snake_case identifier, e.g.
+      "recruiter_name") — a drop can be typed either way. `key` is checked
+      first: for a single-word field (e.g. `key: company, label: Company`)
+      the two coincide anyway, but where they diverge (any multi-word label)
+      matching label-only would silently default a real field to empty
+      whenever the drop was typed with the key instead — exactly the
+      real-world case this fixes.
+    - lines matching neither a known label nor key are ignored
+    - fields never matched in the drop default to '' (missing keys default empty)
     - paste-only: no interactive field-by-field entry
     """
+    by_key = {f.key.lower(): f.key for f in fields}
     by_label = {f.label.lower(): f.key for f in fields}
     values = {f.key: "" for f in fields}
     for line in text.splitlines():
         label_raw, sep, value_raw = line.partition(":")
         if not sep:
             continue
-        key = by_label.get(label_raw.strip().lower())
+        lookup = label_raw.strip().lower()
+        key = by_key.get(lookup) or by_label.get(lookup)
         if key is None:
             continue
         values[key] = value_raw[1:] if value_raw.startswith(" ") else value_raw

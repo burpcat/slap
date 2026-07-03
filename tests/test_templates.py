@@ -33,6 +33,59 @@ def test_parse_drop_matches_label_case_insensitively():
     assert values["company"] == "Acme Corp"
 
 
+def test_parse_drop_matches_field_key_when_drop_uses_key_not_label():
+    # Real BLOCKER: a drop typed with snake_case field KEYS on the left
+    # (matching {{placeholder}} names, not campaign.yaml's human labels)
+    # must still parse. Single-word fields (email/company) "accidentally"
+    # worked before this fix because key and label happened to coincide;
+    # every multi-word-labeled field (role_catted -> "Role", recruiter_name
+    # -> "Recruiter name", experience_1 -> "Experience 1", byebye ->
+    # "Signoff") silently defaulted to empty. Mirrors the real
+    # coldpost-recruiter campaign.yaml field definitions exactly.
+    recruiter_fields = [
+        CampaignField(key="email", label="Email"),
+        CampaignField(key="role_catted", label="Role"),
+        CampaignField(key="company", label="Company"),
+        CampaignField(key="req_id", label="Req ID"),
+        CampaignField(key="recruiter_name", label="Recruiter name"),
+        CampaignField(key="experience_1", label="Experience 1"),
+        CampaignField(key="experience_2", label="Experience 2"),
+        CampaignField(key="byebye", label="Signoff"),
+    ]
+    drop = (
+        "email : avarutla+testmass1@gmail.com\n"
+        "role_catted : data scientist\n"
+        "company : TestCo\n"
+        "req_id :  Req ID: 6900\n"
+        "recruiter_name : Test Recruiter\n"
+        "experience_1 : built an eval...\n"
+        "experience_2 : cut onboarding...\n"
+        "byebye : Thanks a ton\n"
+    )
+    values = parse_drop(drop, recruiter_fields)
+    assert values["email"] == "avarutla+testmass1@gmail.com"
+    assert values["role_catted"] == "data scientist"
+    assert values["company"] == "TestCo"
+    assert values["req_id"] == " Req ID: 6900"
+    assert values["recruiter_name"] == "Test Recruiter"
+    assert values["experience_1"] == "built an eval..."
+    assert values["experience_2"] == "cut onboarding..."
+    assert values["byebye"] == "Thanks a ton"
+
+
+def test_parse_drop_still_matches_label_when_drop_uses_label_not_key():
+    # The other convention must keep working too — matching key first must
+    # not break matching by human label for anyone who types it that way.
+    recruiter_fields = [
+        CampaignField(key="role_catted", label="Role"),
+        CampaignField(key="recruiter_name", label="Recruiter name"),
+    ]
+    drop = "Role : Data Scientist\nRecruiter name : Test Recruiter\n"
+    values = parse_drop(drop, recruiter_fields)
+    assert values["role_catted"] == "Data Scientist"
+    assert values["recruiter_name"] == "Test Recruiter"
+
+
 def test_parse_drop_req_id_colon_in_value_example_from_brief():
     # The brief's own example: "Req ID: 6900" (no space before the colon).
     drop = "Req ID: 6900\n"
