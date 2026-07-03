@@ -16,6 +16,8 @@ from pathlib import Path
 
 from pypdf import PdfReader
 
+from slap import display
+
 WORKDIR_ROOT = Path("workdir")
 
 
@@ -125,15 +127,16 @@ def _confirm_page_gate(pages: int, read_command) -> bool:
     an accidental keystroke can never silently pass the gate."""
     phrase = f"send {pages} pages anyway"
     while True:
-        decision = read_command(
+        decision = read_command(display.styled_prompt(
             f"Résumé is {pages} pages (limit is 1). Type 'r' to go recompile after "
-            f"fixing, or type exactly '{phrase}' to confirm sending as-is: "
-        ).strip()
+            f"fixing, or type exactly '{phrase}' to confirm sending as-is: ",
+            style=display.YELLOW,
+        )).strip()
         if decision.lower() == "r":
             return False
         if decision.lower() == phrase:
             return True
-        print(f"Not understood — type 'r' or exactly: {phrase}")
+        display.warn(f"Not understood — type 'r' or exactly: {phrase}")
 
 
 def run_latex_loop(workdir: Path, tex_source: str, attachment_name: str, *,
@@ -148,24 +151,27 @@ def run_latex_loop(workdir: Path, tex_source: str, attachment_name: str, *,
     if result.success:
         open_preview(result.pdf_path)
     else:
-        print(f"Compile failed:\n{result.log}")
+        display.error(f"Compile failed:\n{result.log}")
     open_editor(tex_path)
 
+    menu_prompt = display.styled_menu_prompt(
+        [("r", "ecompile"), ("o", "pen editor"), ("d", "one"), ("a", "bort")]
+    )
     try:
         while True:
-            cmd = read_command("[r]ecompile · [o]pen editor · [d]one · [a]bort: ").strip().lower()
+            cmd = read_command(menu_prompt).strip().lower()
             if cmd == "r":
                 result = compile_fn(tex_path)
                 if result.success:
                     open_preview(result.pdf_path)
                 else:
-                    print(f"Compile failed:\n{result.log}")
+                    display.error(f"Compile failed:\n{result.log}")
             elif cmd == "o":
                 open_editor(tex_path)
             elif cmd == "d":
                 result = compile_fn(tex_path)  # authoritative — never trust a stale prior result
                 if not result.success:
-                    print(f"Compile failed on final check:\n{result.log}")
+                    display.error(f"Compile failed on final check:\n{result.log}")
                     continue
                 if result.pages > 1 and not _confirm_page_gate(result.pages, read_command):
                     continue
@@ -174,10 +180,10 @@ def run_latex_loop(workdir: Path, tex_source: str, attachment_name: str, *,
                 abort_workdir(workdir)
                 return None
             else:
-                print(f"Unknown command: {cmd!r}")
+                display.error(f"Unknown command: {cmd!r}")
     except (EOFError, KeyboardInterrupt):
         # Closed/interrupted input (including mid-gate) must never be treated
         # as confirmation — fail closed, loudly, and clean up like an abort.
-        print("\nInput closed or interrupted — aborting and cleaning up the workdir.")
+        display.error("\nInput closed or interrupted — aborting and cleaning up the workdir.")
         abort_workdir(workdir)
         return None

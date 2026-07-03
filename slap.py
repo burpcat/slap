@@ -11,6 +11,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from slap import display
 from slap.config import ConfigError, discover_campaigns, load_campaign, load_global_config
 from slap.latex import recipient_workdir, run_latex_loop
 from slap.queue import stage_recipient
@@ -46,7 +47,8 @@ def cmd_list(args):
     try:
         global_config = load_global_config()
     except ConfigError as e:
-        sys.exit(f"slap: {e}")
+        display.fail(f"slap: {e}")
+        sys.exit(1)
 
     names = discover_campaigns()
     if not names:
@@ -57,7 +59,7 @@ def cmd_list(args):
         try:
             campaign = load_campaign(name, global_config)
         except ConfigError as e:
-            print(f"{name}: ERROR — {e}")
+            display.error(f"{name}: ERROR — {e}")
             continue
         latex_state = "latex on" if campaign.latex_enabled else "latex off"
         print(f"{name}  persona={campaign.persona}  {latex_state}")
@@ -75,7 +77,8 @@ def _run_doctor_or_exit(global_config, campaign=None):
     failures = [r for r in results if not r.ok]
     if failures:
         lines = "\n".join(f"  - {r.name}: {r.detail}" for r in failures)
-        sys.exit(f"slap: doctor preflight failed — run `slap.py doctor` for details:\n{lines}")
+        display.fail(f"slap: doctor preflight failed — run `slap.py doctor` for details:\n{lines}")
+        sys.exit(1)
 
 
 def cmd_send(args):
@@ -83,14 +86,16 @@ def cmd_send(args):
         global_config = load_global_config()
         campaign = load_campaign(args.campaign, global_config)
     except ConfigError as e:
-        sys.exit(f"slap: {e}")
+        display.fail(f"slap: {e}")
+        sys.exit(1)
 
     _run_doctor_or_exit(global_config, campaign)
 
     try:
         consumer_domains = domains.load_consumer_domains(Path(global_config.consumer_domains_file))
     except domains.DomainsError as e:
-        sys.exit(f"slap: {e}")
+        display.fail(f"slap: {e}")
+        sys.exit(1)
 
     conn = tracking.connect()
 
@@ -100,7 +105,7 @@ def cmd_send(args):
 
         recipient = values.get("email", "").strip()
         if not recipient:
-            print("No 'Email' value found in the drop — skipping this recipient.")
+            display.error("No 'Email' value found in the drop — skipping this recipient.")
         else:
             _prep_one_recipient(conn, campaign, consumer_domains, values, recipient)
 
@@ -129,23 +134,28 @@ def _prep_one_recipient(conn, campaign, consumer_domains, values, recipient):
     if dedup.hard_warning:
         w = dedup.hard_warning
         replied = "yes" if w.replied_at else "no"
-        print(f"\n⚠ HARD WARN: {recipient} already contacted — campaign={w.campaign} "
-              f"status={w.status} first_sent={w.first_sent_at} replied={replied}")
+        display.error(f"\n⚠ HARD WARN: {recipient} already contacted — campaign={w.campaign} "
+                      f"status={w.status} first_sent={w.first_sent_at} replied={replied}")
     if dedup.soft_warning_contacts:
-        print(f"\n⚠ SOFT WARN: {len(dedup.soft_warning_contacts)} other contact(s) already on "
-              f"domain {dedup.soft_warning_domain}:")
+        display.warn(f"\n⚠ SOFT WARN: {len(dedup.soft_warning_contacts)} other contact(s) already on "
+                     f"domain {dedup.soft_warning_domain}:")
         for c in dedup.soft_warning_contacts:
-            print(f"    {c.recipient}  campaign={c.campaign}  status={c.status}")
+            display.warn(f"    {c.recipient}  campaign={c.campaign}  status={c.status}")
     if (dedup.hard_warning or dedup.soft_warning_contacts) and \
-            input("Proceed anyway? [y/N]: ").strip().lower() != "y":
+            input(display.styled_prompt("Proceed anyway? [y/N]: ", style=display.YELLOW)).strip().lower() != "y":
         print("Skipped.")
         return
 
+    # HARD REQUIREMENT: subject/body/stage_bodies below are the exact values
+    # later passed to stage_recipient() (the real send path). preview_panel()
+    # only reads them to print a display-only rendering — it never wraps,
+    # mutates, or returns a styled version of these variables, so no ANSI
+    # code can ever reach the template-filled message that gets staged/sent.
     subject = fill_template(campaign.subject_template, values, campaign.fields)
     body = fill_template(campaign.body_template, values, campaign.fields)
     stage_bodies = [fill_template(s, values, campaign.fields) for s in campaign.stage_bodies]
 
-    print(f"\n--- Preview for {recipient} ---\nSubject: {subject}\n\n{body}\n")
+    display.preview_panel(recipient, subject, body)
     print(f"Attachment: {campaign.attachment_name}")
     print(f"Cadence (persona={campaign.persona}): {campaign.cadence}")
 
@@ -158,14 +168,15 @@ def _prep_one_recipient(conn, campaign, consumer_domains, values, recipient):
         cadence=campaign.cadence, subject=subject, body=body, stage_bodies=stage_bodies,
         attachment_path=attachment_path, attachment_name=campaign.attachment_name,
     )
-    print(f"Staged {recipient}.")
+    display.success(f"Staged {recipient}.")
 
 
 def cmd_runner(args):
     try:
         global_config = load_global_config()
     except ConfigError as e:
-        sys.exit(f"slap: {e}")
+        display.fail(f"slap: {e}")
+        sys.exit(1)
     conn = tracking.connect()
     runner.wait_for_fire_window(global_config.schedule)
     result = runner.drain(conn, global_config, os.environ.get(global_config.api_key_env, ""))
@@ -174,10 +185,14 @@ def cmd_runner(args):
 
 def _print_drain_result(result):
     if not result.ran:
-        print(f"Preflight failed: {result.preflight_error}. Wrote run_failed; queue is untouched.")
+        display.error(f"Preflight failed: {result.preflight_error}. Wrote run_failed; queue is untouched.")
         return
-    print(f"Drain complete: {result.sent} sent, {result.failed} failed, "
-          f"{result.remaining_queued} still queued.")
+    message = (f"Drain complete: {result.sent} sent, {result.failed} failed, "
+               f"{result.remaining_queued} still queued.")
+    if result.failed:
+        display.error(message)
+    else:
+        display.success(message)
 
 
 def cmd_dashboard(args):
@@ -185,34 +200,36 @@ def cmd_dashboard(args):
         global_config = load_global_config()
         consumer_domains = domains.load_consumer_domains(Path(global_config.consumer_domains_file))
     except (ConfigError, domains.DomainsError) as e:
-        sys.exit(f"slap: {e}")
+        display.fail(f"slap: {e}")
+        sys.exit(1)
 
     api_key = os.environ.get(global_config.api_key_env, "").strip()
     if not api_key:
-        sys.exit(f"slap: {global_config.api_key_env} is not set — the dashboard's on-open "
-                  f"GMass poll (replies/clicks/bounces) needs it. See .env.example.")
+        display.fail(f"slap: {global_config.api_key_env} is not set — the dashboard's on-open "
+                     f"GMass poll (replies/clicks/bounces) needs it. See .env.example.")
+        sys.exit(1)
 
     tracking.connect().close()  # ensure the DB file + schema exist before serving
     app = dashboard.create_app(tracking.DB_PATH, global_config, consumer_domains, api_key)
-    print("Dashboard running at http://127.0.0.1:5000 — Ctrl-C to stop.")
+    display.success("Dashboard running at http://127.0.0.1:5000 — Ctrl-C to stop.")
     app.run(host="127.0.0.1", port=5000)
 
 
 def _print_check(result, *, indent=""):
     if result.ok:
         suffix = f" ({result.detail})" if result.detail else ""
-        print(f"{indent}{result.name}: OK{suffix}")
+        display.success(f"{indent}{result.name}: OK{suffix}")
     else:
-        print(f"{indent}{result.name}: FAIL — {result.detail}")
+        display.error(f"{indent}{result.name}: FAIL — {result.detail}")
 
 
 def cmd_doctor(args):
     try:
         global_config = load_global_config()
     except ConfigError as e:
-        print(f"config.yaml: FAIL — {e}")
+        display.error(f"config.yaml: FAIL — {e}")
         sys.exit(1)
-    print("config.yaml: OK")
+    display.success("config.yaml: OK")
 
     any_failed = False
     for result in doctor.run_global_checks(global_config):
@@ -226,26 +243,30 @@ def cmd_doctor(args):
         try:
             campaign = load_campaign(name, global_config)
         except ConfigError as e:
-            print(f"campaign '{name}': FAIL — {e}")
+            display.error(f"campaign '{name}': FAIL — {e}")
             any_failed = True
             continue
         campaign_results = doctor.run_campaign_checks(campaign)
         campaign_ok = all(r.ok for r in campaign_results)
-        print(f"campaign '{name}': {'OK' if campaign_ok else 'FAIL'}")
+        if campaign_ok:
+            display.success(f"campaign '{name}': OK")
+        else:
+            display.error(f"campaign '{name}': FAIL")
         for result in campaign_results:
             _print_check(result, indent="  ")
         any_failed = any_failed or not campaign_ok
 
     if any_failed:
         sys.exit(1)
-    print("\nAll checks passed.")
+    display.success("\nAll checks passed.")
 
 
 def cmd_domains(args):
     try:
         consumer_domains = domains.load_consumer_domains()
     except domains.DomainsError as e:
-        sys.exit(f"slap: {e}")
+        display.fail(f"slap: {e}")
+        sys.exit(1)
 
     conn = tracking.connect()
     index = domains.domain_index(conn)
@@ -267,7 +288,7 @@ def cmd_rebuild(args):
     event_count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
     tracking.rebuild(conn)
     recipient_count = conn.execute("SELECT COUNT(*) FROM recipients").fetchone()[0]
-    print(f"Rebuilt recipients cache ({recipient_count} recipients) from {event_count} events.")
+    display.success(f"Rebuilt recipients cache ({recipient_count} recipients) from {event_count} events.")
 
 
 def build_parser():
