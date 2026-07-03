@@ -12,6 +12,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from slap import display
+from slap.cleanup import DEFAULT_MIN_DAYS_IDLE, delete_eligible, find_cleanup_candidates
 from slap.config import ConfigError, discover_campaigns, load_campaign, load_global_config
 from slap.latex import recipient_workdir, run_latex_loop
 from slap.queue import stage_recipient
@@ -305,6 +306,34 @@ def cmd_rebuild(args):
     display.success(f"Rebuilt recipients cache ({recipient_count} recipients) from {event_count} events.")
 
 
+def cmd_cleanup(args):
+    try:
+        global_config = load_global_config()
+    except ConfigError as e:
+        display.fail(f"slap: {e}")
+        sys.exit(1)
+
+    conn = tracking.connect()
+    report = find_cleanup_candidates(conn, global_config, min_days_idle=args.min_days_idle)
+
+    if not report.eligible:
+        print("No stale PDFs eligible for cleanup.")
+    else:
+        heading = "Deleted" if args.confirm else "Would delete (dry run — pass --confirm to actually delete)"
+        print(f"{heading}:")
+        for c in report.eligible:
+            print(f"  {c.campaign}/{c.recipient}  {c.pdf_path.name}  — {c.reason}")
+
+    if report.undetermined:
+        display.warn(f"\n⚠ {len(report.undetermined)} recipient(s) skipped — state could not be determined:")
+        for u in report.undetermined:
+            display.warn(f"  {u.campaign}/{u.recipient}  — {u.reason}")
+
+    if args.confirm and report.eligible:
+        deleted = delete_eligible(report.eligible)
+        display.success(f"\nDeleted {len(deleted)} PDF(s) (+ .hash sidecars). resume.tex kept for all.")
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Personal cold job-outreach CLI over GMass.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -323,6 +352,14 @@ def build_parser():
     sub.add_parser(
         "runner", help="Unattended drain — invoked by launchd, see LAUNCHD.md"
     ).set_defaults(func=cmd_runner)
+
+    p_cleanup = sub.add_parser(
+        "cleanup", help="Delete stale compiled PDFs for done/dead/no-reply recipients (dry run by default)"
+    )
+    p_cleanup.add_argument("--confirm", action="store_true", help="Actually delete (default is dry run)")
+    p_cleanup.add_argument("--min-days-idle", type=int, default=DEFAULT_MIN_DAYS_IDLE, dest="min_days_idle",
+                            help=f"Idle-days threshold (default {DEFAULT_MIN_DAYS_IDLE})")
+    p_cleanup.set_defaults(func=cmd_cleanup)
     return parser
 
 
