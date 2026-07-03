@@ -364,3 +364,70 @@ def test_compile_tex_missing_xelatex_raises_latex_error(tmp_path, monkeypatch):
     monkeypatch.setattr("slap.latex.subprocess.run", fake_run)
     with pytest.raises(LatexError, match="xelatex not found"):
         compile_tex(tex_path)
+
+
+# --- _cleanup_intermediates -------------------------------------------------
+
+class FakeCompletedProcess:
+    def __init__(self, returncode):
+        self.returncode = returncode
+        self.stdout = ""
+        self.stderr = ""
+
+
+def test_compile_tex_deletes_byproducts_after_failed_compile(tmp_path, monkeypatch):
+    # A failed xelatex run still leaves .aux/.log behind — those must be
+    # cleaned up too, not just the success-path byproducts.
+    workdir = recipient_workdir("c", "jane@x.com", root=tmp_path)
+    tex_path = write_tex(workdir, BROKEN_TEX)
+
+    def fake_run(cmd, cwd, capture_output, text):
+        (cwd / "resume.aux").write_text("aux")
+        (cwd / "resume.log").write_text("log")
+        return FakeCompletedProcess(returncode=1)
+
+    monkeypatch.setattr("slap.latex.subprocess.run", fake_run)
+    result = compile_tex(tex_path)
+
+    assert result.success is False
+    assert tex_path.exists()  # resume.tex is always kept
+    assert not (workdir / "resume.aux").exists()
+    assert not (workdir / "resume.log").exists()
+
+
+def test_compile_tex_deletes_byproducts_after_successful_compile(tmp_path, monkeypatch):
+    workdir = recipient_workdir("c", "jane@x.com", root=tmp_path)
+    tex_path = write_tex(workdir, ONE_PAGE_TEX)
+    pdf_path = workdir / "resume.pdf"
+
+    def fake_run(cmd, cwd, capture_output, text):
+        (cwd / "resume.aux").write_text("aux")
+        (cwd / "resume.log").write_text("log")
+        (cwd / "resume.out").write_text("out")
+        pdf_path.write_bytes(b"%PDF-fake")
+        return FakeCompletedProcess(returncode=0)
+
+    monkeypatch.setattr("slap.latex.subprocess.run", fake_run)
+    monkeypatch.setattr("slap.latex.page_count", lambda p: 1)
+    result = compile_tex(tex_path)
+
+    assert result.success is True
+    assert tex_path.exists()  # resume.tex is always kept
+    assert pdf_path.exists()  # the compiled PDF is always kept
+    assert not (workdir / "resume.aux").exists()
+    assert not (workdir / "resume.log").exists()
+    assert not (workdir / "resume.out").exists()
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not XELATEX_AVAILABLE, reason="xelatex not installed")
+def test_real_compile_deletes_intermediates_but_keeps_tex_and_pdf(tmp_path):
+    workdir = recipient_workdir("c", "jane@x.com", root=tmp_path)
+    tex_path = write_tex(workdir, ONE_PAGE_TEX)
+    result = compile_tex(tex_path)
+
+    assert result.success is True
+    assert tex_path.exists()
+    assert result.pdf_path.exists()
+    leftover = {p.name for p in workdir.iterdir()} - {tex_path.name, result.pdf_path.name}
+    assert leftover == set(), f"xelatex byproducts left behind: {leftover}"

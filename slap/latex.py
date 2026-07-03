@@ -54,6 +54,23 @@ def write_tex(workdir: Path, tex_source: str) -> Path:
     return tex_path
 
 
+def _cleanup_intermediates(tex_path: Path, pdf_path: Path) -> None:
+    """Deletes every xelatex byproduct (.aux/.log/.out/.toc/... — whatever
+    xelatex actually produced this run, not just an enumerated list) right
+    after a compile attempt, success or failure — none of them are ever
+    needed afterward. Matched by stem (same base name as resume.tex), so
+    any byproduct is caught; keeps only resume.tex itself and the compiled
+    PDF (the latter simply won't exist yet to match if this attempt
+    failed). staged.json/the renamed final attachment/its .hash don't
+    exist at this point in the flow (written later, after the whole
+    interactive loop finishes and stage_final_pdf/stage_recipient run), so
+    there's nothing else in this workdir this could ever touch."""
+    keep = {tex_path.name, pdf_path.name}
+    for candidate in tex_path.parent.glob(f"{tex_path.stem}.*"):
+        if candidate.name not in keep:
+            candidate.unlink()
+
+
 def compile_tex(tex_path: Path) -> CompileResult:
     """Runs xelatex twice (cross-references need a second pass). Deletes any
     existing PDF first — otherwise a failed recompile could leave a stale PDF
@@ -80,6 +97,7 @@ def compile_tex(tex_path: Path) -> CompileResult:
 
     success = returncode == 0 and pdf_path.exists()
     pages = page_count(pdf_path) if success else None
+    _cleanup_intermediates(tex_path, pdf_path)
     return CompileResult(success=success, pdf_path=pdf_path if success else None,
                           pages=pages, log="\n".join(log_parts))
 
