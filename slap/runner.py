@@ -21,13 +21,16 @@ CONTROL_SHEET.md):
   fires today," so this estimates each active, already-sent recipient's next
   stage date as cumulative persona-cadence days from `first_sent_at`. Real
   GMass timing (time-of-day, `skipWeekends`, etc.) can differ.
-- Preflight here is intentionally minimal (just GMASS_API_KEY presence) —
-  the full `doctor` preflight (config/campaign/attachment/DB/consumer-domains
-  checks) is step 12's job, which will wire into this same retry path.
+- Preflight here (step 12) runs doctor's GLOBAL checks only (API key, sender
+  fields, DB reachable, consumer_domains.txt present-or-seeded) — NOT the
+  per-campaign attachment/xelatex/code checks. By the time a recipient is
+  queued, its campaign already passed those at `send` time and its
+  attachment bytes are already baked into that recipient's staged.json; a
+  drain batch can also span multiple campaigns, so there's no single
+  "current campaign" to re-check anyway.
 """
 from __future__ import annotations
 
-import os
 import random
 import time
 from dataclasses import dataclass
@@ -36,7 +39,7 @@ from datetime import time as dt_time
 from datetime import timedelta
 from pathlib import Path
 
-from slap import gmass
+from slap import doctor, gmass
 from slap.latex import WORKDIR_ROOT, recipient_workdir
 from slap.queue import due_for_ooo_resend, due_recipients, load_manifest
 from slap.tracking import append_event, latest_open_draft_id
@@ -55,21 +58,33 @@ class DrainResult:
     preflight_error: str = None
 
 
-def _preflight(api_key_env: str) -> str:
-    """Minimal preflight for step 9 — returns an error string, or None if OK.
-    The full doctor preflight (step 12) will wire additional checks into
-    this same drain_retries retry path."""
-    if not os.environ.get(api_key_env, "").strip():
-        return f"{api_key_env} is not set"
-    return None
+def _preflight(global_config, conn=None) -> str:
+    """Doctor's global checks (step 12) — API key, sender fields, DB
+    reachable, consumer_domains.txt present-or-seeded. Returns a combined
+    error string, or None if every check passed. `conn`, when given, is
+    reused for the DB-reachable check instead of opening a second
+    connection at the default cwd-relative path (see doctor.check_db).
+
+    One check has a real side effect (check_consumer_domains seeds a
+    missing file) that can raise (e.g. an unwritable/missing parent dir for
+    a customized consumer_domains_file) — that must still degrade to a
+    normal preflight failure string, never an uncaught exception, so §11's
+    "retry then run_failed, queue intact" guarantee holds unconditionally."""
+    try:
+        failures = [r for r in doctor.run_global_checks(global_config, conn) if not r.ok]
+    except Exception as e:
+        return f"unexpected preflight error: {e}"
+    if not failures:
+        return None
+    return "; ".join(f"{r.name}: {r.detail}" for r in failures)
 
 
-def _preflight_with_retries(api_key_env: str, drain_retries: int, sleep_fn) -> str:
-    error = _preflight(api_key_env)
+def _preflight_with_retries(global_config, conn, drain_retries: int, sleep_fn) -> str:
+    error = _preflight(global_config, conn)
     attempts = 1
     while error is not None and attempts < drain_retries:
         sleep_fn(2)
-        error = _preflight(api_key_env)
+        error = _preflight(global_config, conn)
         attempts += 1
     return error
 
@@ -234,7 +249,7 @@ def drain(conn, global_config, api_key: str, *, now: date = None, sleep_fn=time.
     today = now or date.today()
 
     error = _preflight_with_retries(
-        global_config.api_key_env, global_config.schedule.drain_retries, sleep_fn
+        global_config, conn, global_config.schedule.drain_retries, sleep_fn
     )
     if error is not None:
         append_event(conn, type="run_failed",

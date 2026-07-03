@@ -7,6 +7,7 @@ current build state / package layout.
 import argparse
 import os
 import sys
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -14,7 +15,7 @@ from slap.config import ConfigError, discover_campaigns, load_campaign, load_glo
 from slap.latex import recipient_workdir, run_latex_loop
 from slap.queue import stage_recipient
 from slap.templates import fill_template, parse_drop
-from slap import dashboard, domains, gmass, runner, tracking
+from slap import dashboard, doctor, domains, gmass, runner, tracking
 
 load_dotenv()
 
@@ -62,12 +63,33 @@ def cmd_list(args):
         print(f"{name}  persona={campaign.persona}  {latex_state}")
 
 
+def _run_doctor_or_exit(global_config, campaign=None):
+    """Auto-preflight before any send (§11) — a subset of `doctor`'s own
+    checks: the global battery always, plus this one campaign's checks when
+    a target campaign is known. Runs BEFORE domains.load_consumer_domains()
+    so an owner who's never run `doctor` and is missing consumer_domains.txt
+    gets it auto-seeded here rather than hitting that call's fail-loud path."""
+    results = doctor.run_global_checks(global_config)
+    if campaign is not None:
+        results += doctor.run_campaign_checks(campaign)
+    failures = [r for r in results if not r.ok]
+    if failures:
+        lines = "\n".join(f"  - {r.name}: {r.detail}" for r in failures)
+        sys.exit(f"slap: doctor preflight failed — run `slap.py doctor` for details:\n{lines}")
+
+
 def cmd_send(args):
     try:
         global_config = load_global_config()
         campaign = load_campaign(args.campaign, global_config)
-        consumer_domains = domains.load_consumer_domains()
-    except (ConfigError, domains.DomainsError) as e:
+    except ConfigError as e:
+        sys.exit(f"slap: {e}")
+
+    _run_doctor_or_exit(global_config, campaign)
+
+    try:
+        consumer_domains = domains.load_consumer_domains(Path(global_config.consumer_domains_file))
+    except domains.DomainsError as e:
         sys.exit(f"slap: {e}")
 
     conn = tracking.connect()
@@ -161,7 +183,7 @@ def _print_drain_result(result):
 def cmd_dashboard(args):
     try:
         global_config = load_global_config()
-        consumer_domains = domains.load_consumer_domains()
+        consumer_domains = domains.load_consumer_domains(Path(global_config.consumer_domains_file))
     except (ConfigError, domains.DomainsError) as e:
         sys.exit(f"slap: {e}")
 
@@ -176,11 +198,47 @@ def cmd_dashboard(args):
     app.run(host="127.0.0.1", port=5000)
 
 
+def _print_check(result, *, indent=""):
+    if result.ok:
+        suffix = f" ({result.detail})" if result.detail else ""
+        print(f"{indent}{result.name}: OK{suffix}")
+    else:
+        print(f"{indent}{result.name}: FAIL — {result.detail}")
+
+
 def cmd_doctor(args):
-    sys.exit(
-        "slap: 'doctor' is not yet implemented — Build Order step 12 "
-        "(doctor preflight wiring). See SLAP_BUILD_PROMPT.md §14."
-    )
+    try:
+        global_config = load_global_config()
+    except ConfigError as e:
+        print(f"config.yaml: FAIL — {e}")
+        sys.exit(1)
+    print("config.yaml: OK")
+
+    any_failed = False
+    for result in doctor.run_global_checks(global_config):
+        _print_check(result)
+        any_failed = any_failed or not result.ok
+
+    names = discover_campaigns()
+    if not names:
+        print("No campaigns found under campaigns/.")
+    for name in names:
+        try:
+            campaign = load_campaign(name, global_config)
+        except ConfigError as e:
+            print(f"campaign '{name}': FAIL — {e}")
+            any_failed = True
+            continue
+        campaign_results = doctor.run_campaign_checks(campaign)
+        campaign_ok = all(r.ok for r in campaign_results)
+        print(f"campaign '{name}': {'OK' if campaign_ok else 'FAIL'}")
+        for result in campaign_results:
+            _print_check(result, indent="  ")
+        any_failed = any_failed or not campaign_ok
+
+    if any_failed:
+        sys.exit(1)
+    print("\nAll checks passed.")
 
 
 def cmd_domains(args):

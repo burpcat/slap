@@ -59,10 +59,15 @@ once after installing, to prove it actually works on your Mac:
    `runner` invocation with a timestamp at or shortly after wake, not at the original
    scheduled minute (proving it ran *on wake*, not that it silently missed the window).
 7. Also check the dashboard / `slap.db` for a `run_started`/`run_completed` event pair
-   with a timestamp matching the wake time.
+   with a timestamp matching the wake time. If you instead see `run_started` followed by
+   a `run_failed` (no `run_completed`), the job *did* fire on wake correctly — that part
+   worked — but `doctor`'s preflight failed (see the `run_failed` event's `meta.error` for
+   which check, or just run `python slap.py doctor` by hand). The queue stays untouched
+   either way; it'll retry itself on the next scheduled fire.
 8. **Revert** the plist's `Hour`/`Minute` back to your real desired fire time (e.g. 9:00)
    and `config.yaml`'s fire window back to `09:00`–`09:15`, then reload the agent again.
 
-If the job does *not* fire on wake, common causes: the plist wasn't reloaded after
-editing, `WorkingDirectory`/paths in the plist don't match your actual repo location, or
-the Python interpreter path doesn't point at this repo's `.venv`.
+If the job does *not* fire on wake at all (no `run_started` event, nothing in the logs),
+common causes: the plist wasn't reloaded after editing, `WorkingDirectory`/paths in the
+plist don't match your actual repo location, or the Python interpreter path doesn't point
+at this repo's `.venv`.

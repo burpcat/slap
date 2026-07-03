@@ -27,7 +27,10 @@ def make_global_config(tmp_path, *, daily_cap=500, drain_retries=3, send_delay_m
             send_delay_min=send_delay_min, send_delay_max=send_delay_max,
             daily_cap=daily_cap, drain_retries=drain_retries,
         ),
-        consumer_domains_file="consumer_domains.txt", path=tmp_path / "config.yaml",
+        # Absolute, tmp_path-scoped — doctor.check_consumer_domains() (step 12)
+        # resolves this path directly (no cwd-relative fallback), so this
+        # must never resolve to the real repo-root consumer_domains.txt.
+        consumer_domains_file=str(tmp_path / "consumer_domains.txt"), path=tmp_path / "config.yaml",
     )
 
 
@@ -437,6 +440,24 @@ def test_preflight_recovers_within_retries_and_drain_proceeds(conn, tmp_path, mo
                     create_draft_fn=create_fn, send_campaign_fn=send_fn)
     assert result.ran is True
     assert result.sent == 1
+
+
+def test_preflight_survives_an_unexpected_exception_and_writes_run_failed(conn, tmp_path):
+    # doctor.check_consumer_domains has a real side effect (it seeds a
+    # missing file) that can raise — e.g. a customized consumer_domains_file
+    # whose parent directory doesn't exist. That must still degrade to a
+    # normal preflight failure (retry -> run_failed, queue intact), never an
+    # uncaught exception out of drain() (step 12 SHOULD-FIX).
+    gc = make_global_config(tmp_path, drain_retries=1)
+    gc.consumer_domains_file = str(tmp_path / "missing_dir" / "consumer_domains.txt")
+    stage_one(conn, tmp_path)
+
+    result = drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir")
+
+    assert result.ran is False
+    assert "unexpected preflight error" in result.preflight_error
+    event_types = [dict(r)["type"] for r in conn.execute("SELECT type FROM events ORDER BY id")]
+    assert event_types == ["queued", "run_failed"]  # queue completely untouched
 
 
 # --- random fire-time lands in the configured window -----------------------

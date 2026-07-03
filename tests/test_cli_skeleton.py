@@ -1,7 +1,14 @@
 """Smoke tests for the slap.py CLI skeleton (Build Order step 2).
 
-Scoped strictly to what step 2 builds: argparse dispatch and fail-loud stubs.
-Does not test config/templates/tracking/etc. — those land in later steps.
+Originally scoped to argparse dispatch and fail-loud stubs; every one of the
+six commands has since graduated to a real implementation (list: step 3,
+rebuild: step 5, domains: step 7, send/runner: step 9, dashboard: step 11,
+doctor: step 12) — see each command's dedicated test file. What's left here
+is the top-level dispatch smoke test plus each command's own
+fail-loud-before-doing-anything-real path — 'dashboard' and 'runner' in
+particular are NOT exercised beyond that, since a successful run either
+blocks forever (Flask's app.run()) or can sleep for minutes
+(wait_for_fire_window).
 """
 import os
 import subprocess
@@ -10,12 +17,6 @@ from pathlib import Path
 
 SLAP_PY = Path(__file__).resolve().parent.parent / "slap.py"
 ALL_COMMANDS = ["list", "send", "dashboard", "doctor", "domains", "rebuild", "runner"]
-# 'list' (step 3), 'rebuild' (step 5), 'domains' (step 7), 'send'/'runner'
-# (step 9), and 'dashboard' (step 11) are wired to real implementations and
-# are no longer stubs — see their dedicated tests. 'dashboard' in particular
-# is NOT exercised here at all beyond its fail-loud-without-config path,
-# since a successful run calls Flask's app.run() and blocks forever.
-NO_ARG_COMMANDS = ["doctor"]
 
 
 def run(*args, cwd=None, env=None):
@@ -36,13 +37,6 @@ def test_help_lists_all_subcommands():
         assert cmd in result.stdout
 
 
-def test_no_arg_commands_fail_loud_not_implemented():
-    for cmd in NO_ARG_COMMANDS:
-        result = run(cmd)
-        assert result.returncode != 0, f"{cmd} should exit non-zero"
-        assert "not yet implemented" in result.stderr, f"{cmd} stderr: {result.stderr!r}"
-
-
 def test_send_without_campaign_is_argparse_usage_error():
     result = run("send")
     assert result.returncode == 2
@@ -61,6 +55,99 @@ def test_send_fails_loud_for_unknown_campaign(tmp_path):
     assert result.returncode != 0
     assert "not found" in result.stderr
     assert "Traceback" not in result.stderr
+
+
+def test_send_fails_loud_when_doctor_preflight_fails(tmp_path):
+    # A structurally valid campaign (load_campaign succeeds) but doctor's
+    # preflight fails (missing attachment) — must fail loud BEFORE ever
+    # reading stdin for the interactive drop-paste loop.
+    (tmp_path / "config.yaml").write_text(
+        (Path(__file__).resolve().parent.parent / "config.yaml.example")
+        .read_text()
+        .replace("<Owner Name>", "Test Owner")
+    )
+    campaign = tmp_path / "campaigns" / "coldpost"
+    campaign.mkdir(parents=True)
+    (campaign / "campaign.yaml").write_text(
+        "persona: recruiter\n"
+        "latex: { enabled: false, attachment_name: r.pdf }\n"
+        "attachment_file: resume.pdf\n"
+        "fields:\n  - { key: email, label: Email }\n"
+    )
+    (campaign / "initial.txt").write_text("Subject: Hi\n\nBody\n")
+    for i in (1, 2, 3):
+        (campaign / f"stage{i}.txt").write_text(f"stage {i}\n")
+    # resume.pdf deliberately never created.
+
+    env_with_key = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    result = run("send", "coldpost", cwd=tmp_path, env=env_with_key)
+    assert result.returncode != 0
+    assert "doctor preflight failed" in result.stderr
+    assert "attachment_file" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_doctor_fails_loud_without_config(tmp_path):
+    result = run("doctor", cwd=tmp_path)
+    assert result.returncode != 0
+    assert "config.yaml: FAIL" in result.stdout
+    assert "Traceback" not in (result.stdout + result.stderr)
+
+
+def test_doctor_reports_missing_api_key(tmp_path):
+    (tmp_path / "config.yaml").write_text(
+        (Path(__file__).resolve().parent.parent / "config.yaml.example")
+        .read_text()
+        .replace("<Owner Name>", "Test Owner")
+    )
+    env_without_key = {**os.environ, "GMASS_API_KEY": ""}
+    result = run("doctor", cwd=tmp_path, env=env_without_key)
+    assert result.returncode != 0
+    assert "GMASS_API_KEY: FAIL" in result.stdout
+
+
+def test_doctor_seeds_missing_consumer_domains_and_passes(tmp_path):
+    (tmp_path / "config.yaml").write_text(
+        (Path(__file__).resolve().parent.parent / "config.yaml.example")
+        .read_text()
+        .replace("<Owner Name>", "Test Owner")
+    )
+    env_with_key = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    result = run("doctor", cwd=tmp_path, env=env_with_key)
+    assert result.returncode == 0
+    assert "All checks passed." in result.stdout
+    seeded = tmp_path / "consumer_domains.txt"
+    assert seeded.exists()
+    assert "gmail.com" in seeded.read_text()
+
+
+def test_doctor_reports_campaign_attachment_issues(tmp_path):
+    (tmp_path / "config.yaml").write_text(
+        (Path(__file__).resolve().parent.parent / "config.yaml.example")
+        .read_text()
+        .replace("<Owner Name>", "Test Owner")
+    )
+    (tmp_path / "consumer_domains.txt").write_text(
+        (Path(__file__).resolve().parent.parent / "consumer_domains.txt").read_text()
+    )
+    broken = tmp_path / "campaigns" / "broken-campaign"
+    broken.mkdir(parents=True)
+    (broken / "campaign.yaml").write_text(
+        "persona: recruiter\n"
+        "latex: { enabled: false, attachment_name: r.pdf }\n"
+        "attachment_file: resume.pdf\n"
+        "fields:\n  - { key: email, label: Email }\n"
+    )
+    (broken / "initial.txt").write_text("Subject: Hi\n\nBody\n")
+    for i in (1, 2, 3):
+        (broken / f"stage{i}.txt").write_text(f"stage {i}\n")
+    # resume.pdf deliberately never created.
+
+    env_with_key = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    result = run("doctor", cwd=tmp_path, env=env_with_key)
+    assert result.returncode != 0
+    assert "campaign 'broken-campaign': FAIL" in result.stdout
+    assert "attachment_file: FAIL" in result.stdout
 
 
 def test_runner_fails_loud_without_config(tmp_path):
