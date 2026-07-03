@@ -118,6 +118,19 @@ def cmd_send(args):
         _print_drain_result(result)
 
 
+def _warn_empty_fields(campaign, values) -> None:
+    """Pre-preview validation warning (display-only, never blocks): a drop
+    that leaves a declared field empty is often a paste mistake worth
+    flagging, but some fields (req_id) are legitimately blank often — so
+    this only warns, the send still proceeds normally on confirm. 'Empty'
+    matches fill_template's own definition (exact '', not stripped) so this
+    warning and the optional-field line-drop behavior never disagree about
+    what counts as empty. Nothing here touches subject/body/values."""
+    empty_keys = [f.key for f in campaign.fields if values.get(f.key, "") == ""]
+    if empty_keys:
+        display.warn(f"⚠ empty fields: {', '.join(empty_keys)}")
+
+
 def _prep_one_recipient(conn, campaign, consumer_domains, values, recipient):
     if campaign.latex_enabled:
         tex_source = read_paste(f"\nPaste the LaTeX résumé source for {recipient}")
@@ -155,6 +168,7 @@ def _prep_one_recipient(conn, campaign, consumer_domains, values, recipient):
     body = fill_template(campaign.body_template, values, campaign.fields)
     stage_bodies = [fill_template(s, values, campaign.fields) for s in campaign.stage_bodies]
 
+    _warn_empty_fields(campaign, values)
     display.preview_panel(recipient, subject, body)
     print(f"Attachment: {campaign.attachment_name}")
     print(f"Cadence (persona={campaign.persona}): {campaign.cadence}")

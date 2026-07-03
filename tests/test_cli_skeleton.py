@@ -20,7 +20,7 @@ SLAP_PY = Path(__file__).resolve().parent.parent / "slap.py"
 ALL_COMMANDS = ["list", "send", "dashboard", "doctor", "domains", "rebuild", "runner"]
 
 
-def run(*args, cwd=None, env=None):
+def run(*args, cwd=None, env=None, input=None):
     # Deterministic regardless of the ambient shell's color-forcing env vars
     # (e.g. FORCE_COLOR, set by some terminal/CI wrappers) — tests assert on
     # exact plain-text stdout/stderr content, and rich's colorization (see
@@ -32,6 +32,7 @@ def run(*args, cwd=None, env=None):
     full_env["NO_COLOR"] = "1"
     return subprocess.run(
         [sys.executable, str(SLAP_PY), *args],
+        input=input,
         capture_output=True,
         text=True,
         cwd=cwd,
@@ -161,6 +162,62 @@ def test_send_never_leaks_ansi_into_the_staged_message_even_with_color_forced(tm
     assert all("\x1b" not in body for body in manifest["stage_bodies"])
     assert manifest["subject"] == "Hi from Acme"
     assert manifest["body"] == "Hello Acme team"
+
+
+def _setup_three_field_campaign(tmp_path):
+    (tmp_path / "config.yaml").write_text(
+        (Path(__file__).resolve().parent.parent / "config.yaml.example")
+        .read_text()
+        .replace("<Owner Name>", "Test Owner")
+    )
+    (tmp_path / "consumer_domains.txt").write_text(
+        (Path(__file__).resolve().parent.parent / "consumer_domains.txt").read_text()
+    )
+    campaign = tmp_path / "campaigns" / "coldpost"
+    campaign.mkdir(parents=True)
+    (campaign / "campaign.yaml").write_text(
+        "persona: recruiter\n"
+        "latex: { enabled: false, attachment_name: r.pdf }\n"
+        "attachment_file: resume.pdf\n"
+        "fields:\n"
+        "  - { key: email, label: Email }\n"
+        "  - { key: company, label: Company }\n"
+        "  - { key: req_id, label: Req ID, optional: true }\n"
+    )
+    (campaign / "resume.pdf").write_bytes(b"%PDF-fake")
+    (campaign / "initial.txt").write_text("Subject: Hi from {{company}}\n\nHello {{company}} team\n")
+    for i in (1, 2, 3):
+        (campaign / f"stage{i}.txt").write_text(f"stage {i}\n")
+    return campaign
+
+
+def test_send_warns_about_empty_declared_fields_but_does_not_block(tmp_path):
+    # Pre-preview validation warning: display-only, never gates the send.
+    _setup_three_field_campaign(tmp_path)
+    recipient = "jane@acme.com"
+    drop = f"Email: {recipient}\nCompany: Acme\n"  # Req ID deliberately omitted -- stays empty
+    scripted_stdin = f"{drop}\nEOF\ny\nn\n"  # drop, stage-this-send, no-more
+
+    env_with_key = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    result = run("send", "coldpost", cwd=tmp_path, env=env_with_key, input=scripted_stdin)
+
+    assert result.returncode == 0, result.stderr
+    assert "empty fields: req_id" in result.stdout
+    assert "Staged" in result.stdout  # non-blocking: the send still proceeds despite the warning
+
+
+def test_send_no_empty_fields_warning_when_everything_is_filled(tmp_path):
+    _setup_three_field_campaign(tmp_path)
+    recipient = "jane@acme.com"
+    drop = f"Email: {recipient}\nCompany: Acme\nReq ID: 6900\n"
+    scripted_stdin = f"{drop}\nEOF\ny\nn\n"
+
+    env_with_key = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    result = run("send", "coldpost", cwd=tmp_path, env=env_with_key, input=scripted_stdin)
+
+    assert result.returncode == 0, result.stderr
+    assert "empty fields" not in result.stdout
+    assert "Staged" in result.stdout
 
 
 def test_doctor_fails_loud_without_config(tmp_path):
