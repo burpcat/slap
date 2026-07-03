@@ -6,12 +6,14 @@ shapes, not invented ones. Genuine live-API verification of this exact
 production code (not just mocks) lives in probes/run.py's 'client' probe,
 run manually against a guarded self-send address — see CONTROL_SHEET.md.
 """
+import html
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from slap.gmass import (
     GMassError, build_campaign_settings, build_reply_settings, create_draft, get_reports, send_campaign,
+    _plain_text_to_html,
 )
 
 
@@ -34,9 +36,51 @@ def test_create_draft_sends_expected_fields_and_header(mock_post):
     url, kwargs = mock_post.call_args[0][0], mock_post.call_args[1]
     assert url == "https://api.gmass.co/api/campaigndrafts"
     assert kwargs["headers"] == {"X-apikey": "key123"}
+    # messageType must be "html" (not "text" -- not even a valid campaignDraft
+    # enum value) for click tracking to have a real <a href> to rewrite; a
+    # plain message with no HTML-special chars/URLs/newlines round-trips
+    # through _plain_text_to_html unchanged.
     assert kwargs["json"] == {
-        "emailAddresses": "a@x.com", "subject": "Hi", "message": "Body", "messageType": "text",
+        "emailAddresses": "a@x.com", "subject": "Hi", "message": "Body", "messageType": "html",
     }
+
+
+# --- _plain_text_to_html -------------------------------------------------
+
+def test_plain_text_to_html_linkifies_bare_urls_with_domain_as_display_text():
+    # The actual root cause of a real BLOCKER: click tracking only rewrites
+    # <a href> targets -- a bare URL string in a plain message has nothing
+    # for GMass to rewrite, so clickTracking=true silently did nothing.
+    # Verified live (three real guarded sends) that the display text must
+    # differ from the href for GMass to rewrite it at all -- an <a href> whose
+    # visible text is the SAME as the URL is left untouched. Domain-only text
+    # is enough and needs no per-site label mapping.
+    html_out = _plain_text_to_html("Link: https://www.linkedin.com/in/test")
+    assert html_out == 'Link: <a href="https://www.linkedin.com/in/test">www.linkedin.com</a>'
+
+
+def test_plain_text_to_html_escapes_special_characters():
+    assert _plain_text_to_html("Tom & Jerry <3") == "Tom &amp; Jerry &lt;3"
+
+
+def test_plain_text_to_html_preserves_line_breaks():
+    assert _plain_text_to_html("Hi,\n\nBody line.\n") == "Hi,<br>\n<br>\nBody line.<br>\n"
+
+
+def test_plain_text_to_html_handles_url_containing_ampersand():
+    # & inside a URL must round-trip correctly through escape/unescape:
+    # neither double-escaped (&amp;amp;) nor left as a raw & in HTML.
+    url = "https://example.com/x?a=1&b=2"
+    html_out = _plain_text_to_html(f"See {url}")
+    assert html_out == 'See <a href="https://example.com/x?a=1&amp;b=2">example.com</a>'
+
+
+def test_plain_text_to_html_multiple_urls_and_surrounding_text():
+    html_out = _plain_text_to_html("A: https://a.com and B: https://b.com done")
+    assert html_out == (
+        'A: <a href="https://a.com">a.com</a> and '
+        'B: <a href="https://b.com">b.com</a> done'
+    )
 
 
 @patch("slap.gmass.requests.post")

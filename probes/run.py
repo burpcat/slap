@@ -484,6 +484,58 @@ def probe_verify(key: str) -> None:
     _record("verify", result)
 
 
+def probe_clicktest(key: str) -> None:
+    """Investigates a real BLOCKER bug report: a delivered email's links stay raw
+    (never rewritten to a GMass click-tracking redirect) despite clickTracking=true.
+    Root-cause hypothesis: _create_draft()/slap.gmass.create_draft() hardcode
+    messageType="text" -- NOT a valid campaignDraft enum value (the live swagger
+    spec documents only "html"/"plain"). Click tracking works by rewriting <a href>
+    targets, which only exist in an HTML message; a plain-text message has no anchor
+    tag to rewrite, so clickTracking=true has nothing to act on.
+
+    Sends TWO real test emails, each with a real clickable link, clickTracking=true/
+    openTracking=false, to compare messageType="plain" vs messageType="html". The
+    live API has no endpoint that echoes back the delivered message content (the
+    `campaign` read model has no message/body/links field at all -- checked against
+    the saved swagger spec), so whether either link was actually rewritten can only
+    be confirmed by opening the two real received emails -- a manual step, recorded
+    as such rather than silently assumed."""
+    print("[clicktest] two real sends (messageType=plain vs html), each with a real link, clickTracking=true")
+    result = {"probe": "clicktest", "sends": {}}
+    link = "https://www.linkedin.com/in/slap-probe-test"
+
+    cases = [
+        ("plain", "everythingforgenius+testmass8@gmail.com", f"Plain-text click-tracking test.\n\nLink: {link}\n"),
+        ("html", "everythingforgenius+testmass9@gmail.com",
+         f'<p>HTML click-tracking test.</p><p><a href="{link}">Click here</a></p>'),
+    ]
+    for message_type, recipient, message in cases:
+        draft = _create_draft(
+            key, recipient, subject=f"slap probe clicktest ({message_type})",
+            message=message, extra={"messageType": message_type},
+        )
+        print(f"  [{message_type}] draft: HTTP {draft['response']['status']}, draft_id={draft['draft_id']}")
+        entry = {"recipient": recipient, "message_type": message_type, "link": link, "draft": draft}
+        if draft["draft_id"]:
+            send_fields = {
+                "openTracking": False, "clickTracking": True, "createDrafts": False,
+                "stageOneDays": 2, "stageOneCampaignText": "clicktest stage one", "stageOneAction": "r",
+            }
+            r = _post_campaign(key, draft["draft_id"], send_fields, "path")
+            summary = _summarize(r)
+            campaign_id = _campaign_id(summary)
+            print(f"  [{message_type}] send: HTTP {r.status_code}, campaign_id={campaign_id}")
+            entry["send"] = {"sent_fields": send_fields, "response": summary, "campaign_id": campaign_id}
+            if campaign_id:
+                _RUN_STATE["campaign_ids"].append(campaign_id)
+        result["sends"][message_type] = entry
+
+    print("  MANUAL STEP REQUIRED: open both delivered test emails in Gmail and check whether "
+          "the link's actual href/hover target (right-click -> copy link, or hover and read the "
+          "status bar) is rewritten to a gmass.co domain for EACH message type above.")
+    _record("clicktest", result)
+
+
 def probe_resend(key: str) -> None:
     """Resolves iron-audit SHOULD-FIX #2 (step 9): if a runner crashes AFTER
     send_campaign succeeds server-side but BEFORE the local 'sent' event
@@ -589,7 +641,7 @@ PROBES = {
     "auth": probe_auth, "attach": probe_attach, "casing": probe_casing,
     "stop": probe_stop, "thread": probe_thread, "reports": probe_reports,
     "verify": probe_verify, "swagger": probe_swagger, "client": probe_client,
-    "resend": probe_resend,
+    "resend": probe_resend, "clicktest": probe_clicktest,
 }
 
 

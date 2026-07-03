@@ -16,6 +16,19 @@ from the brief's §3 examples that Phase-0 caught:
 - Stage fields use GMass's English-ordinal names — `stageOneDays`,
   `stageTwoDays`, `stageThreeDays` — not `stage1Days`/`stage2Days`.
 - Stop-on-reply is a per-stage `stageNAction: "r"`, not a single global flag.
+- **`messageType` must be `"html"` for click tracking to do anything**
+  (verified live, post-launch — see CONTROL_SHEET.md's "Post-launch BLOCKER:
+  click tracking never fires" section). The `campaignDraft` swagger model
+  only documents `"html"`/`"plain"` (not `"text"`, which this client used to
+  send). More importantly: `clickTracking: true` works by rewriting an
+  `<a href>` target to a GMass tracking redirect while keeping the visible
+  text/URL looking normal — a plain-text message has no anchor tag to
+  rewrite, so click tracking is structurally impossible on it regardless of
+  the `clickTracking` flag. `create_draft()` therefore auto-converts the
+  plain-text `message` it's given into minimal HTML (escaped, line breaks
+  preserved, bare URLs auto-linkified into real `<a href>` tags) and sends
+  `messageType: "html"` — campaign `.txt` template authoring stays 100%
+  plain text; only the wire format changes.
 
 Idempotency (§3): create_draft() and send_campaign() are deliberately two
 separate calls, mirroring the two real API calls. The caller MUST persist
@@ -29,6 +42,9 @@ enforce that ordering itself; wiring the two together is the runner's job
 from __future__ import annotations
 
 import base64
+import html
+import re
+from urllib.parse import urlparse
 
 import requests
 
@@ -39,9 +55,40 @@ REPORT_TYPES = {"replies", "clicks", "bounces", "opens", "recipients", "unsubscr
 # GMass's per-stage field names use English ordinal words, not digits.
 _ORDINALS = ["One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight"]
 
+_URL_RE = re.compile(r'https?://[^\s<>"]+')
+
 
 class GMassError(Exception):
     """Raised when the GMass API returns an unexpected/error response."""
+
+
+def _plain_text_to_html(text: str) -> str:
+    """Minimal plain-text -> HTML conversion so click tracking has a real
+    <a href> to rewrite (see the module docstring). Escapes HTML-special
+    characters, auto-linkifies bare URLs into anchor tags, and preserves
+    line breaks — campaign .txt template authoring never needs to change.
+
+    Each link's VISIBLE TEXT is the URL's domain, not the full URL —
+    verified live (three real guarded sends, see CONTROL_SHEET.md): GMass
+    only rewrites an <a href> for click tracking when its visible text
+    DIFFERS from the href. An anchor whose text is identical to its own
+    href (a "naked" URL rendered as a link — what a naive linkify would
+    produce) is left untouched, silently defeating clickTracking=true.
+    Domain-only text is enough to trigger rewriting, requires no
+    per-site label mapping, and still shows the recipient roughly where a
+    link goes rather than an opaque "click here"."""
+    escaped = html.escape(text)
+
+    def _linkify(match: re.Match) -> str:
+        # match is against the ALREADY-escaped text (e.g. a literal '&' in
+        # the URL is '&amp;' at this point) — unescape back to the raw URL,
+        # then re-escape it correctly as an HTML attribute value.
+        url = html.unescape(match.group(0))
+        label = urlparse(url).netloc or url
+        return f'<a href="{html.escape(url, quote=True)}">{html.escape(label)}</a>'
+
+    linkified = _URL_RE.sub(_linkify, escaped)
+    return linkified.replace("\n", "<br>\n")
 
 
 def _headers(api_key: str) -> dict:
@@ -61,12 +108,15 @@ def create_draft(api_key: str, *, recipient: str, subject: str, message: str,
                   attachment: tuple = None) -> dict:
     """POST /api/campaigndrafts — creates the Gmail draft, carries the
     attachment. `attachment`, if given, is (filename, bytes, content_type).
+    `message` is plain text (matches every caller/template in this app) —
+    converted to minimal HTML here (see _plain_text_to_html) so click
+    tracking has a real <a href> to rewrite; sent as messageType="html".
     Returns {"draft_id": ..., "raw": <full response body>}."""
     body = {
         "emailAddresses": recipient,
         "subject": subject,
-        "message": message,
-        "messageType": "text",
+        "message": _plain_text_to_html(message),
+        "messageType": "html",
     }
     if attachment:
         fname, fbytes, ctype = attachment
