@@ -128,7 +128,38 @@ def test_classify_open_ooo_resend_is_not_yet(tmp_path):
     assert "OOO" in v.reason
 
 
+def test_classify_open_ooo_uses_the_latest_cycle_not_any_ever_requeued(tmp_path):
+    # A SECOND OOO cycle still open must not be masked by a FIRST cycle's
+    # already-resolved requeued — "any requeued anywhere in history" would
+    # wrongly treat this as closed. No reply events here (isolates this
+    # check from the earlier reply-guard, which would otherwise catch it
+    # first in the real production shape where ooo_tagged always follows a
+    # reply — see the reply-guard tests for that path).
+    conn = connect(tmp_path / "t.db")
+    append_event(conn, type="queued", recipient="j@x.com", campaign="c1", stage=0,
+                 meta={"persona": "recruiter"}, timestamp=days_ago(30))
+    append_event(conn, type="sent", recipient="j@x.com", campaign="c1", stage=0,
+                 meta={"is_final_stage": False}, timestamp=days_ago(29))
+    append_event(conn, type="ooo_tagged", recipient="j@x.com", campaign="c1", timestamp=days_ago(27))
+    append_event(conn, type="requeued", recipient="j@x.com", campaign="c1", stage=1,
+                 meta={"is_final_stage": False}, timestamp=days_ago(25))
+    append_event(conn, type="ooo_tagged", recipient="j@x.com", campaign="c1", timestamp=days_ago(20))
+    # ^ second cycle never resolved — recruiter's cadence window (10d) has
+    # long elapsed since first_sent_at, so the old buggy check would have
+    # fallen through to "eligible" here instead of catching the open cycle.
+
+    v = classify_recipient(conn, "c1", "j@x.com", make_global_config(tmp_path), now=NOW)
+    assert v.status == "not_yet"
+    assert "OOO" in v.reason
+
+
 def test_classify_resolved_ooo_then_final_stage_is_eligible(tmp_path):
+    # Exercises the requeued+is_final_stage mechanism in isolation. Note this
+    # exact event sequence can't happen in real production today — dashboard
+    # tag_reply() only ever writes ooo_tagged after an existing reply event,
+    # which the reply-check above would already have caught first. Kept as a
+    # defensive/future-proofing check (e.g. if OOO tagging logic ever
+    # changes, or a persona with an empty cadence completes via this path).
     conn = connect(tmp_path / "t.db")
     append_event(conn, type="queued", recipient="g@x.com", campaign="c1", stage=0,
                  meta={"persona": "recruiter"}, timestamp=days_ago(30))
@@ -230,6 +261,28 @@ def test_find_cleanup_candidates_skips_recipients_with_no_pdf_on_disk(tmp_path):
 
     report = find_cleanup_candidates(conn, make_global_config(tmp_path), workdir_root=workdir_root, now=NOW)
     assert not report.eligible
+
+
+def test_find_cleanup_candidates_one_corrupt_manifest_does_not_abort_the_whole_scan(tmp_path):
+    # One-recipient blast radius (matches runner.py's _send_one pattern): a
+    # corrupted/partial staged.json for one stale recipient must not hide
+    # every other genuinely eligible candidate from the scan.
+    conn = connect(tmp_path / "t.db")
+    workdir_root = tmp_path / "workdir"
+
+    corrupt_workdir = stage(conn, tmp_path, recipient="corrupt@x.com", workdir_root=workdir_root)
+    (corrupt_workdir / "staged.json").write_text("{not valid json")
+
+    stage(conn, tmp_path, recipient="fine@x.com", workdir_root=workdir_root)
+    append_event(conn, type="bounce", recipient="fine@x.com", campaign="c1", timestamp=days_ago(20))
+    conn.execute("UPDATE events SET timestamp = ? WHERE recipient = 'fine@x.com' AND type = 'queued'",
+                 (days_ago(25).isoformat(),))
+    conn.execute("UPDATE events SET timestamp = ? WHERE recipient = 'fine@x.com' AND type = 'sent'",
+                 (days_ago(24).isoformat(),))
+
+    report = find_cleanup_candidates(conn, make_global_config(tmp_path), workdir_root=workdir_root, now=NOW)
+    assert {c.recipient for c in report.eligible} == {"fine@x.com"}
+    assert {u.recipient for u in report.undetermined} == {"corrupt@x.com"}
 
 
 # --- delete_eligible: the actual destructive step ---------------------------

@@ -454,7 +454,11 @@ def warm_but_silent(conn) -> list:
         entry = by_recipient.setdefault(
             row["recipient"], {"recipient": row["recipient"], "campaign": row["campaign"], "stages_clicked": []}
         )
-        if row["stage"] not in entry["stages_clicked"]:
+        # A click's stage is only ever None if the recipient wasn't yet in
+        # the recipients cache at sync time (shouldn't happen — a click can
+        # only follow a sent event, which always upserts the cache) — never
+        # render a literal "None" in the stages-clicked list either way.
+        if row["stage"] is not None and row["stage"] not in entry["stages_clicked"]:
             entry["stages_clicked"].append(row["stage"])
 
     return sorted(by_recipient.values(), key=lambda e: e["recipient"])

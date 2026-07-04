@@ -105,9 +105,12 @@ def classify_recipient(conn, campaign: str, recipient: str, global_config: Globa
     if any(e["type"] == "reply" for e in events):
         return Verdict("not_yet", "recipient replied — PDF never eligible for cleanup", days_idle)
 
-    open_ooo = any(e["type"] == "ooo_tagged" for e in events) and not any(
-        e["type"] == "requeued" for e in events
-    )
+    # Latest of the two lifecycle event types only — "any ooo_tagged with no
+    # requeued ANYWHERE in history" would wrongly treat a resolved-then-
+    # re-tagged OOO cycle as closed just because an EARLIER cycle's requeued
+    # exists. `events` is already id-ASC ordered, so [-1] is the latest.
+    ooo_lifecycle = [e for e in events if e["type"] in ("ooo_tagged", "requeued")]
+    open_ooo = bool(ooo_lifecycle) and ooo_lifecycle[-1]["type"] == "ooo_tagged"
     if open_ooo:
         return Verdict("not_yet", "OOO resend pending — PDF still needed", days_idle)
 
@@ -166,8 +169,18 @@ def find_cleanup_candidates(conn, global_config: GlobalConfig, *,
     for manifest_path in sorted(workdir_root.glob(f"*/*/{MANIFEST_NAME}")):
         workdir = manifest_path.parent
         campaign, recipient = workdir.parent.name, workdir.name
-        manifest = load_manifest(workdir)
-        pdf_path = workdir / manifest["attachment_name"]
+        try:
+            manifest = load_manifest(workdir)
+            pdf_path = workdir / manifest["attachment_name"]
+        except Exception as e:
+            # One-recipient blast radius (matches runner.py's _send_one): a
+            # corrupted/partial staged.json for one stale recipient must
+            # never abort the whole scan and hide every other candidate.
+            undetermined.append(UndeterminedRecipient(
+                campaign=campaign, recipient=recipient, workdir=workdir,
+                reason=f"could not read staged.json — cannot determine attachment: {e}",
+            ))
+            continue
         if not pdf_path.exists():
             continue  # nothing heavy staged here (already cleaned, or latex-loop aborted)
 

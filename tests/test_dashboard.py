@@ -601,6 +601,16 @@ def test_warm_but_silent_dedupes_multiple_stage_clicks_for_one_recipient(conn):
     assert result[0]["stages_clicked"] == [0, 1]
 
 
+def test_warm_but_silent_never_includes_a_literal_none_stage(conn):
+    # A click's stage is None only if the recipient wasn't yet in the
+    # recipients cache at sync time (shouldn't happen in practice) — must
+    # never render a literal "None" in the stages-clicked list either way.
+    append_event(conn, type="click", recipient="a@x.com", campaign="c", stage=None)
+    result = warm_but_silent(conn)
+    assert len(result) == 1
+    assert result[0]["stages_clicked"] == []
+
+
 def test_warm_but_silent_empty_when_no_clicks(conn):
     assert warm_but_silent(conn) == []
 
