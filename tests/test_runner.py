@@ -12,13 +12,13 @@ import pytest
 from slap.config import GlobalConfig, ScheduleConfig
 from slap.queue import due_for_ooo_resend, due_recipients, load_manifest, stage_recipient, tag_ooo
 from slap.runner import (
-    DrainResult, cap_headroom, drain, wait_for_fire_window, _roll_fire_time,
+    DrainResult, cap_headroom, drain, is_active_day, wait_for_fire_window, _roll_fire_time,
 )
 from slap.tracking import append_event, connect, latest_open_draft_id
 
 
 def make_global_config(tmp_path, *, daily_cap=500, drain_retries=3, send_delay_min=10,
-                        send_delay_max=15, api_key_env="GMASS_API_KEY"):
+                        send_delay_max=15, api_key_env="GMASS_API_KEY", active_days=None):
     return GlobalConfig(
         from_email="owner@gmail.com", from_name="Owner", api_key_env=api_key_env,
         personas={"recruiter": [2, 3, 5], "founder": [2, 5, 7], "hiring_manager": [2, 4, 6]},
@@ -26,6 +26,7 @@ def make_global_config(tmp_path, *, daily_cap=500, drain_retries=3, send_delay_m
             fire_window_start="09:00", fire_window_end="09:15",
             send_delay_min=send_delay_min, send_delay_max=send_delay_max,
             daily_cap=daily_cap, drain_retries=drain_retries,
+            active_days=active_days or ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
         ),
         # Absolute, tmp_path-scoped — doctor.check_consumer_domains() (step 12)
         # resolves this path directly (no cwd-relative fallback), so this
@@ -514,6 +515,34 @@ def test_wait_for_fire_window_fires_immediately_if_already_past_it(tmp_path):
     sleeps = []
     wait_for_fire_window(gc.schedule, now_fn=lambda: now, sleep_fn=lambda s: sleeps.append(s))
     assert sleeps == []  # no sleep at all — fires right away
+
+
+# --- is_active_day (§new: configurable scheduler days) ---------------------
+
+def test_is_active_day_true_when_todays_weekday_is_listed(tmp_path):
+    gc = make_global_config(tmp_path, active_days=["mon", "tue", "wed", "thu", "fri"])
+    monday = date(2026, 1, 5)  # a real Monday
+    assert monday.weekday() == 0
+    assert is_active_day(gc.schedule, today=monday) is True
+
+
+def test_is_active_day_false_on_a_weekend_when_only_weekdays_active(tmp_path):
+    gc = make_global_config(tmp_path, active_days=["mon", "tue", "wed", "thu", "fri"])
+    saturday = date(2026, 1, 10)
+    assert saturday.weekday() == 5
+    assert is_active_day(gc.schedule, today=saturday) is False
+
+
+def test_is_active_day_true_every_day_when_all_seven_configured(tmp_path):
+    gc = make_global_config(tmp_path, active_days=["mon", "tue", "wed", "thu", "fri", "sat", "sun"])
+    for offset in range(7):
+        d = date(2026, 1, 5 + offset)
+        assert is_active_day(gc.schedule, today=d) is True
+
+
+def test_is_active_day_defaults_to_todays_real_local_date(tmp_path):
+    gc = make_global_config(tmp_path, active_days=["mon", "tue", "wed", "thu", "fri", "sat", "sun"])
+    assert is_active_day(gc.schedule) is True  # every day active — today always passes
 
 
 class _FixedRng:

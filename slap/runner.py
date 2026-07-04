@@ -49,6 +49,25 @@ class RunnerError(Exception):
     """Raised on fail-loud runner misuse."""
 
 
+# date.weekday(): 0=Monday ... 6=Sunday — matches slap.config.VALID_DAYS' spelling.
+_WEEKDAY_ABBR = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+def is_active_day(schedule, *, today: date = None) -> bool:
+    """Guard for the UNATTENDED runner only (§new: configurable scheduler
+    days) — not applied to a manual `send --now`, which is an explicit human
+    action that should never be silently skipped by a scheduling preference.
+    Correct even if the launchd plist and config.yaml's active_days have
+    drifted out of sync (e.g. active_days edited without regenerating/
+    reloading the plist) — this is the second line of defense; the plist
+    generator (slap/launchd.py) is the first, since it only ever emits
+    StartCalendarInterval entries for days config.yaml actually lists. Local
+    calendar day, matching the fire-window's own local-time interpretation
+    (see module docstring)."""
+    today = today or date.today()
+    return _WEEKDAY_ABBR[today.weekday()] in schedule.active_days
+
+
 @dataclass
 class DrainResult:
     ran: bool                  # False if preflight failed and nothing ran at all

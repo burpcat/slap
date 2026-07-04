@@ -32,7 +32,8 @@ def make_global_config(*, daily_cap=500, drain_retries=3):
         personas={"recruiter": [2, 3, 5], "founder": [2, 5, 7], "hiring_manager": [2, 4, 6]},
         schedule=ScheduleConfig(fire_window_start="09:00", fire_window_end="09:15",
                                  send_delay_min=10, send_delay_max=15,
-                                 daily_cap=daily_cap, drain_retries=drain_retries),
+                                 daily_cap=daily_cap, drain_retries=drain_retries,
+                                 active_days=["mon", "tue", "wed", "thu", "fri", "sat", "sun"]),
         consumer_domains_file="consumer_domains.txt", path="config.yaml",
     )
 

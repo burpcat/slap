@@ -108,7 +108,9 @@ The number of `stageN.txt` files must exactly match the chosen persona's cadence
 | `python slap.py doctor` | Preflight checks — see Setup above. Safe to run any time. |
 | `python slap.py domains` | Regenerates and prints a read-only domain index from tracked events (who you've contacted, grouped by email domain) — for manual inspection, not itself a source of truth. |
 | `python slap.py rebuild` | Rebuilds the `recipients` cache table by replaying the full `events` log. Use this if the cache ever looks wrong — `events` is always the source of truth. |
-| `python slap.py runner` | The unattended drain — asks the DB what's queued and due, and sends it. Meant to be triggered by **launchd**, not run by hand day-to-day. See [`LAUNCHD.md`](LAUNCHD.md) for setup and the one-time manual test. |
+| `python slap.py runner` | The unattended drain — asks the DB what's queued and due, and sends it. Meant to be triggered by **launchd**, not run by hand day-to-day. See [`LAUNCHD.md`](LAUNCHD.md) for setup and the one-time manual test. Guards itself against `config.yaml`'s `schedule.active_days` — exits without draining on a day that isn't listed. |
+| `python slap.py plist` | Prints the launchd `.plist` for `runner`, generated from the current `config.yaml` (one `StartCalendarInterval` entry per `schedule.active_days` day) — redirect it into `~/Library/LaunchAgents/`. See [`LAUNCHD.md`](LAUNCHD.md). |
+| `python slap.py cleanup [--confirm]` | Deletes stale compiled résumé PDFs for recipients who are done/dead/never replied and have been idle 15+ days. Dry run by default; `--confirm` actually deletes. Never touches `resume.tex`. |
 
 Typical flow: `send` a few recipients through the interactive prep loop (staging them to
 the queue, not sending yet) → either `send --now` to drain immediately, or let the

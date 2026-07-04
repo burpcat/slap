@@ -7,6 +7,7 @@ current build state / package layout.
 import argparse
 import os
 import sys
+from datetime import date
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -17,7 +18,7 @@ from slap.config import ConfigError, discover_campaigns, load_campaign, load_glo
 from slap.latex import recipient_workdir, run_latex_loop
 from slap.queue import stage_recipient
 from slap.templates import fill_template, parse_drop
-from slap import dashboard, doctor, domains, gmass, runner, tracking
+from slap import dashboard, doctor, domains, gmass, launchd, runner, tracking
 
 load_dotenv()
 
@@ -192,10 +193,25 @@ def cmd_runner(args):
     except ConfigError as e:
         display.fail(f"slap: {e}")
         sys.exit(1)
+    if not runner.is_active_day(global_config.schedule):
+        display.success(
+            f"{date.today():%A} is not an active day (active_days={global_config.schedule.active_days}) "
+            f"— exiting without draining."
+        )
+        return
     conn = tracking.connect()
     runner.wait_for_fire_window(global_config.schedule)
     result = runner.drain(conn, global_config, os.environ.get(global_config.api_key_env, ""))
     _print_drain_result(result)
+
+
+def cmd_plist(args):
+    try:
+        global_config = load_global_config()
+    except ConfigError as e:
+        display.fail(f"slap: {e}")
+        sys.exit(1)
+    print(launchd.render_plist(global_config, Path.cwd(), sys.executable), end="")
 
 
 def _print_drain_result(result):
@@ -352,6 +368,9 @@ def build_parser():
     sub.add_parser(
         "runner", help="Unattended drain — invoked by launchd, see LAUNCHD.md"
     ).set_defaults(func=cmd_runner)
+    sub.add_parser(
+        "plist", help="Print the launchd .plist for the unattended runner, see LAUNCHD.md"
+    ).set_defaults(func=cmd_plist)
 
     p_cleanup = sub.add_parser(
         "cleanup", help="Delete stale compiled PDFs for done/dead/no-reply recipients (dry run by default)"

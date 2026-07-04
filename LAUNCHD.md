@@ -5,16 +5,45 @@
 catch up if the Mac was asleep at the scheduled time; a launchd `StartCalendarInterval`
 LaunchAgent does.
 
+## Configurable scheduler days (`schedule.active_days`)
+
+`config.yaml`'s `schedule.active_days` lists which weekdays the unattended runner is
+allowed to drain, e.g.:
+
+```yaml
+schedule:
+  active_days: [mon, tue, wed, thu, fri] # skip weekends
+```
+
+This is enforced in **two places**, so it stays correct even if they ever drift out of
+sync:
+
+1. **The generated plist** (`python slap.py plist`) emits one `StartCalendarInterval`
+   entry per active day — launchd simply never invokes the runner on an inactive day.
+2. **The runner itself** (`runner.is_active_day()`) re-checks `active_days` at drain time
+   and exits without draining if today isn't listed, even if it somehow got invoked
+   anyway. This does *not* apply to a manual `send --now` — that's an explicit human
+   action, never silently skipped by a scheduling preference.
+
+**Note the asymmetry**: the runner-side guard only protects against the plist being
+*too permissive* (still has a Weekday entry for a day you've since removed from
+`active_days`). If you *add* a day to `active_days`, the plist has no entry for it until
+you regenerate and reload — the runner is never even invoked that day. **Always
+regenerate + reload after changing `active_days` or `fire_window_start`** (see below).
+
 ## Install
 
-1. Copy the template and fill in your real, absolute repo path (three placeholders):
+1. Generate the plist from your current `config.yaml` and copy it into place:
 
    ```
-   cp com.slap.runner.plist.example ~/Library/LaunchAgents/com.slap.runner.plist
+   python slap.py plist > ~/Library/LaunchAgents/com.slap.runner.plist
    ```
 
-   Then edit `~/Library/LaunchAgents/com.slap.runner.plist` and replace every
-   `/ABSOLUTE/PATH/TO/slap` with your actual path (e.g. `/Users/you/Documents/github/slap`).
+   No manual path-editing needed — the generator fills in the Python interpreter that
+   ran it, the absolute repo path, and one `StartCalendarInterval` entry per
+   `schedule.active_days` day, all anchored at `schedule.fire_window_start`.
+   `com.slap.runner.plist.example` (repo root) shows the resulting shape for reference
+   only — it's not meant to be hand-copied anymore.
 
 2. Load it:
 
@@ -22,22 +51,27 @@ LaunchAgent does.
    launchctl load ~/Library/LaunchAgents/com.slap.runner.plist
    ```
 
-3. To reload after editing the plist:
+3. **Any time `config.yaml`'s `schedule.active_days` or `fire_window_start` changes**,
+   regenerate and reload:
 
    ```
+   python slap.py plist > ~/Library/LaunchAgents/com.slap.runner.plist
    launchctl unload ~/Library/LaunchAgents/com.slap.runner.plist
    launchctl load ~/Library/LaunchAgents/com.slap.runner.plist
    ```
 
 ## How the timing works
 
-- `StartCalendarInterval` fires at a **fixed anchor time** (09:00 in the template) —
-  this is what gives the wake-catch-up guarantee: if the Mac is asleep at 09:00, launchd
-  runs the job as soon as it wakes.
+- Each `StartCalendarInterval` array entry fires at a **fixed anchor time** (the
+  template's `Hour`/`Minute`, taken from `fire_window_start`) on its one active weekday —
+  this is what gives the wake-catch-up guarantee: if the Mac is asleep at that time on an
+  active day, launchd runs the job as soon as it wakes.
 - `slap.py runner` itself then rolls a **random moment** within
   `schedule.fire_window_start`–`fire_window_end` (`config.yaml`, default `09:00`–`09:15`)
   and sleeps until it — or, if that moment has already passed (e.g. the Mac woke up at
   09:20), fires **immediately** rather than waiting for tomorrow.
+- Before any of that, `runner.is_active_day()` checks `config.yaml`'s current
+  `active_days` and exits immediately (no drain, no queue touched) if today isn't listed.
 - Logs land at `runner.log`/`runner.err.log` (paths set in the plist) — check these
   first if a scheduled run doesn't seem to have happened.
 
@@ -46,28 +80,27 @@ LaunchAgent does.
 launchd's actual sleep/wake catch-up behavior only happens on real hardware — do this
 once after installing, to prove it actually works on your Mac:
 
-1. Edit `~/Library/LaunchAgents/com.slap.runner.plist`'s `Hour`/`Minute` to a time
-   **~2 minutes from now** (e.g. if it's 14:32, set `Hour=14`, `Minute=34`).
-2. Also temporarily narrow `config.yaml`'s `schedule.fire_window_start`/`fire_window_end`
-   to a ~1 minute window starting at that same time, so the random-fire-time roll doesn't
-   add much extra delay for this test.
-3. Reload the agent (`unload` then `load`, per above).
-4. Put the Mac to sleep (Apple menu → Sleep, or close the lid) **before** the scheduled
+1. In `config.yaml`, temporarily set `schedule.fire_window_start`/`fire_window_end` to a
+   ~1-minute window starting ~2 minutes from now (e.g. if it's 14:32, use `14:34`–`14:35`),
+   and make sure **today's weekday is in `active_days`** (add it temporarily if not).
+2. Regenerate and reload the plist (see step 3 above).
+3. Put the Mac to sleep (Apple menu → Sleep, or close the lid) **before** the scheduled
    minute arrives.
-5. Wake the Mac **after** the scheduled minute has passed.
-6. Within a few seconds of waking, check `runner.log` — it should show a fresh
+4. Wake the Mac **after** the scheduled minute has passed.
+5. Within a few seconds of waking, check `runner.log` — it should show a fresh
    `runner` invocation with a timestamp at or shortly after wake, not at the original
    scheduled minute (proving it ran *on wake*, not that it silently missed the window).
-7. Also check the dashboard / `slap.db` for a `run_started`/`run_completed` event pair
+6. Also check the dashboard / `slap.db` for a `run_started`/`run_completed` event pair
    with a timestamp matching the wake time. If you instead see `run_started` followed by
    a `run_failed` (no `run_completed`), the job *did* fire on wake correctly — that part
    worked — but `doctor`'s preflight failed (see the `run_failed` event's `meta.error` for
    which check, or just run `python slap.py doctor` by hand). The queue stays untouched
    either way; it'll retry itself on the next scheduled fire.
-8. **Revert** the plist's `Hour`/`Minute` back to your real desired fire time (e.g. 9:00)
-   and `config.yaml`'s fire window back to `09:00`–`09:15`, then reload the agent again.
+7. **Revert** `config.yaml`'s `fire_window_start`/`fire_window_end` (and `active_days`, if
+   you temporarily changed it) back to your real values, then regenerate + reload again.
 
 If the job does *not* fire on wake at all (no `run_started` event, nothing in the logs),
-common causes: the plist wasn't reloaded after editing, `WorkingDirectory`/paths in the
-plist don't match your actual repo location, or the Python interpreter path doesn't point
-at this repo's `.venv`.
+common causes: the plist wasn't regenerated/reloaded after a `config.yaml` change,
+today's weekday isn't in `active_days`, or the Python interpreter path in the plist
+doesn't point at this repo's `.venv` (regenerate with `slap.py plist` run from inside that
+venv to fix this automatically).

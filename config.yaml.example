@@ -19,6 +19,7 @@ schedule:
   send_delay_max: 15
   daily_cap: 500 # Gmail ceiling; drain stops here, overflow re-queues
   drain_retries: 3 # transient-failure retries before surfacing run_failed
+  active_days: [mon, tue, wed, thu, fri] # days the unattended runner may drain (skip weekends here)
 
 tracking:
   consumer_domains_file: consumer_domains.txt

@@ -14,10 +14,11 @@ import json
 import os
 import subprocess
 import sys
+from datetime import date
 from pathlib import Path
 
 SLAP_PY = Path(__file__).resolve().parent.parent / "slap.py"
-ALL_COMMANDS = ["list", "send", "dashboard", "doctor", "domains", "rebuild", "runner"]
+ALL_COMMANDS = ["list", "send", "dashboard", "doctor", "domains", "rebuild", "runner", "cleanup", "plist"]
 
 
 def run(*args, cwd=None, env=None, input=None):
@@ -291,6 +292,50 @@ def test_runner_fails_loud_without_config(tmp_path):
     assert result.returncode != 0
     assert "config.yaml" in result.stderr
     assert not (tmp_path / "slap.db").exists()
+
+
+def test_runner_skips_draining_on_an_inactive_day(tmp_path):
+    # The active_days guard must fire BEFORE tracking.connect()/
+    # wait_for_fire_window — critical for this test to stay fast (no real
+    # sleep) and to prove no DB/queue side effect happens on a skipped day.
+    all_days = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+    today_abbr = all_days[date.today().weekday()]
+    other_days = [d for d in all_days if d != today_abbr]
+    config_text = (
+        (Path(__file__).resolve().parent.parent / "config.yaml.example").read_text()
+        .replace("<Owner Name>", "Test Owner")
+        .replace("active_days: [mon, tue, wed, thu, fri]", f"active_days: [{', '.join(other_days)}]")
+    )
+    (tmp_path / "config.yaml").write_text(config_text)
+    result = run("runner", cwd=tmp_path)
+    assert result.returncode == 0
+    assert "not an active day" in (result.stdout + result.stderr).lower()
+    assert not (tmp_path / "slap.db").exists()
+
+
+def test_plist_fails_loud_without_config(tmp_path):
+    result = run("plist", cwd=tmp_path)
+    assert result.returncode != 0
+    assert "config.yaml" in result.stderr
+
+
+def test_plist_prints_a_valid_plist_for_this_repo(tmp_path):
+    (tmp_path / "config.yaml").write_text(
+        (Path(__file__).resolve().parent.parent / "config.yaml.example")
+        .read_text()
+        .replace("<Owner Name>", "Test Owner")
+    )
+    result = run("plist", cwd=tmp_path)
+    assert result.returncode == 0
+    assert "com.slap.runner" in result.stdout
+    assert "<key>StartCalendarInterval</key>" in result.stdout
+    assert str(tmp_path.resolve()) in result.stdout  # WorkingDirectory/paths resolved to THIS config's repo root
+    assert sys.executable in result.stdout  # the interpreter that ran slap.py, not a hardcoded path
+
+    import plistlib
+    parsed = plistlib.loads(result.stdout.encode())
+    assert isinstance(parsed["StartCalendarInterval"], list)
+    assert len(parsed["StartCalendarInterval"]) == 5  # config.yaml.example's active_days: mon-fri
 
 
 def test_dashboard_fails_loud_without_config(tmp_path):

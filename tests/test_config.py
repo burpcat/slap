@@ -26,6 +26,7 @@ schedule:
   send_delay_max: 15
   daily_cap: 500
   drain_retries: 3
+  active_days: [mon, tue, wed, thu, fri]
 
 tracking:
   consumer_domains_file: consumer_domains.txt
@@ -98,6 +99,44 @@ def test_load_global_config_invalid_yaml_fails_loud(tmp_path):
     path = tmp_path / "config.yaml"
     path.write_text("sender: [this is not\n  a valid: mapping")
     with pytest.raises(ConfigError, match="invalid YAML"):
+        load_global_config(path)
+
+
+# --- schedule.active_days -------------------------------------------------
+
+def test_load_global_config_active_days_parsed_and_lowercased(tmp_path):
+    text = VALID_CONFIG_YAML.replace("active_days: [mon, tue, wed, thu, fri]",
+                                      "active_days: [MON, Tue, wed]")
+    path = write_global_config(tmp_path, text)
+    cfg = load_global_config(path)
+    assert cfg.schedule.active_days == ["mon", "tue", "wed"]
+
+
+def test_load_global_config_missing_active_days_fails_loud(tmp_path):
+    bad = VALID_CONFIG_YAML.replace("active_days: [mon, tue, wed, thu, fri]\n", "")
+    path = write_global_config(tmp_path, bad)
+    with pytest.raises(ConfigError, match="active_days"):
+        load_global_config(path)
+
+
+def test_load_global_config_empty_active_days_fails_loud(tmp_path):
+    bad = VALID_CONFIG_YAML.replace("active_days: [mon, tue, wed, thu, fri]", "active_days: []")
+    path = write_global_config(tmp_path, bad)
+    with pytest.raises(ConfigError, match="non-empty"):
+        load_global_config(path)
+
+
+def test_load_global_config_invalid_day_name_fails_loud(tmp_path):
+    bad = VALID_CONFIG_YAML.replace("active_days: [mon, tue, wed, thu, fri]", "active_days: [mon, funday]")
+    path = write_global_config(tmp_path, bad)
+    with pytest.raises(ConfigError, match="not a valid day"):
+        load_global_config(path)
+
+
+def test_load_global_config_duplicate_day_fails_loud(tmp_path):
+    bad = VALID_CONFIG_YAML.replace("active_days: [mon, tue, wed, thu, fri]", "active_days: [mon, mon]")
+    path = write_global_config(tmp_path, bad)
+    with pytest.raises(ConfigError, match="duplicate"):
         load_global_config(path)
 
 

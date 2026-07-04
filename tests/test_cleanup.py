@@ -19,7 +19,8 @@ def make_global_config(tmp_path, personas=None):
         from_email="owner@gmail.com", from_name="Owner", api_key_env="GMASS_API_KEY",
         personas=personas or {"recruiter": [2, 3, 5]},
         schedule=ScheduleConfig(fire_window_start="09:00", fire_window_end="09:15",
-                                 send_delay_min=10, send_delay_max=15, daily_cap=500, drain_retries=3),
+                                 send_delay_min=10, send_delay_max=15, daily_cap=500, drain_retries=3,
+                                 active_days=["mon", "tue", "wed", "thu", "fri", "sat", "sun"]),
         consumer_domains_file=str(tmp_path / "consumer_domains.txt"), path=tmp_path / "config.yaml",
     )
 

@@ -41,6 +41,9 @@ def _load_yaml_mapping(path: Path) -> dict:
     return raw
 
 
+VALID_DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
 @dataclass
 class ScheduleConfig:
     fire_window_start: str
@@ -49,6 +52,7 @@ class ScheduleConfig:
     send_delay_max: int
     daily_cap: int
     drain_retries: int
+    active_days: list  # e.g. ["mon", "tue", "wed", "thu", "fri"] — days the unattended runner may drain
 
 
 @dataclass
@@ -120,6 +124,21 @@ def load_global_config(path: Path = CONFIG_PATH) -> GlobalConfig:
         value = schedule_values[key]
         if not isinstance(value, int) or isinstance(value, bool):
             raise ConfigError(f"{schedule_ctx}.{key} must be an integer — got {value!r}")
+
+    active_days_raw = _require(sched_raw, "active_days", schedule_ctx)
+    if not isinstance(active_days_raw, list) or not active_days_raw:
+        raise ConfigError(f"{schedule_ctx}.active_days must be a non-empty list")
+    active_days = []
+    for d in active_days_raw:
+        norm = d.lower() if isinstance(d, str) else None
+        if norm not in VALID_DAYS:
+            raise ConfigError(
+                f"{schedule_ctx}.active_days: {d!r} is not a valid day — use one of {VALID_DAYS}"
+            )
+        active_days.append(norm)
+    if len(set(active_days)) != len(active_days):
+        raise ConfigError(f"{schedule_ctx}.active_days contains duplicate day(s): {active_days_raw}")
+
     schedule = ScheduleConfig(
         fire_window_start=schedule_values["fire_window_start"],
         fire_window_end=schedule_values["fire_window_end"],
@@ -127,6 +146,7 @@ def load_global_config(path: Path = CONFIG_PATH) -> GlobalConfig:
         send_delay_max=schedule_values["send_delay_max"],
         daily_cap=schedule_values["daily_cap"],
         drain_retries=schedule_values["drain_retries"],
+        active_days=active_days,
     )
 
     consumer_domains_file = _require(raw, "tracking.consumer_domains_file", path)
