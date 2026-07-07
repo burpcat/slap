@@ -4,6 +4,7 @@ cap-aware leaves overflow queued; --now flushes; drain resilience (preflight
 failure -> retries -> run_failed, queue intact); idempotency (draft ID
 recorded before send, retry-after-draft doesn't double-create).
 """
+import json
 import os
 from datetime import date, datetime, timedelta, timezone
 
@@ -41,13 +42,14 @@ def make_attachment(tmp_path, name="resume.pdf"):
     return p
 
 
-def stage_one(conn, tmp_path, recipient="jane@acme.com", persona="recruiter", cadence=None):
+def stage_one(conn, tmp_path, recipient="jane@acme.com", persona="recruiter", cadence=None,
+              latex_enabled=True, attachment_path=None):
     cadence = cadence if cadence is not None else [2, 3, 5]
     return stage_recipient(
         conn, campaign="c", recipient=recipient, persona=persona, cadence=cadence,
         subject="Hi", body="Body", stage_bodies=["s1", "s2", "s3"][:len(cadence)],
-        attachment_path=make_attachment(tmp_path, f"{recipient}.pdf"), attachment_name="r.pdf",
-        workdir_root=tmp_path / "workdir",
+        attachment_path=attachment_path or make_attachment(tmp_path, f"{recipient}.pdf"),
+        attachment_name="r.pdf", latex_enabled=latex_enabled, workdir_root=tmp_path / "workdir",
     )
 
 
@@ -106,6 +108,84 @@ def test_drain_sends_a_staged_recipient(conn, tmp_path):
     assert result == DrainResult(ran=True, sent=1, failed=0, remaining_queued=0, preflight_error=None)
     assert calls == {"create": 1, "send": 1}
     assert due_recipients(conn) == []
+
+
+def test_drain_static_campaign_attaches_from_shared_source_not_a_workdir_copy(conn, tmp_path):
+    # Static (latex_enabled=False) campaigns never get a per-recipient PDF
+    # copy — the runner must read attachment bytes straight from the shared
+    # campaigns/<name>/<attachment_file> path recorded in the manifest.
+    gc = make_global_config(tmp_path)
+    shared_resume = make_attachment(tmp_path, "shared_campaign_resume.pdf")
+    shared_resume.write_bytes(b"%PDF-the-one-true-resume")
+    stage_one(conn, tmp_path, latex_enabled=False, attachment_path=shared_resume)
+
+    captured = {}
+
+    def create_fn(api_key, *, recipient, subject, message, attachment=None):
+        captured["attachment"] = attachment
+        return {"draft_id": "d1", "raw": {}}
+
+    def send_fn(api_key, draft_id_arg, *, campaign_settings):
+        return {"campaign_id": 42, "raw": {}}
+
+    result = drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+                    create_draft_fn=create_fn, send_campaign_fn=send_fn)
+
+    assert result.sent == 1
+    name, data, ctype = captured["attachment"]
+    assert data == b"%PDF-the-one-true-resume"
+    assert name == "r.pdf"
+    # No per-recipient copy exists anywhere under workdir/.
+    assert list((tmp_path / "workdir").rglob("*.pdf")) == []
+    events = [dict(r) for r in conn.execute("SELECT * FROM events WHERE type = 'sent'")]
+    assert len(events) == 1  # still recorded per recipient in the event log
+
+
+def test_drain_falls_back_to_workdir_copy_when_attachment_source_is_absent(conn, tmp_path):
+    # Backward compatibility: a staged.json written before attachment_source
+    # existed has no such key. load_manifest().get() must fall back to the
+    # old workdir/attachment_name read path rather than crashing.
+    gc = make_global_config(tmp_path)
+    workdir = stage_one(conn, tmp_path, latex_enabled=True)
+    manifest_path = workdir / "staged.json"
+    manifest = json.loads(manifest_path.read_text())
+    del manifest["attachment_source"]  # simulate a pre-existing, older manifest
+    manifest_path.write_text(json.dumps(manifest))
+
+    create_fn, send_fn, calls = fake_gmass()
+    result = drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+                    create_draft_fn=create_fn, send_campaign_fn=send_fn)
+
+    assert result.sent == 1
+    assert calls == {"create": 1, "send": 1}
+
+
+def test_drain_static_campaign_missing_shared_source_fails_only_that_recipient(conn, tmp_path):
+    # One-recipient blast radius: if the shared source file has gone missing
+    # by drain time, that recipient gets send_failed - it must not crash the
+    # whole drain or affect any other recipient in the batch.
+    gc = make_global_config(tmp_path)
+    shared_resume = make_attachment(tmp_path, "shared_campaign_resume.pdf")
+    stage_one(conn, tmp_path, recipient="broken@acme.com", latex_enabled=False,
+              attachment_path=shared_resume)
+    stage_one(conn, tmp_path, recipient="fine@acme.com", latex_enabled=True)
+    shared_resume.unlink()  # the shared source vanishes before drain
+
+    create_fn, send_fn, calls = fake_gmass()
+    result = drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+                    create_draft_fn=create_fn, send_campaign_fn=send_fn)
+
+    assert result.sent == 1
+    assert result.failed == 1
+    failed_event = conn.execute(
+        "SELECT * FROM events WHERE type = 'send_failed' AND recipient = 'broken@acme.com'"
+    ).fetchone()
+    assert failed_event is not None
+    # The successful recipient is gone from the queue; the failed one stays
+    # queued for retry on the next drain (§11 - a failed attempt is never
+    # dropped, and never blocks/affects the other recipient in the batch).
+    remaining = [r["recipient"] for r in due_recipients(conn)]
+    assert remaining == ["broken@acme.com"]
 
 
 def test_drain_sends_a_recipient_already_contacted_in_an_earlier_campaign(conn, tmp_path):

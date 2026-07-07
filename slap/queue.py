@@ -24,21 +24,35 @@ MANIFEST_NAME = "staged.json"
 
 def stage_recipient(conn, *, campaign: str, recipient: str, persona: str, cadence: list,
                      subject: str, body: str, stage_bodies: list,
-                     attachment_path: Path, attachment_name: str,
+                     attachment_path: Path, attachment_name: str, latex_enabled: bool,
                      workdir_root: Path = WORKDIR_ROOT) -> Path:
     """Write the queued event + staged manifest for one recipient (does not
-    send). Returns the recipient's workdir. The attachment is copied into
-    the workdir if it isn't already staged there (e.g. the LaTeX loop, step
-    8, already staged it in place for latex-enabled campaigns)."""
+    send). Returns the recipient's workdir.
+
+    latex_enabled recipients genuinely have a per-recipient attachment (the
+    freshly compiled PDF the LaTeX loop, step 8, already staged in place) —
+    that's real per-recipient state, so it stays copied into the workdir.
+
+    Static (latex-disabled) recipients all share the exact same campaign
+    resume.pdf — copying it into every recipient's workdir would be false
+    per-recipient state (identical bytes duplicated once per send, forever).
+    Instead the manifest records `attachment_source`, the shared file's own
+    path in campaigns/<name>/ — the runner reads bytes from there directly
+    at drain time (see runner._send_one), no per-recipient copy at all."""
     workdir = recipient_workdir(campaign, recipient, root=workdir_root)
-    staged_attachment = workdir / attachment_name
-    if attachment_path.resolve() != staged_attachment.resolve():
-        shutil.copyfile(attachment_path, staged_attachment)
+
+    if latex_enabled:
+        staged_attachment = workdir / attachment_name
+        if attachment_path.resolve() != staged_attachment.resolve():
+            shutil.copyfile(attachment_path, staged_attachment)
+        attachment_source = None  # None means "read from workdir/attachment_name"
+    else:
+        attachment_source = str(attachment_path.resolve())
 
     manifest = {
         "campaign": campaign, "recipient": recipient, "persona": persona, "cadence": cadence,
         "subject": subject, "body": body, "stage_bodies": stage_bodies,
-        "attachment_name": attachment_name,
+        "attachment_name": attachment_name, "attachment_source": attachment_source,
     }
     (workdir / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 

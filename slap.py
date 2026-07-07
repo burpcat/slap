@@ -183,6 +183,7 @@ def _prep_one_recipient(conn, campaign, consumer_domains, values, recipient):
         conn, campaign=campaign.name, recipient=recipient, persona=campaign.persona,
         cadence=campaign.cadence, subject=subject, body=body, stage_bodies=stage_bodies,
         attachment_path=attachment_path, attachment_name=campaign.attachment_name,
+        latex_enabled=campaign.latex_enabled,
     )
     display.success(f"Staged {recipient}.")
 

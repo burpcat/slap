@@ -36,13 +36,19 @@ def make_attachment(tmp_path, name="resume.pdf"):
 
 
 def stage(conn, tmp_path, *, campaign="c1", recipient="a@x.com", persona="recruiter",
-          cadence=(2, 3, 5), attachment_name="Resume.pdf", workdir_root=None):
+          cadence=(2, 3, 5), attachment_name="Resume.pdf", workdir_root=None, latex_enabled=True):
+    # latex_enabled=True by default: cleanup targets the per-recipient
+    # compiled PDF genuinely sitting in workdir — that's the case these
+    # tests exercise. A static (latex_enabled=False) recipient never has a
+    # PDF copied into its workdir at all (see slap/queue.py), so it's never
+    # a cleanup candidate in the first place — see the dedicated test below.
     workdir_root = workdir_root or (tmp_path / "workdir")
     attachment = make_attachment(tmp_path, name=f"src_{recipient}.pdf")
     return stage_recipient(
         conn, campaign=campaign, recipient=recipient, persona=persona, cadence=list(cadence),
         subject="Hi", body="Body", stage_bodies=["s1", "s2", "s3"],
-        attachment_path=attachment, attachment_name=attachment_name, workdir_root=workdir_root,
+        attachment_path=attachment, attachment_name=attachment_name,
+        latex_enabled=latex_enabled, workdir_root=workdir_root,
     )
 
 
@@ -261,6 +267,25 @@ def test_find_cleanup_candidates_skips_recipients_with_no_pdf_on_disk(tmp_path):
 
     report = find_cleanup_candidates(conn, make_global_config(tmp_path), workdir_root=workdir_root, now=NOW)
     assert not report.eligible
+
+
+def test_find_cleanup_candidates_never_flags_static_campaign_recipients(tmp_path):
+    # Static (latex_enabled=False) recipients never get a PDF copied into
+    # their workdir at all (see slap/queue.py) - there's nothing heavy to
+    # reclaim per recipient in the first place, so they must never appear
+    # as cleanup candidates, no matter how bounced/idle they are.
+    conn = connect(tmp_path / "t.db")
+    workdir_root = tmp_path / "workdir"
+    stage(conn, tmp_path, recipient="static@x.com", workdir_root=workdir_root, latex_enabled=False)
+    append_event(conn, type="bounce", recipient="static@x.com", campaign="c1", timestamp=days_ago(20))
+    conn.execute("UPDATE events SET timestamp = ? WHERE recipient = 'static@x.com' AND type = 'queued'",
+                 (days_ago(25).isoformat(),))
+    conn.execute("UPDATE events SET timestamp = ? WHERE recipient = 'static@x.com' AND type = 'sent'",
+                 (days_ago(24).isoformat(),))
+
+    report = find_cleanup_candidates(conn, make_global_config(tmp_path), workdir_root=workdir_root, now=NOW)
+    assert not report.eligible
+    assert not report.undetermined
 
 
 def test_find_cleanup_candidates_one_corrupt_manifest_does_not_abort_the_whole_scan(tmp_path):

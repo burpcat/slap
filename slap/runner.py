@@ -165,7 +165,15 @@ def _send_one(conn, api_key: str, row: dict, *, workdir_root: Path = WORKDIR_ROO
         stage_bodies = manifest["stage_bodies"]
         subject = manifest["subject"]
         body = manifest["body"]
-        attachment_bytes = (workdir / attachment_name).read_bytes()
+        # attachment_source (static/latex-disabled campaigns): the shared
+        # campaigns/<name>/<attachment_file> path — read fresh at drain
+        # time, never copied per-recipient (identical bytes for everyone).
+        # Absent/None (latex-enabled campaigns, and any staged.json written
+        # before this field existed): read the per-recipient compiled PDF
+        # already sitting in this recipient's own workdir, as before.
+        attachment_source = manifest.get("attachment_source")
+        attachment_path = Path(attachment_source) if attachment_source else workdir / attachment_name
+        attachment_bytes = attachment_path.read_bytes()
         campaign_settings = gmass.build_campaign_settings(cadence, stage_bodies)
     except Exception as e:
         append_event(conn, type="send_failed", recipient=recipient, campaign=campaign,

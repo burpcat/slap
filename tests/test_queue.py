@@ -17,7 +17,7 @@ def test_stage_recipient_writes_queued_event_only_not_sent(tmp_path):
     stage_recipient(
         conn, campaign="c", recipient="jane@acme.com", persona="recruiter", cadence=[2, 3, 5],
         subject="Hi", body="Body", stage_bodies=["s1", "s2", "s3"],
-        attachment_path=attachment, attachment_name="Jane_Resume.pdf",
+        attachment_path=attachment, attachment_name="Jane_Resume.pdf", latex_enabled=True,
         workdir_root=tmp_path / "workdir",
     )
     events = [dict(r) for r in conn.execute("SELECT * FROM events")]
@@ -36,7 +36,7 @@ def test_stage_recipient_writes_manifest_and_copies_attachment(tmp_path):
     workdir = stage_recipient(
         conn, campaign="c", recipient="jane@acme.com", persona="recruiter", cadence=[2, 3, 5],
         subject="Hi {{company}}", body="Body text", stage_bodies=["s1", "s2", "s3"],
-        attachment_path=attachment, attachment_name="Jane_Resume.pdf",
+        attachment_path=attachment, attachment_name="Jane_Resume.pdf", latex_enabled=True,
         workdir_root=workdir_root,
     )
     assert (workdir / "Jane_Resume.pdf").exists()
@@ -47,6 +47,57 @@ def test_stage_recipient_writes_manifest_and_copies_attachment(tmp_path):
     assert manifest["cadence"] == [2, 3, 5]
     assert manifest["persona"] == "recruiter"
     assert manifest["attachment_name"] == "Jane_Resume.pdf"
+
+
+def test_stage_recipient_latex_enabled_records_no_attachment_source(tmp_path):
+    # latex_enabled=True -> None signals "read from workdir/attachment_name"
+    # at drain time, since the compiled PDF genuinely differs per recipient.
+    conn = connect(tmp_path / "test.db")
+    attachment = make_attachment(tmp_path)
+    workdir = stage_recipient(
+        conn, campaign="c", recipient="jane@acme.com", persona="recruiter", cadence=[2, 3, 5],
+        subject="Hi", body="Body", stage_bodies=["s1", "s2", "s3"],
+        attachment_path=attachment, attachment_name="Jane_Resume.pdf", latex_enabled=True,
+        workdir_root=tmp_path / "workdir",
+    )
+    manifest = load_manifest(workdir)
+    assert manifest["attachment_source"] is None
+    assert (workdir / "Jane_Resume.pdf").exists()
+
+
+def test_stage_recipient_static_does_not_copy_attachment_into_workdir(tmp_path):
+    # A static (latex-disabled) campaign's attachment is identical for every
+    # recipient — copying it into each recipient's workdir would be false
+    # per-recipient state. It must stay un-copied; the manifest instead
+    # records the shared source path directly.
+    conn = connect(tmp_path / "test.db")
+    shared_resume = make_attachment(tmp_path, name="campaign_resume.pdf")
+    workdir = stage_recipient(
+        conn, campaign="c", recipient="jane@acme.com", persona="recruiter", cadence=[2, 3, 5],
+        subject="Hi", body="Body", stage_bodies=["s1", "s2", "s3"],
+        attachment_path=shared_resume, attachment_name="Jane_Resume.pdf", latex_enabled=False,
+        workdir_root=tmp_path / "workdir",
+    )
+    assert not (workdir / "Jane_Resume.pdf").exists()  # never copied
+    manifest = load_manifest(workdir)
+    assert manifest["attachment_source"] == str(shared_resume.resolve())
+
+
+def test_stage_recipient_static_multiple_recipients_share_one_source_no_duplication(tmp_path):
+    conn = connect(tmp_path / "test.db")
+    shared_resume = make_attachment(tmp_path, name="campaign_resume.pdf")
+    workdir_root = tmp_path / "workdir"
+    for recipient in ["a@acme.com", "b@acme.com", "c@acme.com"]:
+        workdir = stage_recipient(
+            conn, campaign="c", recipient=recipient, persona="recruiter", cadence=[2, 3, 5],
+            subject="Hi", body="Body", stage_bodies=["s1", "s2", "s3"],
+            attachment_path=shared_resume, attachment_name="Resume.pdf", latex_enabled=False,
+            workdir_root=workdir_root,
+        )
+        assert not (workdir / "Resume.pdf").exists()
+        assert load_manifest(workdir)["attachment_source"] == str(shared_resume.resolve())
+    # Only the one original file exists anywhere under workdir/ — no per-recipient copies.
+    assert list(workdir_root.rglob("*.pdf")) == []
 
 
 def test_stage_recipient_does_not_double_copy_already_staged_attachment(tmp_path):
@@ -62,7 +113,7 @@ def test_stage_recipient_does_not_double_copy_already_staged_attachment(tmp_path
     stage_recipient(
         conn, campaign="c", recipient="jane@acme.com", persona="recruiter", cadence=[2, 3, 5],
         subject="Hi", body="Body", stage_bodies=["s1", "s2", "s3"],
-        attachment_path=already_staged, attachment_name="Jane_Resume.pdf",
+        attachment_path=already_staged, attachment_name="Jane_Resume.pdf", latex_enabled=True,
         workdir_root=workdir_root,
     )
     assert already_staged.read_bytes() == b"%PDF-already-there"
@@ -79,12 +130,14 @@ def test_due_recipients_includes_queued_excludes_already_sent(tmp_path):
     stage_recipient(
         conn, campaign="c", recipient="queued-only@acme.com", persona="recruiter", cadence=[2, 3, 5],
         subject="Hi", body="Body", stage_bodies=["s1", "s2", "s3"],
-        attachment_path=attachment, attachment_name="r.pdf", workdir_root=tmp_path / "workdir",
+        attachment_path=attachment, attachment_name="r.pdf", latex_enabled=True,
+        workdir_root=tmp_path / "workdir",
     )
     stage_recipient(
         conn, campaign="c", recipient="already-sent@acme.com", persona="recruiter", cadence=[2, 3, 5],
         subject="Hi", body="Body", stage_bodies=["s1", "s2", "s3"],
-        attachment_path=attachment, attachment_name="r.pdf", workdir_root=tmp_path / "workdir",
+        attachment_path=attachment, attachment_name="r.pdf", latex_enabled=True,
+        workdir_root=tmp_path / "workdir",
     )
     append_event(conn, type="sent", recipient="already-sent@acme.com", campaign="c",
                  stage=0, gmass_campaign_id="1")
@@ -114,7 +167,8 @@ def test_due_recipients_includes_recipient_re_staged_after_a_prior_campaigns_sen
     stage_recipient(
         conn, campaign="new-campaign", recipient=recipient, persona="founder", cadence=[2, 5, 7],
         subject="Hi", body="Body", stage_bodies=["s1", "s2", "s3"],
-        attachment_path=attachment, attachment_name="r.pdf", workdir_root=tmp_path / "workdir",
+        attachment_path=attachment, attachment_name="r.pdf", latex_enabled=True,
+        workdir_root=tmp_path / "workdir",
     )
 
     due = due_recipients(conn)
