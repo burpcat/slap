@@ -18,7 +18,7 @@ from datetime import date
 from pathlib import Path
 
 SLAP_PY = Path(__file__).resolve().parent.parent / "slap.py"
-ALL_COMMANDS = ["list", "send", "dashboard", "doctor", "domains", "rebuild", "runner", "cleanup", "plist"]
+ALL_COMMANDS = ["list", "send", "dashboard", "doctor", "domains", "rebuild", "runner", "cleanup", "plist", "init"]
 
 
 def run(*args, cwd=None, env=None, input=None):
@@ -452,3 +452,60 @@ def test_domains_fails_loud_without_consumer_domains_file(tmp_path):
     assert result.returncode != 0
     assert "consumer_domains.txt" in result.stderr
     assert not (tmp_path / "slap.db").exists()  # fails before ever touching the DB
+
+
+def test_init_end_to_end_via_cli(tmp_path):
+    # Real subprocess invocation of `python slap.py init`, scripted stdin for
+    # every prompt in order: sender (email, name), gmass key, schedule (start,
+    # end, cap, days), then decline the optional campaign scaffold.
+    (tmp_path / "config.yaml.example").write_text(
+        (Path(__file__).resolve().parent.parent / "config.yaml.example").read_text()
+    )
+    (tmp_path / ".env.example").write_text(
+        (Path(__file__).resolve().parent.parent / ".env.example").read_text()
+    )
+    answers = "\n".join([
+        "me@gmail.com", "Jane Doe",
+        "fake-gmass-key-value",
+        "09:00", "09:15", "50", "mon,tue,wed,thu,fri",
+        "n",
+    ]) + "\n"
+    result = run("init", cwd=tmp_path, input=answers)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Traceback" not in result.stderr
+    assert "init complete" in result.stdout
+    assert "fake-gmass-key-value" not in result.stdout  # API key never echoed in full
+
+    assert (tmp_path / "config.yaml").exists()
+    assert (tmp_path / ".env").exists()
+    assert (tmp_path / "slap.db").exists()
+
+    from slap.config import load_global_config
+    gc = load_global_config(tmp_path / "config.yaml")
+    assert gc.from_email == "me@gmail.com"
+    assert gc.schedule.daily_cap == 50
+
+
+def test_init_is_idempotent_on_second_cli_run(tmp_path):
+    (tmp_path / "config.yaml.example").write_text(
+        (Path(__file__).resolve().parent.parent / "config.yaml.example").read_text()
+    )
+    (tmp_path / ".env.example").write_text(
+        (Path(__file__).resolve().parent.parent / ".env.example").read_text()
+    )
+    first_answers = "\n".join([
+        "me@gmail.com", "Jane Doe", "fake-gmass-key-value",
+        "09:00", "09:15", "50", "mon,tue,wed,thu,fri", "n",
+    ]) + "\n"
+    result1 = run("init", cwd=tmp_path, input=first_answers)
+    assert result1.returncode == 0, result1.stdout + result1.stderr
+
+    # Second run: decline sender/key overwrite, re-answer schedule, decline campaign again.
+    second_answers = "\n".join(["n", "n", "09:00", "09:15", "50", "mon,tue,wed,thu,fri", "n"]) + "\n"
+    result2 = run("init", cwd=tmp_path, input=second_answers)
+    assert result2.returncode == 0, result2.stdout + result2.stderr
+    assert "Traceback" not in result2.stderr
+
+    from slap.config import load_global_config
+    gc = load_global_config(tmp_path / "config.yaml")
+    assert gc.from_email == "me@gmail.com"  # untouched by the declined second run

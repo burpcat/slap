@@ -61,7 +61,7 @@ def test_highlight_false_produces_one_uniform_style_not_a_multi_colored_line():
     # quoted-string/number patterns.
     with_highlight = Console(force_terminal=True, no_color=False)
     without_highlight = Console(force_terminal=True, no_color=False, highlight=False)
-    message = "campaign 'coldpost-founder': FAIL"
+    message = "campaign 'coldpost': FAIL"
 
     with with_highlight.capture() as cap:
         with_highlight.print(message, style=display.RED, end="")

@@ -54,7 +54,7 @@ def write_global_config(tmp_path, text=VALID_CONFIG_YAML):
     return path
 
 
-def write_campaign(tmp_path, name="coldpost-recruiter", campaign_yaml=VALID_CAMPAIGN_YAML,
+def write_campaign(tmp_path, name="coldpost", campaign_yaml=VALID_CAMPAIGN_YAML,
                     initial_txt=VALID_INITIAL_TXT, stage_count=3):
     campaigns_dir = tmp_path / "campaigns"
     campaign_dir = campaigns_dir / name
@@ -160,7 +160,7 @@ def test_discover_campaigns_missing_dir_returns_empty(tmp_path):
 def test_load_campaign_valid(tmp_path):
     global_config = load_global_config(write_global_config(tmp_path))
     campaigns_dir, _ = write_campaign(tmp_path)
-    campaign = load_campaign("coldpost-recruiter", global_config, campaigns_dir)
+    campaign = load_campaign("coldpost", global_config, campaigns_dir)
     assert campaign.persona == "recruiter"
     assert campaign.cadence == [2, 3, 5]
     assert campaign.latex_enabled is True
@@ -182,7 +182,7 @@ def test_load_campaign_missing_stage_file_fails_loud(tmp_path):
     # recruiter cadence has 3 stages; only provide 2.
     campaigns_dir, _ = write_campaign(tmp_path, stage_count=2)
     with pytest.raises(ConfigError, match="stage3.txt"):
-        load_campaign("coldpost-recruiter", global_config, campaigns_dir)
+        load_campaign("coldpost", global_config, campaigns_dir)
 
 
 def test_load_campaign_extra_stage_file_fails_loud(tmp_path):
@@ -190,14 +190,14 @@ def test_load_campaign_extra_stage_file_fails_loud(tmp_path):
     # recruiter cadence has 3 stages; provide 4.
     campaigns_dir, _ = write_campaign(tmp_path, stage_count=4)
     with pytest.raises(ConfigError, match="stage4.txt"):
-        load_campaign("coldpost-recruiter", global_config, campaigns_dir)
+        load_campaign("coldpost", global_config, campaigns_dir)
 
 
 def test_load_campaign_initial_txt_missing_subject_fails_loud(tmp_path):
     global_config = load_global_config(write_global_config(tmp_path))
     campaigns_dir, _ = write_campaign(tmp_path, initial_txt="Hi there,\n\nno subject line\n")
     with pytest.raises(ConfigError, match="Subject:"):
-        load_campaign("coldpost-recruiter", global_config, campaigns_dir)
+        load_campaign("coldpost", global_config, campaigns_dir)
 
 
 def test_load_campaign_initial_txt_missing_blank_line_fails_loud(tmp_path):
@@ -205,7 +205,7 @@ def test_load_campaign_initial_txt_missing_blank_line_fails_loud(tmp_path):
     bad_initial = "Subject: Quick note\nHi there, no blank line separator\n"
     campaigns_dir, _ = write_campaign(tmp_path, initial_txt=bad_initial)
     with pytest.raises(ConfigError, match="blank"):
-        load_campaign("coldpost-recruiter", global_config, campaigns_dir)
+        load_campaign("coldpost", global_config, campaigns_dir)
 
 
 def test_load_campaign_unknown_persona_fails_loud(tmp_path):
@@ -213,7 +213,7 @@ def test_load_campaign_unknown_persona_fails_loud(tmp_path):
     bad_campaign_yaml = VALID_CAMPAIGN_YAML.replace("persona: recruiter", "persona: nonexistent")
     campaigns_dir, _ = write_campaign(tmp_path, campaign_yaml=bad_campaign_yaml)
     with pytest.raises(ConfigError, match="not defined"):
-        load_campaign("coldpost-recruiter", global_config, campaigns_dir)
+        load_campaign("coldpost", global_config, campaigns_dir)
 
 
 def test_load_campaign_unknown_placeholder_fails_loud(tmp_path):
@@ -221,7 +221,7 @@ def test_load_campaign_unknown_placeholder_fails_loud(tmp_path):
     bad_initial = "Subject: Hi\n\nWelcome, {{nonexistent_field}}!\n"
     campaigns_dir, _ = write_campaign(tmp_path, initial_txt=bad_initial)
     with pytest.raises(ConfigError, match="nonexistent_field"):
-        load_campaign("coldpost-recruiter", global_config, campaigns_dir)
+        load_campaign("coldpost", global_config, campaigns_dir)
 
 
 def test_load_campaign_malformed_placeholder_fails_loud(tmp_path):
@@ -231,7 +231,7 @@ def test_load_campaign_malformed_placeholder_fails_loud(tmp_path):
     bad_initial = "Subject: Hi\n\nWelcome, {{company }}!\n"
     campaigns_dir, _ = write_campaign(tmp_path, initial_txt=bad_initial)
     with pytest.raises(ConfigError, match="malformed placeholder"):
-        load_campaign("coldpost-recruiter", global_config, campaigns_dir)
+        load_campaign("coldpost", global_config, campaigns_dir)
 
 
 def test_load_campaign_requires_an_email_field(tmp_path):
@@ -242,7 +242,7 @@ def test_load_campaign_requires_an_email_field(tmp_path):
     )
     campaigns_dir, _ = write_campaign(tmp_path, campaign_yaml=no_email_yaml)
     with pytest.raises(ConfigError, match="email"):
-        load_campaign("coldpost-recruiter", global_config, campaigns_dir)
+        load_campaign("coldpost", global_config, campaigns_dir)
 
 
 def test_load_campaign_latex_disabled_requires_attachment_file(tmp_path):
@@ -252,4 +252,4 @@ def test_load_campaign_latex_disabled_requires_attachment_file(tmp_path):
     )
     campaigns_dir, _ = write_campaign(tmp_path, campaign_yaml=no_attachment_yaml)
     with pytest.raises(ConfigError, match="attachment_file"):
-        load_campaign("coldpost-recruiter", global_config, campaigns_dir)
+        load_campaign("coldpost", global_config, campaigns_dir)

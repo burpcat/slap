@@ -5,8 +5,12 @@ Single CLI, one subcommand per probe. Every probe records its raw request +
 response into probes/findings/ so findings are auditable, not just summarized.
 
 SAFETY (non-negotiable, not a config knob): any outbound recipient that is not
-of the form everythingforgenius+testmass{N}@gmail.com raises BEFORE any network
-call. See _guard(). This makes emailing a real lead with test data impossible.
+a plus-tagged self-test address for THIS install's own config.yaml sender.from_email
+raises BEFORE any network call. See _guard()/_owner_email_parts(). Config-driven
+(not a hardcoded literal) so the guard always follows whoever owns the install —
+a clone with a different owner's config.yaml is automatically guarded to THEIR
+inbox, never to one hardcoded person's. This makes emailing a real lead with test
+data impossible.
 
 Usage:
     python probes/run.py <auth|attach|casing|stop|thread|reports|verify|swagger|client|all>
@@ -26,19 +30,53 @@ from dotenv import load_dotenv
 
 BASE_URL = "https://api.gmass.co/api"
 FINDINGS_DIR = Path(__file__).parent / "findings"
-# The ONLY recipients any probe may ever send to.
-_ALLOWED_RE = re.compile(r"^everythingforgenius\+testmass\d+@gmail\.com$")
 
 # Campaign ids produced during a run, so the reports probe can query real per-campaign data.
 _RUN_STATE = {"campaign_ids": []}
+_OWNER_EMAIL_PARTS = {}
+
+
+def _owner_email_parts() -> tuple:
+    """Loads config.yaml's sender.from_email lazily (once per process) and
+    splits it into (local, domain) — the guard and every probe's self-test
+    recipient are derived from this, never hardcoded. Fail loud if config.yaml
+    is missing/invalid: the safety guard must never silently fall back to
+    some default address."""
+    if "parts" not in _OWNER_EMAIL_PARTS:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from slap.config import ConfigError, load_global_config
+        try:
+            gc = load_global_config()
+        except ConfigError as e:
+            sys.exit(f"FAIL: could not load config.yaml to build the owner safety guard — {e}\n"
+                     f"Run `python slap.py init` first.")
+        local, sep, domain = gc.from_email.partition("@")
+        if not sep or not local or not domain:
+            sys.exit(f"FAIL: config.yaml sender.from_email={gc.from_email!r} is not a valid "
+                     f"email address — cannot build the safety guard.")
+        _OWNER_EMAIL_PARTS["parts"] = (local, domain)
+    return _OWNER_EMAIL_PARTS["parts"]
+
+
+def _allowed_re():
+    local, domain = _owner_email_parts()
+    return re.compile(rf"^{re.escape(local)}\+testmass\d+@{re.escape(domain)}$")
+
+
+def owner_test_address(n) -> str:
+    """The Nth self-test address for whoever owns THIS install's config.yaml
+    (e.g. local+testmass3@domain) — never a hardcoded literal."""
+    local, domain = _owner_email_parts()
+    return f"{local}+testmass{n}@{domain}"
 
 
 def _guard(recipient: str) -> str:
     """Raise before any network call if recipient is not an owner self-test address."""
-    if not _ALLOWED_RE.match(recipient or ""):
+    if not _allowed_re().match(recipient or ""):
+        local, domain = _owner_email_parts()
         raise RuntimeError(
             f"SAFETY GUARD: refusing to target {recipient!r}. Probes may only send to "
-            f"everythingforgenius+testmass{{N}}@gmail.com. No network call was made."
+            f"{local}+testmass{{N}}@{domain}. No network call was made."
         )
     return recipient
 
@@ -230,7 +268,7 @@ def probe_attach(key: str) -> None:
     records the working positive control, the multipart negative control (415), and a
     size sweep so the accepted ceiling is visible."""
     print("[attach] POST /api/campaigndrafts — JSON attachment (correct), multipart (neg), size sweep")
-    recipient = "everythingforgenius+testmass1@gmail.com"
+    recipient = owner_test_address(1)
     tiny_pdf = _tiny_pdf()
 
     # Positive control: the verified JSON attachment mechanism.
@@ -276,7 +314,7 @@ def probe_casing(key: str) -> None:
     saved into your Gmail account yet, try waiting a few more seconds" transient error,
     not a shape/schema rejection. Equalizing settle time isolates the real cause.)"""
     print("[casing] two fresh, equally-settled drafts -> path-form vs body-form")
-    recipient = "everythingforgenius+testmass1@gmail.com"
+    recipient = owner_test_address(1)
     d_path = _create_draft(key, recipient, subject="slap probe casing (path)",
                            message="probe casing path-form body")
     d_body = _create_draft(key, recipient, subject="slap probe casing (body)",
@@ -318,7 +356,7 @@ def probe_casing(key: str) -> None:
 def probe_stop(key: str) -> None:
     """#2 Stop-on-reply param: real self-send with stageOneAction='r'. Records accepted settings."""
     print("[stop] real self-send with stageOneAction='r' (If No Reply)")
-    recipient = "everythingforgenius+testmass2@gmail.com"
+    recipient = owner_test_address(2)
     draft = _create_draft(key, recipient, subject="slap probe stop-on-reply",
                           message="probe stop-on-reply body")
     print(f"  draft: HTTP {draft['response']['status']}, draft_id={draft['draft_id']}")
@@ -346,7 +384,7 @@ def probe_stop(key: str) -> None:
 def probe_thread(key: str) -> None:
     """#5 sendAsReply threading: initial send, then a send-as-reply into that campaign."""
     print("[thread] initial send, then sendAsReply into it")
-    recipient = "everythingforgenius+testmass3@gmail.com"
+    recipient = owner_test_address(3)
     d1 = _create_draft(key, recipient, subject="slap probe thread initial",
                        message="thread initial body")
     campaign_id = None
@@ -423,7 +461,7 @@ def probe_verify(key: str) -> None:
       actually present in the delivered Gmail message can't be checked via the API —
       that remains an explicit manual owner check (see CONTROL_SHEET.md)."""
     print("[verify] real send + attachment, then GET campaign back + poll recipients report")
-    recipient = "everythingforgenius+testmass5@gmail.com"
+    recipient = owner_test_address(5)
     tiny_pdf = _tiny_pdf()
     draft = _create_draft(
         key, recipient, subject="slap probe verify (real send + attachment)",
@@ -505,8 +543,8 @@ def probe_clicktest(key: str) -> None:
     link = "https://www.linkedin.com/in/slap-probe-test"
 
     cases = [
-        ("plain", "everythingforgenius+testmass8@gmail.com", f"Plain-text click-tracking test.\n\nLink: {link}\n"),
-        ("html", "everythingforgenius+testmass9@gmail.com",
+        ("plain", owner_test_address(8), f"Plain-text click-tracking test.\n\nLink: {link}\n"),
+        ("html", owner_test_address(9),
          f'<p>HTML click-tracking test.</p><p><a href="{link}">Click here</a></p>'),
     ]
     for message_type, recipient, message in cases:
@@ -545,7 +583,7 @@ def probe_resend(key: str) -> None:
     actually double-send? Real send, to the guarded test address only —
     genuinely calls the same endpoint twice on purpose to observe this."""
     print("[resend] real send, then call POST /api/campaigns/{draftId} a second time on the SAME draft")
-    recipient = "everythingforgenius+testmass7@gmail.com"
+    recipient = owner_test_address(7)
     draft = _create_draft(key, recipient, subject="slap probe resend (idempotency check)",
                           message="probe resend body")
     print(f"  draft: HTTP {draft['response']['status']}, draft_id={draft['draft_id']}")
@@ -589,7 +627,7 @@ def probe_client(key: str) -> None:
     from slap import gmass  # local import: only this probe needs the production package
 
     print("[client] live-verify slap.gmass.* against the real API (self-send only)")
-    recipient = _guard("everythingforgenius+testmass6@gmail.com")
+    recipient = _guard(owner_test_address(6))
     tiny_pdf = _tiny_pdf()
 
     draft = gmass.create_draft(
@@ -656,7 +694,7 @@ def main() -> None:
             _guard("someone@realcompany.com")
         except RuntimeError as e:
             print(f"OK guard rejected real address: {e}")
-            _guard("everythingforgenius+testmass1@gmail.com")
+            _guard(owner_test_address(1))
             print("OK guard accepted +testmass address")
             return
         sys.exit("FAIL: guard did not reject a real address")

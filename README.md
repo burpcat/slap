@@ -9,17 +9,22 @@ reply triage.
 
 Single-owner, personal-use tool. Not multi-tenant, not a SaaS product.
 
+Each user runs their own install against their own GMass account — there's no shared
+server or shared data. See [`USAGE.md`](USAGE.md) for the full day-to-day guide once
+you're set up.
+
 ## Requirements
 
 - macOS (the unattended runner is scheduled via **launchd**, and the LaTeX loop shells
   out to macOS's `open -a Preview`).
 - Python 3.11+.
-- A [GMass](https://www.gmass.co/) account with an API key, connected to the Gmail
-  account you want to send from. Follow-up cadences (stage 2/3 emails) need GMass
-  Premium.
+- Your **own** [GMass](https://www.gmass.co/) account with an API key, connected to
+  your **own** Gmail account (the one you want to send from). Follow-up cadences (stage
+  2/3 emails) need GMass Premium.
 - If you plan to use LaTeX-compiled résumés (`latex.enabled: true` in a campaign):
-  [`xelatex`](https://www.tug.org/xetex/) and the [`code`](https://code.visualstudio.com/docs/editor/command-line)
-  CLI (VS Code), both on your `PATH`. `slap.py doctor` checks for both — see below.
+  [MacTeX](https://www.tug.org/mactex/) (for `xelatex`) and the
+  [`code`](https://code.visualstudio.com/docs/editor/command-line) CLI (VS Code), both
+  on your `PATH`. `slap.py doctor` checks for both — see below.
 
 ## Setup
 
@@ -31,32 +36,46 @@ source .venv/bin/activate
 pip install -r requirements-dev.txt   # includes requirements.txt + pytest
 ```
 
-Copy the two example files and fill them in:
+Then run the interactive installer:
 
 ```bash
-cp .env.example .env
-cp config.yaml.example config.yaml
+python slap.py init
 ```
 
-- **`.env`** — set `GMASS_API_KEY` to your real GMass API key. `.env` is gitignored;
-  never commit it.
-- **`config.yaml`** — set `sender.from_name` to your name (`sender.from_email` should
-  already match the Gmail account behind your API key). The persona cadences
-  (`hiring_manager`/`recruiter`/`founder`) and `schedule` defaults are reasonable
-  starting points — see the comments in the file for what each knob does.
+`init` is the entry point for everything else in this section — it's re-runnable any
+time (it asks before overwriting anything real) and walks through:
 
-Run the preflight check to confirm everything's wired up:
+1. **Preflight** — checks python3/venv/macOS/`xelatex`/`code`, printing exact install
+   instructions for anything missing. Nothing is auto-installed; LaTeX/`code` are only
+   required if you turn on a LaTeX campaign.
+2. **Sender** — writes `config.yaml` and asks for your Gmail address and name.
+   **Your `from_email` must be the exact Gmail account your GMass API key is connected
+   to** — GMass sends by relaying through that account.
+3. **GMass key** — writes `.env` and asks for your API key (never echoed back in full).
+   Confirms `.env` is gitignored.
+4. **Owner test-guard** — confirms that self-tests are now guarded to
+   `you+testmass{N}@yourdomain`, derived from step 2 — never a hardcoded address, and
+   never overridable.
+5. **Schedule** — fire window, daily send cap (defaults to a conservative 50/day — keep
+   cold-outreach volume low), and which weekdays the unattended runner is allowed to fire.
+6. **First campaign (optional)** — offers to scaffold an example campaign folder to edit.
+7. **Database** — creates an empty `slap.db` if one doesn't exist.
+8. **Launchd** — prints the generated `.plist` and the exact `cp`/`launchctl load`
+   commands to install the unattended runner (see [`LAUNCHD.md`](LAUNCHD.md) for the
+   one-time wake-test — this can only be verified on real hardware).
+9. **Finish** — runs the same checks as `doctor` and prints your safe self-test address.
 
-```bash
-python slap.py doctor
-```
+**Before sending anything real**, test-send to yourself using the `local+testmass1@domain`
+address `init` prints at the end — this guarantees a test send can only ever reach your
+own inbox, never a real lead, no matter what campaign you point it at.
 
-`doctor` verifies: `GMASS_API_KEY` is set, `config.yaml`'s sender fields are filled in,
-the SQLite tracking DB is reachable, and `consumer_domains.txt` is present (it seeds the
-default consumer-email-provider list automatically if missing — the only check here that
-writes anything; everything else only checks, never installs). It then validates every
-campaign under `campaigns/` (see below) and reports pass/fail per check, exiting non-zero
-if anything needs attention.
+`doctor` (step 9, and re-runnable any time via `python slap.py doctor`) verifies:
+`GMASS_API_KEY` is set, `config.yaml`'s sender fields are filled in, the SQLite tracking
+DB is reachable, and `consumer_domains.txt` is present (it seeds the default
+consumer-email-provider list automatically if missing — the only check here that writes
+anything; everything else only checks, never installs). It then validates every campaign
+under `campaigns/` and reports pass/fail per check, exiting non-zero if anything needs
+attention.
 
 ## Setting up a campaign
 
@@ -65,7 +84,7 @@ Campaigns are auto-discovered: any folder under `campaigns/` with a valid
 
 ```
 campaigns/
-  coldpost-recruiter/
+  my-campaign/
     campaign.yaml
     initial.txt      # Subject: line + blank line + body
     stage1.txt       # follow-up bodies — no subject line, they thread as replies
@@ -100,8 +119,12 @@ The number of `stageN.txt` files must exactly match the chosen persona's cadence
 
 ## Commands
 
+See [`USAGE.md`](USAGE.md) for the full guide (writing drops, the send flow, the
+dashboard, deliverability tips). Quick reference:
+
 | Command | What it does |
 |---|---|
+| `python slap.py init` | Interactive installer — see Setup above. Safe to re-run any time. |
 | `python slap.py list` | Lists every auto-discovered campaign (persona, LaTeX on/off). |
 | `python slap.py send <campaign> [--now]` | Interactive prep: paste a drop, optionally compile/preview a LaTeX résumé, see domain-dedup warnings and a preview, then stage the send to the queue. `--now` also drains the queue immediately afterward instead of waiting for the scheduled runner. |
 | `python slap.py dashboard` | Starts the localhost dashboard at `http://127.0.0.1:5000` — today/week stats, engagement metrics, replies needing triage (tag as real/OOO/not-interested), pipeline, and recent run history. |
@@ -132,7 +155,4 @@ pytest -q              # fast suite (default) — no real xelatex compiles or re
 pytest -m slow -q      # slow suite — real xelatex compiles + a real threaded HTTP server
 ```
 
-Neither suite makes real GMass API calls. The Phase-0 API probes in `probes/run.py` do —
-run standalone via `python probes/run.py <probe>`, never as part of `pytest` — and are
-guarded to only ever target the owner's own inbox via Gmail plus-addressing
-(`+testmass{N}@gmail.com`); any other recipient raises before any network call.
+Neither suite makes real GMass API calls or sends anything.

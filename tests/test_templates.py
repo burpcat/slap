@@ -40,8 +40,8 @@ def test_parse_drop_matches_field_key_when_drop_uses_key_not_label():
     # worked before this fix because key and label happened to coincide;
     # every multi-word-labeled field (role_catted -> "Role", recruiter_name
     # -> "Recruiter name", experience_1 -> "Experience 1", byebye ->
-    # "Signoff") silently defaulted to empty. Mirrors the real
-    # coldpost-recruiter campaign.yaml field definitions exactly.
+    # "Signoff") silently defaulted to empty. Mirrors a real-world recruiter
+    # campaign.yaml's field definitions exactly.
     recruiter_fields = [
         CampaignField(key="email", label="Email"),
         CampaignField(key="role_catted", label="Role"),
@@ -53,7 +53,7 @@ def test_parse_drop_matches_field_key_when_drop_uses_key_not_label():
         CampaignField(key="byebye", label="Signoff"),
     ]
     drop = (
-        "email : avarutla+testmass1@gmail.com\n"
+        "email : jane+testmass1@example.com\n"
         "role_catted : data scientist\n"
         "company : TestCo\n"
         "req_id :  Req ID: 6900\n"
@@ -63,7 +63,7 @@ def test_parse_drop_matches_field_key_when_drop_uses_key_not_label():
         "byebye : Thanks a ton\n"
     )
     values = parse_drop(drop, recruiter_fields)
-    assert values["email"] == "avarutla+testmass1@gmail.com"
+    assert values["email"] == "jane+testmass1@example.com"
     assert values["role_catted"] == "data scientist"
     assert values["company"] == "TestCo"
     assert values["req_id"] == " Req ID: 6900"

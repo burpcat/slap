@@ -18,7 +18,7 @@ from slap.config import ConfigError, discover_campaigns, load_campaign, load_glo
 from slap.latex import recipient_workdir, run_latex_loop
 from slap.queue import stage_recipient
 from slap.templates import fill_template, parse_drop
-from slap import dashboard, doctor, domains, gmass, launchd, runner, tracking
+from slap import dashboard, doctor, domains, gmass, init, launchd, runner, tracking
 
 load_dotenv()
 
@@ -247,14 +247,6 @@ def cmd_dashboard(args):
     app.run(host="127.0.0.1", port=5000)
 
 
-def _print_check(result, *, indent=""):
-    if result.ok:
-        suffix = f" ({result.detail})" if result.detail else ""
-        display.success(f"{indent}{result.name}: OK{suffix}")
-    else:
-        display.error(f"{indent}{result.name}: FAIL — {result.detail}")
-
-
 def cmd_doctor(args):
     try:
         global_config = load_global_config()
@@ -263,34 +255,18 @@ def cmd_doctor(args):
         sys.exit(1)
     display.success("config.yaml: OK")
 
-    any_failed = False
-    for result in doctor.run_global_checks(global_config):
-        _print_check(result)
-        any_failed = any_failed or not result.ok
-
-    names = discover_campaigns()
-    if not names:
-        print("No campaigns found under campaigns/.")
-    for name in names:
-        try:
-            campaign = load_campaign(name, global_config)
-        except ConfigError as e:
-            display.error(f"campaign '{name}': FAIL — {e}")
-            any_failed = True
-            continue
-        campaign_results = doctor.run_campaign_checks(campaign)
-        campaign_ok = all(r.ok for r in campaign_results)
-        if campaign_ok:
-            display.success(f"campaign '{name}': OK")
-        else:
-            display.error(f"campaign '{name}': FAIL")
-        for result in campaign_results:
-            _print_check(result, indent="  ")
-        any_failed = any_failed or not campaign_ok
-
-    if any_failed:
+    if doctor.print_report(global_config):
+        display.success("\nAll checks passed.")
+    else:
         sys.exit(1)
-    display.success("\nAll checks passed.")
+
+
+def cmd_init(args):
+    try:
+        init.run_init()
+    except init.InitError as e:
+        display.fail(f"slap init: {e}")
+        sys.exit(1)
 
 
 def cmd_domains(args):
@@ -364,6 +340,9 @@ def build_parser():
 
     sub.add_parser("dashboard", help="Launch the localhost dashboard").set_defaults(func=cmd_dashboard)
     sub.add_parser("doctor", help="Run preflight checks").set_defaults(func=cmd_doctor)
+    sub.add_parser(
+        "init", help="Interactive installer — config.yaml, .env, schedule, DB, launchd"
+    ).set_defaults(func=cmd_init)
     sub.add_parser("domains", help="Regenerate/print the domain index").set_defaults(func=cmd_domains)
     sub.add_parser("rebuild", help="Rebuild the recipients cache from events").set_defaults(func=cmd_rebuild)
     sub.add_parser(

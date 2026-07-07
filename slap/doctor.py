@@ -108,3 +108,47 @@ def check_attachment(campaign: CampaignConfig) -> list:
 
 def run_campaign_checks(campaign: CampaignConfig) -> list:
     return check_attachment(campaign)
+
+
+def _print_check(result: CheckResult, *, indent: str = "") -> None:
+    from slap import display
+    if result.ok:
+        suffix = f" ({result.detail})" if result.detail else ""
+        display.success(f"{indent}{result.name}: OK{suffix}")
+    else:
+        display.error(f"{indent}{result.name}: FAIL — {result.detail}")
+
+
+def print_report(global_config: GlobalConfig) -> bool:
+    """Prints the full doctor report (global checks + every discovered
+    campaign's checks) — shared by the standalone `doctor` command and
+    `init`'s finish step, so there's exactly one place that defines what
+    the report looks like. Returns True if everything passed."""
+    from slap import display
+    from slap.config import ConfigError, discover_campaigns, load_campaign
+
+    ok = True
+    for result in run_global_checks(global_config):
+        _print_check(result)
+        ok = ok and result.ok
+
+    names = discover_campaigns()
+    if not names:
+        print("No campaigns found under campaigns/.")
+    for name in names:
+        try:
+            campaign = load_campaign(name, global_config)
+        except ConfigError as e:
+            display.error(f"campaign '{name}': FAIL — {e}")
+            ok = False
+            continue
+        campaign_results = run_campaign_checks(campaign)
+        campaign_ok = all(r.ok for r in campaign_results)
+        if campaign_ok:
+            display.success(f"campaign '{name}': OK")
+        else:
+            display.error(f"campaign '{name}': FAIL")
+        for result in campaign_results:
+            _print_check(result, indent="  ")
+        ok = ok and campaign_ok
+    return ok
