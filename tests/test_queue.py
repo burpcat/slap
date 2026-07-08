@@ -1,6 +1,8 @@
 """Queue staging tests (Build Order step 9), per SLAP_BUILD_PROMPT.md §13 B:
 send stages without firing. Also covers OOO re-queue tagging (step 10, §7).
 """
+from datetime import date
+
 from slap.queue import due_for_ooo_resend, due_recipients, load_manifest, stage_recipient, tag_ooo
 from slap.tracking import append_event, connect
 
@@ -239,3 +241,122 @@ def test_due_for_ooo_resend_still_includes_recipient_after_failed_resend(tmp_pat
     append_event(conn, type="send_failed", recipient="a@x.com", campaign="c1",
                  meta={"error": "boom"})
     assert [r["recipient"] for r in due_for_ooo_resend(conn)] == ["a@x.com"]
+
+
+# --- résumé archive integration (post-launch feature) -----------------------
+
+WHEN = date(2026, 7, 8)
+
+
+def test_stage_recipient_archives_latex_attachment_at_its_real_workdir_path(tmp_path):
+    conn = connect(tmp_path / "test.db")
+    attachment = make_attachment(tmp_path)
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    workdir_root = tmp_path / "workdir"
+
+    stage_recipient(
+        conn, campaign="c", recipient="jane@acme.com", persona="recruiter", cadence=[2, 3, 5],
+        subject="Hi", body="Body", stage_bodies=["s1", "s2", "s3"],
+        attachment_path=attachment, attachment_name="Jane_Resume.pdf", latex_enabled=True,
+        company="Acme", role="SWE", archive_dir=archive_dir, when=WHEN,
+        workdir_root=workdir_root,
+    )
+
+    link = archive_dir / "acme-swe-2026-07-08.pdf"
+    assert list(archive_dir.iterdir()) == [link]
+    assert link.resolve() == (workdir_root / "c" / "jane@acme.com" / "Jane_Resume.pdf").resolve()
+
+
+def test_stage_recipient_archives_static_attachment_at_its_shared_path(tmp_path):
+    conn = connect(tmp_path / "test.db")
+    shared_resume = make_attachment(tmp_path, name="campaign_resume.pdf")
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+
+    stage_recipient(
+        conn, campaign="c", recipient="jane@acme.com", persona="recruiter", cadence=[2, 3, 5],
+        subject="Hi", body="Body", stage_bodies=["s1", "s2", "s3"],
+        attachment_path=shared_resume, attachment_name="Resume.pdf", latex_enabled=False,
+        company="Acme", role="SWE", archive_dir=archive_dir, when=WHEN,
+        workdir_root=tmp_path / "workdir",
+    )
+
+    link = archive_dir / "acme-swe-2026-07-08.pdf"
+    assert link.resolve() == shared_resume.resolve()
+
+
+def test_stage_recipient_rerun_same_recipient_does_not_duplicate_archive_symlink(tmp_path):
+    conn = connect(tmp_path / "test.db")
+    attachment = make_attachment(tmp_path)
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    workdir_root = tmp_path / "workdir"
+    kwargs = dict(
+        conn=conn, campaign="c", recipient="jane@acme.com", persona="recruiter", cadence=[2, 3, 5],
+        subject="Hi", body="Body", stage_bodies=["s1", "s2", "s3"],
+        attachment_path=attachment, attachment_name="Jane_Resume.pdf", latex_enabled=True,
+        company="Acme", role="SWE", archive_dir=archive_dir, when=WHEN, workdir_root=workdir_root,
+    )
+
+    stage_recipient(**kwargs)
+    stage_recipient(**kwargs)  # e.g. a re-stage of the same recipient
+
+    assert len(list(archive_dir.iterdir())) == 1
+
+
+def test_stage_recipient_two_recipients_colliding_on_name_get_dash_2(tmp_path):
+    conn = connect(tmp_path / "test.db")
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    workdir_root = tmp_path / "workdir"
+
+    for recipient in ("jane@acme.com", "john@acme.com"):
+        recipient_dir = tmp_path / recipient.split("@")[0]
+        recipient_dir.mkdir()
+        attachment = make_attachment(recipient_dir, name="r.pdf")
+        stage_recipient(
+            conn, campaign="c", recipient=recipient, persona="recruiter", cadence=[2, 3, 5],
+            subject="Hi", body="Body", stage_bodies=["s1", "s2", "s3"],
+            attachment_path=attachment, attachment_name="Resume.pdf", latex_enabled=True,
+            company="Acme", role="SWE", archive_dir=archive_dir, when=WHEN,
+            workdir_root=workdir_root,
+        )
+
+    names = sorted(p.name for p in archive_dir.iterdir())
+    assert names == ["acme-swe-2026-07-08-2.pdf", "acme-swe-2026-07-08.pdf"]
+
+
+def test_stage_recipient_archive_dir_unset_still_succeeds_no_symlink(tmp_path):
+    conn = connect(tmp_path / "test.db")
+    attachment = make_attachment(tmp_path)
+
+    workdir = stage_recipient(
+        conn, campaign="c", recipient="jane@acme.com", persona="recruiter", cadence=[2, 3, 5],
+        subject="Hi", body="Body", stage_bodies=["s1", "s2", "s3"],
+        attachment_path=attachment, attachment_name="Jane_Resume.pdf", latex_enabled=True,
+        workdir_root=tmp_path / "workdir",
+    )
+
+    assert (workdir / "Jane_Resume.pdf").exists()
+    events = [dict(r) for r in conn.execute("SELECT * FROM events")]
+    assert len(events) == 1 and events[0]["type"] == "queued"
+
+
+def test_stage_recipient_archive_dir_missing_still_succeeds_with_warning(tmp_path, capsys):
+    conn = connect(tmp_path / "test.db")
+    attachment = make_attachment(tmp_path)
+    missing_archive_dir = tmp_path / "does-not-exist"
+
+    workdir = stage_recipient(
+        conn, campaign="c", recipient="jane@acme.com", persona="recruiter", cadence=[2, 3, 5],
+        subject="Hi", body="Body", stage_bodies=["s1", "s2", "s3"],
+        attachment_path=attachment, attachment_name="Jane_Resume.pdf", latex_enabled=True,
+        company="Acme", role="SWE", archive_dir=missing_archive_dir, when=WHEN,
+        workdir_root=tmp_path / "workdir",
+    )
+
+    assert (workdir / "Jane_Resume.pdf").exists()  # the send-relevant staging still succeeded
+    events = [dict(r) for r in conn.execute("SELECT * FROM events")]
+    assert len(events) == 1 and events[0]["type"] == "queued"
+    assert "skipping archive symlink" in capsys.readouterr().out

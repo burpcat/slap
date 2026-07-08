@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import json
 import shutil
+from datetime import date
 from pathlib import Path
 
+from slap import archive, display
 from slap.latex import WORKDIR_ROOT, recipient_workdir
 from slap.tracking import append_event
 
@@ -25,7 +27,8 @@ MANIFEST_NAME = "staged.json"
 def stage_recipient(conn, *, campaign: str, recipient: str, persona: str, cadence: list,
                      subject: str, body: str, stage_bodies: list,
                      attachment_path: Path, attachment_name: str, latex_enabled: bool,
-                     workdir_root: Path = WORKDIR_ROOT) -> Path:
+                     company: str = "", role: str = "", archive_dir: Path = None,
+                     when: date = None, workdir_root: Path = WORKDIR_ROOT) -> Path:
     """Write the queued event + staged manifest for one recipient (does not
     send). Returns the recipient's workdir.
 
@@ -38,7 +41,17 @@ def stage_recipient(conn, *, campaign: str, recipient: str, persona: str, cadenc
     per-recipient state (identical bytes duplicated once per send, forever).
     Instead the manifest records `attachment_source`, the shared file's own
     path in campaigns/<name>/ — the runner reads bytes from there directly
-    at drain time (see runner._send_one), no per-recipient copy at all."""
+    at drain time (see runner._send_one), no per-recipient copy at all.
+
+    `archive_dir` (None unless the owner set RESUME_ARCHIVE_DIR, see
+    slap.archive) points a symlink at whichever of the two files above is
+    THIS recipient's real, final attachment — this is the one place that
+    distinction is already resolved, so archiving hooks in here rather than
+    re-deriving it at the call site. Never allowed to fail this function or
+    this recipient's staging: a broken/missing archive dir only warns (see
+    slap.archive's own docstring), and any unexpected error is caught here
+    too, matching the one-recipient-blast-radius guarantee used everywhere
+    else sends can partially fail (e.g. runner.drain)."""
     workdir = recipient_workdir(campaign, recipient, root=workdir_root)
 
     if latex_enabled:
@@ -46,8 +59,10 @@ def stage_recipient(conn, *, campaign: str, recipient: str, persona: str, cadenc
         if attachment_path.resolve() != staged_attachment.resolve():
             shutil.copyfile(attachment_path, staged_attachment)
         attachment_source = None  # None means "read from workdir/attachment_name"
+        real_attachment_path = staged_attachment
     else:
         attachment_source = str(attachment_path.resolve())
+        real_attachment_path = attachment_path.resolve()
 
     manifest = {
         "campaign": campaign, "recipient": recipient, "persona": persona, "cadence": cadence,
@@ -55,6 +70,11 @@ def stage_recipient(conn, *, campaign: str, recipient: str, persona: str, cadenc
         "attachment_name": attachment_name, "attachment_source": attachment_source,
     }
     (workdir / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    try:
+        archive.archive_resume(real_attachment_path, archive_dir, company=company, role=role, when=when)
+    except Exception as e:
+        display.warn(f"resume archive: unexpected error archiving for {recipient}: {e}")
 
     append_event(conn, type="queued", recipient=recipient, campaign=campaign, stage=0,
                  meta={"persona": persona})

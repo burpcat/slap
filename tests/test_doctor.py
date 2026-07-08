@@ -10,7 +10,7 @@ import pytest
 from slap.config import CampaignConfig, CampaignField, GlobalConfig, ScheduleConfig
 from slap.doctor import (
     DEFAULT_CONSUMER_DOMAINS, check_api_key, check_attachment, check_consumer_domains,
-    check_db, check_sender_fields, run_campaign_checks, run_global_checks,
+    check_db, check_resume_archive, check_sender_fields, run_campaign_checks, run_global_checks,
 )
 from slap.tracking import connect
 
@@ -182,3 +182,58 @@ def test_run_campaign_checks_matches_check_attachment(tmp_path):
     campaign = make_campaign_config(tmp_path, latex_enabled=False)
     (campaign.path / campaign.attachment_file).write_bytes(b"%PDF-fake")
     assert run_campaign_checks(campaign) == check_attachment(campaign)
+
+
+# --- check_resume_archive ---------------------------------------------------
+#
+# Deliberately NOT part of run_global_checks() (see test below): a broken
+# RESUME_ARCHIVE_DIR must never be able to block a `send` or a `runner.drain`
+# preflight (warn, don't block) — it's only surfaced via the standalone
+# `doctor` report (slap.doctor.print_report), never via run_global_checks().
+
+def test_check_resume_archive_passes_when_unset(monkeypatch):
+    monkeypatch.delenv("RESUME_ARCHIVE_DIR", raising=False)
+    result = check_resume_archive()
+    assert result.ok
+    assert "not set" in result.detail
+
+
+def test_check_resume_archive_fails_when_dir_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("RESUME_ARCHIVE_DIR", str(tmp_path / "does-not-exist"))
+    result = check_resume_archive()
+    assert not result.ok
+    assert "does not exist" in result.detail
+
+
+def test_check_resume_archive_passes_when_dir_valid_and_clean(tmp_path, monkeypatch):
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    monkeypatch.setenv("RESUME_ARCHIVE_DIR", str(archive_dir))
+    result = check_resume_archive()
+    assert result.ok
+
+
+def test_check_resume_archive_fails_when_a_symlink_is_broken(tmp_path, monkeypatch):
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    target = tmp_path / "gone.pdf"
+    target.write_bytes(b"%PDF-fake")
+    link = archive_dir / "acme-swe-2026-07-08.pdf"
+    link.symlink_to(target)
+    target.unlink()
+    monkeypatch.setenv("RESUME_ARCHIVE_DIR", str(archive_dir))
+
+    result = check_resume_archive()
+
+    assert not result.ok
+    assert "acme-swe-2026-07-08.pdf" in result.detail
+
+
+def test_run_global_checks_never_includes_resume_archive(tmp_path, monkeypatch):
+    # Regression guard for the "must never block a send/drain" requirement:
+    # if this ever starts passing check_resume_archive's name, a broken
+    # archive dir would start failing send's/drain's preflight gate.
+    monkeypatch.setenv("GMASS_API_KEY", "real-key")
+    monkeypatch.setenv("RESUME_ARCHIVE_DIR", str(tmp_path / "does-not-exist"))
+    results = run_global_checks(make_global_config(tmp_path))
+    assert "RESUME_ARCHIVE_DIR" not in {r.name for r in results}

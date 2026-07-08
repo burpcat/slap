@@ -310,6 +310,71 @@ def test_find_cleanup_candidates_one_corrupt_manifest_does_not_abort_the_whole_s
     assert {u.recipient for u in report.undetermined} == {"corrupt@x.com"}
 
 
+# --- find_cleanup_candidates x résumé archive: the archive/cleanup tension --
+#
+# Resolved as option (a) in CONTROL_SHEET.md: a PDF cleanup would otherwise
+# delete stays kept, not eligible, if a live RESUME_ARCHIVE_DIR symlink still
+# points at it — otherwise `cleanup` would silently defeat the whole point of
+# a durable archive.
+
+def _stage_bounced_and_idle(conn, tmp_path, workdir_root, recipient="bounced@x.com"):
+    workdir = stage(conn, tmp_path, recipient=recipient, workdir_root=workdir_root)
+    append_event(conn, type="bounce", recipient=recipient, campaign="c1", timestamp=days_ago(20))
+    conn.execute("UPDATE events SET timestamp = ? WHERE recipient = ? AND type = 'queued'",
+                 (days_ago(25).isoformat(), recipient))
+    conn.execute("UPDATE events SET timestamp = ? WHERE recipient = ? AND type = 'sent'",
+                 (days_ago(24).isoformat(), recipient))
+    return workdir
+
+
+def test_find_cleanup_candidates_keeps_pdf_still_referenced_by_live_archive_symlink(tmp_path, monkeypatch):
+    conn = connect(tmp_path / "t.db")
+    workdir_root = tmp_path / "workdir"
+    workdir = _stage_bounced_and_idle(conn, tmp_path, workdir_root)
+
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    (archive_dir / "acme-swe-2026-07-01.pdf").symlink_to(workdir / "Resume.pdf")
+    monkeypatch.setenv("RESUME_ARCHIVE_DIR", str(archive_dir))
+
+    report = find_cleanup_candidates(conn, make_global_config(tmp_path), workdir_root=workdir_root, now=NOW)
+
+    assert not report.eligible
+    assert {c.recipient for c in report.archived} == {"bounced@x.com"}
+    assert not report.undetermined
+
+
+def test_find_cleanup_candidates_archived_pdf_is_never_actually_deleted(tmp_path, monkeypatch):
+    conn = connect(tmp_path / "t.db")
+    workdir_root = tmp_path / "workdir"
+    workdir = _stage_bounced_and_idle(conn, tmp_path, workdir_root)
+    pdf_path = workdir / "Resume.pdf"
+
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    link = archive_dir / "acme-swe-2026-07-01.pdf"
+    link.symlink_to(pdf_path)
+    monkeypatch.setenv("RESUME_ARCHIVE_DIR", str(archive_dir))
+
+    report = find_cleanup_candidates(conn, make_global_config(tmp_path), workdir_root=workdir_root, now=NOW)
+    delete_eligible(report.eligible)  # mirrors cmd_cleanup --confirm, which only ever touches .eligible
+
+    assert pdf_path.exists()
+    assert link.resolve() == pdf_path.resolve()  # symlink is still live, not dangling
+
+
+def test_find_cleanup_candidates_without_archive_dir_set_behaves_as_before(tmp_path, monkeypatch):
+    monkeypatch.delenv("RESUME_ARCHIVE_DIR", raising=False)
+    conn = connect(tmp_path / "t.db")
+    workdir_root = tmp_path / "workdir"
+    _stage_bounced_and_idle(conn, tmp_path, workdir_root)
+
+    report = find_cleanup_candidates(conn, make_global_config(tmp_path), workdir_root=workdir_root, now=NOW)
+
+    assert {c.recipient for c in report.eligible} == {"bounced@x.com"}
+    assert not report.archived
+
+
 # --- delete_eligible: the actual destructive step ---------------------------
 
 def test_delete_eligible_removes_pdf_and_hash_but_keeps_tex(tmp_path):

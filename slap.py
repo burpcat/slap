@@ -18,7 +18,7 @@ from slap.config import ConfigError, discover_campaigns, load_campaign, load_glo
 from slap.latex import recipient_workdir, run_latex_loop
 from slap.queue import stage_recipient
 from slap.templates import fill_template, parse_drop
-from slap import dashboard, doctor, domains, gmass, init, launchd, runner, tracking
+from slap import archive, dashboard, doctor, domains, gmass, init, launchd, runner, tracking
 
 load_dotenv()
 
@@ -101,6 +101,10 @@ def cmd_send(args):
 
     conn = tracking.connect()
 
+    archive_dir = archive.archive_dir_from_env()
+    if archive_dir is None:
+        display.plain(f"Résumé archive is off ({archive.ENV_VAR} not set) — see .env.example to enable.")
+
     while True:
         drop_text = read_paste(f"\nPaste the drop for campaign '{campaign.name}'")
         values = parse_drop(drop_text, campaign.fields)
@@ -109,7 +113,7 @@ def cmd_send(args):
         if not recipient:
             display.error("No 'Email' value found in the drop — skipping this recipient.")
         else:
-            _prep_one_recipient(conn, campaign, consumer_domains, values, recipient)
+            _prep_one_recipient(conn, campaign, consumer_domains, values, recipient, archive_dir)
 
         if input("\nAdd another? [Y/n]: ").strip().lower() == "n":
             break
@@ -133,7 +137,7 @@ def _warn_empty_fields(campaign, values) -> None:
         display.warn(f"⚠ empty fields: {', '.join(empty_keys)}")
 
 
-def _prep_one_recipient(conn, campaign, consumer_domains, values, recipient):
+def _prep_one_recipient(conn, campaign, consumer_domains, values, recipient, archive_dir):
     if campaign.latex_enabled:
         tex_source = read_paste(f"\nPaste the LaTeX résumé source for {recipient}")
         workdir = recipient_workdir(campaign.name, recipient)
@@ -184,6 +188,8 @@ def _prep_one_recipient(conn, campaign, consumer_domains, values, recipient):
         cadence=campaign.cadence, subject=subject, body=body, stage_bodies=stage_bodies,
         attachment_path=attachment_path, attachment_name=campaign.attachment_name,
         latex_enabled=campaign.latex_enabled,
+        company=values.get("company", ""), role=values.get("role_catted", ""),
+        archive_dir=archive_dir,
     )
     display.success(f"Staged {recipient}.")
 
@@ -321,6 +327,11 @@ def cmd_cleanup(args):
         display.warn(f"\n⚠ {len(report.undetermined)} recipient(s) skipped — state could not be determined:")
         for u in report.undetermined:
             display.warn(f"  {u.campaign}/{u.recipient}  — {u.reason}")
+
+    if report.archived:
+        display.warn(f"\n⚠ {len(report.archived)} PDF(s) kept — still referenced by a résumé archive symlink:")
+        for a in report.archived:
+            display.warn(f"  {a.campaign}/{a.recipient}  {a.pdf_path.name}  — {a.reason}")
 
     if args.confirm and report.eligible:
         deleted = delete_eligible(report.eligible)

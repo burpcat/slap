@@ -23,6 +23,12 @@ Two check batteries:
   that recipient's staged.json; nothing about draining re-touches the live
   campaign.yaml or attachment files, so re-checking them there would be
   meaningless (and ambiguous — a drain batch can span multiple campaigns).
+- `check_resume_archive()` — deliberately a THIRD, standalone check, never
+  added to either battery above: `RESUME_ARCHIVE_DIR` must never be able to
+  block a send or a drain (warn, don't block — see slap/archive.py), so it's
+  wired into `print_report()` only, visible in the standalone `doctor`
+  report (and `init`'s finish step) but invisible to `send`'s auto-preflight
+  and `runner.drain()`'s preflight-retry gate.
 """
 from __future__ import annotations
 
@@ -31,7 +37,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from slap import tracking
+from slap import archive, tracking
 from slap.config import CampaignConfig, GlobalConfig
 
 DEFAULT_CONSUMER_DOMAINS = [
@@ -110,6 +116,26 @@ def run_campaign_checks(campaign: CampaignConfig) -> list:
     return check_attachment(campaign)
 
 
+def check_resume_archive() -> CheckResult:
+    """RESUME_ARCHIVE_DIR (post-launch feature, slap/archive.py). Deliberately
+    NOT folded into run_global_checks(): that battery gates every `send`/
+    `runner.drain()` preflight, and a broken archive dir must never block a
+    send (warn, don't block — see archive.py's own docstring). This check is
+    wired into print_report() only, so it's visible in the standalone
+    `doctor` report (and `init`'s finish step) without ever being able to
+    fail a send or a drain."""
+    archive_dir = archive.archive_dir_from_env()
+    if archive_dir is None:
+        return CheckResult(archive.ENV_VAR, True, "not set — résumé archiving is off")
+    if not archive.is_valid_dir(archive_dir):
+        return CheckResult(archive.ENV_VAR, False, f"{archive_dir} does not exist or isn't writable")
+    broken = archive.find_broken_symlinks(archive_dir)
+    if broken:
+        names = ", ".join(p.name for p in broken)
+        return CheckResult(archive.ENV_VAR, False, f"{len(broken)} broken symlink(s): {names}")
+    return CheckResult(archive.ENV_VAR, True, str(archive_dir))
+
+
 def _print_check(result: CheckResult, *, indent: str = "") -> None:
     from slap import display
     if result.ok:
@@ -131,6 +157,10 @@ def print_report(global_config: GlobalConfig) -> bool:
     for result in run_global_checks(global_config):
         _print_check(result)
         ok = ok and result.ok
+
+    archive_result = check_resume_archive()
+    _print_check(archive_result)
+    ok = ok and archive_result.ok
 
     names = discover_campaigns()
     if not names:

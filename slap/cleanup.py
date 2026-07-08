@@ -21,6 +21,17 @@ configured). For a normal active recipient, the only honest way to know the
 follow-up sequence has run its course (rather than still being mid-flight on
 GMass's side) is: the recipient's full persona cadence window (sum of the
 cadence's stage-day offsets) has elapsed since first_sent_at with no reply.
+
+**Archive/cleanup tension (resolved as option (a), see CONTROL_SHEET.md):** a
+`RESUME_ARCHIVE_DIR` symlink (slap/archive.py) can point at a PDF this module
+would otherwise consider eligible for deletion — deleting it out from under
+the symlink would silently defeat the whole point of a durable archive. So
+an eligible PDF still referenced by a LIVE (non-dangling) archive symlink is
+pulled into its own `archived` bucket instead of `eligible`: kept, never
+deleted, and reported separately so the owner can see disk isn't being
+reclaimed and why. This check is skipped entirely when RESUME_ARCHIVE_DIR
+isn't set (empty target set), so cleanup's behavior is unchanged for anyone
+not using the archive feature.
 """
 from __future__ import annotations
 
@@ -29,6 +40,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from slap import archive
 from slap.config import GlobalConfig
 from slap.latex import WORKDIR_ROOT
 from slap.queue import MANIFEST_NAME, load_manifest
@@ -66,6 +78,7 @@ class UndeterminedRecipient:
 class CleanupReport:
     eligible: list
     undetermined: list
+    archived: list
 
 
 def _recipient_events(conn, campaign: str, recipient: str) -> list:
@@ -162,9 +175,12 @@ def find_cleanup_candidates(conn, global_config: GlobalConfig, *,
     classify_recipient(), and returns the eligible/undetermined split. Pure
     read — deletes nothing. Recipients classified "not_yet" (still active,
     pending, or replied) are simply omitted — they aren't candidates and
-    aren't a problem, so they don't need reporting."""
+    aren't a problem, so they don't need reporting. An `eligible` PDF still
+    referenced by a live RESUME_ARCHIVE_DIR symlink is diverted into
+    `archived` instead (see module docstring) — kept, not deleted."""
     now = now or datetime.now(timezone.utc)
-    eligible, undetermined = [], []
+    eligible, undetermined, archived = [], [], []
+    live_archive_targets = archive.resolve_live_targets(archive.archive_dir_from_env())
 
     for manifest_path in sorted(workdir_root.glob(f"*/*/{MANIFEST_NAME}")):
         workdir = manifest_path.parent
@@ -187,17 +203,22 @@ def find_cleanup_candidates(conn, global_config: GlobalConfig, *,
         verdict = classify_recipient(conn, campaign, recipient, global_config,
                                       min_days_idle=min_days_idle, now=now)
         if verdict.status == "eligible":
-            eligible.append(CleanupCandidate(
+            candidate = CleanupCandidate(
                 campaign=campaign, recipient=recipient, workdir=workdir,
                 pdf_path=pdf_path, hash_path=pdf_path.with_name(pdf_path.name + ".hash"),
                 days_idle=verdict.days_idle, reason=verdict.reason,
-            ))
+            )
+            if pdf_path.resolve() in live_archive_targets:
+                candidate.reason = f"{verdict.reason} — kept, still referenced by a résumé archive symlink"
+                archived.append(candidate)
+            else:
+                eligible.append(candidate)
         elif verdict.status == "undetermined":
             undetermined.append(UndeterminedRecipient(
                 campaign=campaign, recipient=recipient, workdir=workdir, reason=verdict.reason,
             ))
 
-    return CleanupReport(eligible=eligible, undetermined=undetermined)
+    return CleanupReport(eligible=eligible, undetermined=undetermined, archived=archived)
 
 
 def delete_eligible(candidates: list) -> list:
