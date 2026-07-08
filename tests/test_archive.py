@@ -5,8 +5,11 @@ missing/unwritable archive dir.
 """
 from datetime import date
 
+import pytest
+
 from slap.archive import (
-    ENV_VAR, archive_dir_from_env, archive_resume, find_broken_symlinks, resolve_live_targets,
+    ArchiveError, ENV_VAR, archive_dir_from_env, archive_resume, copy_reused_resume,
+    find_broken_symlinks, find_matches_for_company, resolve_live_targets,
 )
 
 WHEN = date(2026, 7, 8)
@@ -15,6 +18,19 @@ WHEN = date(2026, 7, 8)
 def make_pdf(tmp_path, name="resume.pdf"):
     p = tmp_path / name
     p.write_bytes(b"%PDF-fake")
+    return p
+
+
+def make_valid_pdf(tmp_path, name="resume.pdf"):
+    """A genuinely pypdf-parseable one-page PDF — copy_reused_resume() really
+    parses its target (unlike most of this module's other tests, which only
+    need something symlink-able and don't care whether it's a real PDF)."""
+    from pypdf import PdfWriter
+    p = tmp_path / name
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    with open(p, "wb") as f:
+        writer.write(f)
     return p
 
 
@@ -180,3 +196,130 @@ def test_resolve_live_targets_excludes_dangling_symlinks(tmp_path):
     dead_target.unlink()
 
     assert resolve_live_targets(archive_dir) == {live_target.resolve()}
+
+
+# --- find_matches_for_company (résumé-reuse lookup) ------------------------
+
+def test_find_matches_for_company_none_when_archive_dir_unset():
+    assert find_matches_for_company(None, "Acme") == []
+
+
+def test_find_matches_for_company_none_when_archive_dir_missing(tmp_path):
+    assert find_matches_for_company(tmp_path / "does-not-exist", "Acme") == []
+
+
+def test_find_matches_for_company_none_when_company_slugifies_to_empty(tmp_path):
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    (archive_dir / "acme-swe-2026-07-08.pdf").symlink_to(make_pdf(tmp_path))
+    assert find_matches_for_company(archive_dir, "!!!") == []
+
+
+def test_find_matches_for_company_returns_matching_entries_sorted(tmp_path):
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    (archive_dir / "acme-swe-2026-07-08.pdf").symlink_to(make_pdf(tmp_path, "a.pdf"))
+    (archive_dir / "acme-recruiter-2026-06-01.pdf").symlink_to(make_pdf(tmp_path, "b.pdf"))
+    (archive_dir / "other-co-swe-2026-07-01.pdf").symlink_to(make_pdf(tmp_path, "c.pdf"))
+
+    matches = find_matches_for_company(archive_dir, "Acme")
+
+    assert [m.name for m in matches] == ["acme-recruiter-2026-06-01.pdf", "acme-swe-2026-07-08.pdf"]
+
+
+def test_find_matches_for_company_respects_slug_prefix_boundary(tmp_path):
+    # "Acme" must not match "AcmeWidgets" — both slugify without a shared
+    # "-" boundary unless the full "<slug>-" prefix is checked.
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    (archive_dir / "acmewidgets-swe-2026-07-08.pdf").symlink_to(make_pdf(tmp_path))
+
+    assert find_matches_for_company(archive_dir, "Acme") == []
+
+
+def test_find_matches_for_company_ignores_non_symlink_files(tmp_path):
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    (archive_dir / "acme-swe-2026-07-08.pdf").write_bytes(b"%PDF-not-a-symlink")
+
+    assert find_matches_for_company(archive_dir, "Acme") == []
+
+
+# --- copy_reused_resume ------------------------------------------------------
+
+def test_copy_reused_resume_copies_target_into_workdir_renamed(tmp_path):
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    target = make_valid_pdf(tmp_path, "original.pdf")
+    entry = archive_dir / "acme-swe-2026-06-01.pdf"
+    entry.symlink_to(target)
+    workdir = tmp_path / "workdir" / "coldpost-recruiter" / "jane@acme.com"
+
+    dest = copy_reused_resume(entry, workdir, "AvinashArutla.pdf")
+
+    assert dest == workdir / "AvinashArutla.pdf"
+    assert dest.exists()
+    assert not dest.is_symlink()  # a real copy, not a symlink
+    assert dest.read_bytes() == target.read_bytes()
+    assert target.exists()  # original untouched
+
+
+def test_copy_reused_resume_creates_workdir_if_missing(tmp_path):
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    entry = archive_dir / "acme-swe-2026-06-01.pdf"
+    entry.symlink_to(make_valid_pdf(tmp_path))
+    workdir = tmp_path / "workdir" / "c" / "jane@acme.com"
+    assert not workdir.exists()
+
+    copy_reused_resume(entry, workdir, "Resume.pdf")
+
+    assert workdir.is_dir()
+
+
+def test_copy_reused_resume_raises_when_target_missing(tmp_path):
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    target = make_valid_pdf(tmp_path, "gone.pdf")
+    entry = archive_dir / "acme-swe-2026-06-01.pdf"
+    entry.symlink_to(target)
+    target.unlink()
+
+    with pytest.raises(ArchiveError, match="missing file"):
+        copy_reused_resume(entry, tmp_path / "workdir", "Resume.pdf")
+
+
+def test_copy_reused_resume_raises_when_target_empty(tmp_path):
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    empty = tmp_path / "empty.pdf"
+    empty.write_bytes(b"")
+    entry = archive_dir / "acme-swe-2026-06-01.pdf"
+    entry.symlink_to(empty)
+
+    with pytest.raises(ArchiveError, match="empty"):
+        copy_reused_resume(entry, tmp_path / "workdir", "Resume.pdf")
+
+
+def test_copy_reused_resume_raises_when_target_not_a_valid_pdf(tmp_path):
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    target = make_pdf(tmp_path, "fake.pdf")  # b"%PDF-fake" -- not really parseable
+    entry = archive_dir / "acme-swe-2026-06-01.pdf"
+    entry.symlink_to(target)
+
+    with pytest.raises(ArchiveError, match="readable PDF"):
+        copy_reused_resume(entry, tmp_path / "workdir", "Resume.pdf")
+
+
+def test_copy_reused_resume_does_not_write_anything_on_failure(tmp_path):
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    entry = archive_dir / "acme-swe-2026-06-01.pdf"
+    entry.symlink_to(tmp_path / "never-created.pdf")
+    workdir = tmp_path / "workdir"
+
+    with pytest.raises(ArchiveError):
+        copy_reused_resume(entry, workdir, "Resume.pdf")
+
+    assert not workdir.exists()

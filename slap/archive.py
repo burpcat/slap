@@ -24,12 +24,25 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 from datetime import date
 from pathlib import Path
 
 from slap import display
+from slap.latex import LatexError, page_count
 
 ENV_VAR = "RESUME_ARCHIVE_DIR"
+
+
+class ArchiveError(Exception):
+    """Raised on a fail-loud résumé-reuse validation failure (the resolved
+    archive entry is missing, empty, or not a readable PDF) — see
+    copy_reused_resume(). Unlike everything else in this module, reuse is an
+    explicit owner action (they picked a specific archive entry to reuse),
+    so a broken pick fails loud for that ONE recipient rather than silently
+    falling back — callers must catch this and skip just that recipient,
+    never let it abort a whole `send` batch (one-recipient blast radius,
+    same as everywhere else in the app)."""
 
 
 def archive_dir_from_env() -> Path | None:
@@ -120,3 +133,56 @@ def resolve_live_targets(archive_dir: Path | None) -> set:
         if entry.is_symlink() and entry.exists():
             targets.add(entry.resolve())
     return targets
+
+
+def find_matches_for_company(archive_dir: Path | None, company: str) -> list:
+    """Every archive entry whose filename starts with `company`'s slug —
+    the lookup index behind `send`'s résumé-reuse offer when the domain
+    soft-warn fires (a previous résumé already went to this company). No
+    RESUME_ARCHIVE_DIR, or a company that slugifies to nothing, both mean
+    'no matches' rather than an error — this is an optional offer, never a
+    hard requirement (§ CLAUDE.md warn-don't-block). Matches are NOT
+    resolved/validated here — deliberately cheap, just a filename listing;
+    validation only happens on copy_reused_resume(), for whichever ONE
+    entry the owner actually picks. Sorted by filename for a deterministic,
+    easily-testable order (not by date — a company's matches typically
+    number in the single digits, so alphabetical-by-filename is plenty)."""
+    if archive_dir is None or not archive_dir.is_dir():
+        return []
+    slug = _slugify(company)
+    if not slug:
+        return []
+    prefix = f"{slug}-"
+    return sorted(p for p in archive_dir.iterdir() if p.is_symlink() and p.name.startswith(prefix))
+
+
+def copy_reused_resume(entry: Path, workdir: Path, attachment_name: str) -> Path:
+    """Resolve `entry` (an archive symlink) to its real target, validate
+    it's a real, non-empty, readable PDF, and COPY (never symlink) it into
+    `workdir` as `attachment_name` — the same workdir/<campaign>/<recipient>/
+    layout the LaTeX loop already stages into (see slap.latex.
+    recipient_workdir), so it flows through the existing attach/archive path
+    unchanged. Copy, not symlink or shared reference: this file must stay
+    correct at actual send time regardless of what `cleanup` later does to
+    the ORIGINAL recipient's workdir — no cross-recipient dependency.
+
+    Raises ArchiveError (never returns a partial/invalid result) if the
+    resolved target is missing, empty, or not a readable PDF — the caller
+    decides what a failed reuse pick means for the one recipient being
+    staged; it must never silently fall back to the default resume."""
+    target = entry.resolve()
+    if not target.is_file():
+        raise ArchiveError(f"{entry.name} points at a missing file ({target})")
+    if target.stat().st_size == 0:
+        raise ArchiveError(f"{entry.name}'s target is empty ({target})")
+    try:
+        pages = page_count(target)
+    except LatexError as e:
+        raise ArchiveError(f"{entry.name}'s target isn't a readable PDF ({target}): {e}") from e
+    if pages < 1:
+        raise ArchiveError(f"{entry.name}'s target has no pages ({target})")
+
+    workdir.mkdir(parents=True, exist_ok=True)
+    dest = workdir / attachment_name
+    shutil.copyfile(target, dest)
+    return dest

@@ -521,3 +521,217 @@ def test_init_is_idempotent_on_second_cli_run(tmp_path):
     from slap.config import load_global_config
     gc = load_global_config(tmp_path / "config.yaml")
     assert gc.from_email == "me@gmail.com"  # untouched by the declined second run
+
+
+# --- résumé reuse on the domain soft-warn (post-launch, latex-off campaigns only) ---
+
+def _setup_reuse_campaign(tmp_path):
+    (tmp_path / "config.yaml").write_text(
+        (Path(__file__).resolve().parent.parent / "config.yaml.example")
+        .read_text()
+        .replace("<Owner Name>", "Test Owner")
+    )
+    (tmp_path / "consumer_domains.txt").write_text(
+        (Path(__file__).resolve().parent.parent / "consumer_domains.txt").read_text()
+    )
+    campaign = tmp_path / "campaigns" / "coldpost"
+    campaign.mkdir(parents=True)
+    (campaign / "campaign.yaml").write_text(
+        "persona: recruiter\n"
+        "latex: { enabled: false, attachment_name: AvinashArutla.pdf }\n"
+        "attachment_file: resume.pdf\n"
+        "fields:\n"
+        "  - { key: email,       label: Email }\n"
+        "  - { key: company,     label: Company }\n"
+        "  - { key: role_catted, label: Role }\n"
+    )
+    (campaign / "resume.pdf").write_bytes(b"%PDF-default-resume")
+    (campaign / "initial.txt").write_text("Subject: Hi {{company}}\n\nHello {{company}} re {{role_catted}}\n")
+    for i in (1, 2, 3):
+        (campaign / f"stage{i}.txt").write_text(f"stage {i}\n")
+    return campaign
+
+
+def _seed_prior_contact_same_domain(tmp_path, *, recipient="other@acme.com", campaign="coldpost"):
+    from slap.tracking import append_event, connect
+    conn = connect(tmp_path / "slap.db")
+    append_event(conn, type="queued", recipient=recipient, campaign=campaign, stage=0,
+                 meta={"persona": "recruiter"})
+    append_event(conn, type="sent", recipient=recipient, campaign=campaign, stage=0,
+                 gmass_campaign_id="1")
+    conn.close()
+
+
+def _write_valid_pdf(path):
+    from pypdf import PdfWriter
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    with open(path, "wb") as f:
+        writer.write(f)
+
+
+def test_send_offers_resume_reuse_on_soft_warn_and_accepted(tmp_path):
+    _setup_reuse_campaign(tmp_path)
+    _seed_prior_contact_same_domain(tmp_path)
+
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    original = tmp_path / "original.pdf"
+    _write_valid_pdf(original)
+    (archive_dir / "acme-founding-engineer-2026-06-01.pdf").symlink_to(original)
+
+    recipient = "jane@acme.com"
+    drop = f"Email: {recipient}\nCompany: Acme\nRole: Staff Engineer\n"
+    scripted_stdin = f"{drop}\nEOF\ny\n1\ny\nn\n"  # drop, proceed-anyway, reuse #1, stage, no-more
+
+    env = {**os.environ, "GMASS_API_KEY": "fake-key", "RESUME_ARCHIVE_DIR": str(archive_dir)}
+    result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "reused from acme-founding-engineer-2026-06-01.pdf" in result.stdout
+    assert "Staged" in result.stdout
+
+    staged = tmp_path / "workdir" / "coldpost" / recipient / "AvinashArutla.pdf"
+    assert staged.exists()
+    assert staged.read_bytes() == original.read_bytes()
+    assert original.exists()  # original archive target untouched
+
+    today = date.today().isoformat()
+    new_entry = archive_dir / f"acme-staff-engineer-{today}.pdf"
+    assert new_entry.is_symlink()
+    assert new_entry.resolve() == staged.resolve()  # a fresh entry for THIS send, not the reused one
+
+
+def test_send_offers_resume_reuse_multiple_matches_selects_correct_one(tmp_path):
+    _setup_reuse_campaign(tmp_path)
+    _seed_prior_contact_same_domain(tmp_path)
+
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    first = tmp_path / "first.pdf"
+    second = tmp_path / "second.pdf"
+    _write_valid_pdf(first)
+    _write_valid_pdf(second)
+    # alphabetical: "acme-founding..." sorts before "acme-recruiter..."
+    (archive_dir / "acme-founding-engineer-2026-06-01.pdf").symlink_to(first)
+    (archive_dir / "acme-recruiter-2026-05-01.pdf").symlink_to(second)
+
+    recipient = "jane@acme.com"
+    drop = f"Email: {recipient}\nCompany: Acme\nRole: Staff Engineer\n"
+    scripted_stdin = f"{drop}\nEOF\ny\n2\ny\nn\n"  # pick the 2nd listed match
+
+    env = {**os.environ, "GMASS_API_KEY": "fake-key", "RESUME_ARCHIVE_DIR": str(archive_dir)}
+    result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "2 previous résumé(s) found" in result.stdout
+    assert "reused from acme-recruiter-2026-05-01.pdf" in result.stdout
+
+    staged = tmp_path / "workdir" / "coldpost" / recipient / "AvinashArutla.pdf"
+    assert staged.read_bytes() == second.read_bytes()
+
+
+def test_send_soft_warn_no_archive_matches_falls_through_no_prompt(tmp_path):
+    _setup_reuse_campaign(tmp_path)
+    _seed_prior_contact_same_domain(tmp_path)
+
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    other = tmp_path / "other.pdf"
+    _write_valid_pdf(other)
+    (archive_dir / "othercorp-swe-2026-06-01.pdf").symlink_to(other)  # no match for "Acme"
+
+    recipient = "jane@acme.com"
+    drop = f"Email: {recipient}\nCompany: Acme\nRole: Staff Engineer\n"
+    scripted_stdin = f"{drop}\nEOF\ny\ny\nn\n"  # drop, proceed-anyway, stage, no-more (NO reuse prompt)
+
+    env = {**os.environ, "GMASS_API_KEY": "fake-key", "RESUME_ARCHIVE_DIR": str(archive_dir)}
+    result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "résumé(s) found" not in result.stdout
+    assert "Attachment: AvinashArutla.pdf" in result.stdout
+    assert "Staged" in result.stdout
+
+
+def test_send_soft_warn_archive_dir_unset_falls_through_no_prompt_no_error(tmp_path):
+    _setup_reuse_campaign(tmp_path)
+    _seed_prior_contact_same_domain(tmp_path)
+
+    recipient = "jane@acme.com"
+    drop = f"Email: {recipient}\nCompany: Acme\nRole: Staff Engineer\n"
+    scripted_stdin = f"{drop}\nEOF\ny\ny\nn\n"
+
+    env = {**os.environ, "GMASS_API_KEY": "fake-key"}  # RESUME_ARCHIVE_DIR left unset
+    result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Traceback" not in result.stderr
+    assert "résumé(s) found" not in result.stdout
+    assert "Staged" in result.stdout
+
+
+def test_send_declining_resume_reuse_uses_default(tmp_path):
+    campaign = _setup_reuse_campaign(tmp_path)
+    _seed_prior_contact_same_domain(tmp_path)
+
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    original = tmp_path / "original.pdf"
+    _write_valid_pdf(original)
+    (archive_dir / "acme-founding-engineer-2026-06-01.pdf").symlink_to(original)
+
+    recipient = "jane@acme.com"
+    drop = f"Email: {recipient}\nCompany: Acme\nRole: Staff Engineer\n"
+    scripted_stdin = f"{drop}\nEOF\ny\n0\ny\nn\n"  # drop, proceed-anyway, DECLINE reuse, stage, no-more
+
+    env = {**os.environ, "GMASS_API_KEY": "fake-key", "RESUME_ARCHIVE_DIR": str(archive_dir)}
+    result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Attachment: AvinashArutla.pdf" in result.stdout
+    assert "reused from" not in result.stdout
+    assert "Staged" in result.stdout
+
+    # Static-campaign default path: no per-recipient copy, shared source recorded instead.
+    workdir = tmp_path / "workdir" / "coldpost" / recipient
+    assert not (workdir / "AvinashArutla.pdf").exists()
+    manifest = json.loads((workdir / "staged.json").read_text())
+    assert manifest["attachment_source"] == str((campaign / "resume.pdf").resolve())
+
+
+def test_send_reuse_of_broken_archive_entry_fails_loud_for_that_recipient_only(tmp_path):
+    _setup_reuse_campaign(tmp_path)
+    _seed_prior_contact_same_domain(tmp_path)
+
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    gone = tmp_path / "gone.pdf"
+    _write_valid_pdf(gone)
+    (archive_dir / "acme-founding-engineer-2026-06-01.pdf").symlink_to(gone)
+    gone.unlink()  # dangling target by the time it's picked
+
+    recipient1, recipient2 = "jane@acme.com", "jill@acme.com"
+    scripted_stdin = "\n".join([
+        f"Email: {recipient1}", "Company: Acme", "Role: Staff Engineer", "",
+        "EOF",
+        "y",   # proceed anyway (soft-warn, recipient1)
+        "1",   # reuse the (broken) match -> fails loud, this recipient is skipped
+        "y",   # cmd_send's "Add another?"
+        f"Email: {recipient2}", "Company: Acme", "Role: Staff Engineer", "",
+        "EOF",
+        "y",   # proceed anyway (soft-warn, recipient2 -- jane was never staged, so still just 'other@acme.com')
+        "0",   # decline reuse this time
+        "y",   # Stage this send?
+        "n",   # Add another? -> end
+        "",
+    ])
+
+    env = {**os.environ, "GMASS_API_KEY": "fake-key", "RESUME_ARCHIVE_DIR": str(archive_dir)}
+    result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Could not reuse" in result.stdout
+
+    assert not (tmp_path / "workdir" / "coldpost" / recipient1 / "staged.json").exists()
+    assert (tmp_path / "workdir" / "coldpost" / recipient2 / "staged.json").exists()

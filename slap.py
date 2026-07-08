@@ -137,7 +137,34 @@ def _warn_empty_fields(campaign, values) -> None:
         display.warn(f"⚠ empty fields: {', '.join(empty_keys)}")
 
 
-def _prep_one_recipient(conn, campaign, consumer_domains, values, recipient, archive_dir):
+def _offer_resume_reuse(matches: list, *, read_line=input):
+    """Numbered choice of previously-archived résumés to reuse instead of
+    the campaign's default static attachment — offered only when the domain
+    soft-warn fires and matches exist for this company (see caller). Returns
+    the chosen archive entry Path, or None if declined. '0'/empty input both
+    mean 'no reuse' and are the easy/default answer — this is an offer, not
+    a nudge toward reuse."""
+    display.plain(f"\n{len(matches)} previous résumé(s) found in the archive for this company:")
+    for i, m in enumerate(matches, start=1):
+        display.plain(f"  {i}. {m.name}")
+    display.plain("  0. Use this campaign's default resume")
+    while True:
+        raw = read_line(display.styled_prompt(
+            "Reuse one of these instead? [0]: ", style=display.YELLOW
+        )).strip()
+        if raw in ("", "0"):
+            return None
+        try:
+            choice = int(raw)
+        except ValueError:
+            display.warn(f"  Not understood — enter a number 0-{len(matches)}.")
+            continue
+        if 1 <= choice <= len(matches):
+            return matches[choice - 1]
+        display.warn(f"  Not understood — enter a number 0-{len(matches)}.")
+
+
+def _prep_one_recipient(conn, campaign, consumer_domains, values, recipient, archive_dir, *, read_line=input):
     if campaign.latex_enabled:
         tex_source = read_paste(f"\nPaste the LaTeX résumé source for {recipient}")
         workdir = recipient_workdir(campaign.name, recipient)
@@ -161,9 +188,34 @@ def _prep_one_recipient(conn, campaign, consumer_domains, values, recipient, arc
         for c in dedup.soft_warning_contacts:
             display.warn(f"    {c.recipient}  campaign={c.campaign}  status={c.status}")
     if (dedup.hard_warning or dedup.soft_warning_contacts) and \
-            input(display.styled_prompt("Proceed anyway? [y/N]: ", style=display.YELLOW)).strip().lower() != "y":
+            read_line(display.styled_prompt("Proceed anyway? [y/N]: ", style=display.YELLOW)).strip().lower() != "y":
         print("Skipped.")
         return
+
+    # Résumé reuse (v1: latex-off campaigns only — see CONTROL_SHEET.md).
+    # Only offered on the domain SOFT warn (a different person at the same
+    # company was already contacted) — never the hard warn (this exact
+    # recipient already contacted), and only when the archive actually has
+    # a matching entry for this company; otherwise this is a no-op and
+    # behavior is byte-for-byte identical to before this feature existed.
+    reused_from = None
+    if dedup.soft_warning_contacts and not campaign.latex_enabled:
+        matches = archive.find_matches_for_company(archive_dir, values.get("company", ""))
+        if matches:
+            choice = _offer_resume_reuse(matches, read_line=read_line)
+            if choice is not None:
+                try:
+                    workdir = recipient_workdir(campaign.name, recipient)
+                    attachment_path = archive.copy_reused_resume(choice, workdir, campaign.attachment_name)
+                    reused_from = choice.name
+                except archive.ArchiveError as e:
+                    # Fail loud for THIS recipient only (never sys.exit —
+                    # cmd_send's while-loop must keep going for the rest of
+                    # the batch, same one-recipient blast radius as every
+                    # other failure path in this function).
+                    display.error(f"\n⚠ Could not reuse {choice.name}: {e}")
+                    print("Skipped.")
+                    return
 
     # HARD REQUIREMENT: subject/body/stage_bodies below are the exact values
     # later passed to stage_recipient() (the real send path). preview_panel()
@@ -176,10 +228,13 @@ def _prep_one_recipient(conn, campaign, consumer_domains, values, recipient, arc
 
     _warn_empty_fields(campaign, values)
     display.preview_panel(recipient, subject, body)
-    print(f"Attachment: {campaign.attachment_name}")
+    if reused_from:
+        print(f"Attachment: reused from {reused_from}")
+    else:
+        print(f"Attachment: {campaign.attachment_name}")
     print(f"Cadence (persona={campaign.persona}): {campaign.cadence}")
 
-    if input("\nStage this send? [y/N]: ").strip().lower() != "y":
+    if read_line("\nStage this send? [y/N]: ").strip().lower() != "y":
         print("Skipped.")
         return
 
