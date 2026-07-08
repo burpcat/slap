@@ -522,6 +522,205 @@ def next_drain(conn, global_config) -> dict:
     }
 
 
+# --- Reach-outs: all-campaigns, filterable, read-only recipient table ------
+#
+# Post-launch page, not in the original Build Order. See CONTROL_SHEET.md for
+# the full set of findings from investigating the actual schema before
+# designing this — the short version: "company"/"req_id" were never
+# persisted anywhere before this feature (see slap.queue.stage_recipient's
+# docstring for the new, additive `queued`-event-meta capture this depends
+# on), and `recipients.status`'s real values (active/done/replied/bounced/
+# ooo_requeued) don't match the brief's original queued/sent/failed/bounced
+# strawman — "queued" and "failed" are derived here rather than being real
+# column values (see reachouts_rows()'s own docstring for exactly how).
+
+def _clicked_recipients(conn) -> set:
+    """Every recipient with at least one 'click' event, ever — the exact
+    same criterion warm_but_silent() already uses (a click event's mere
+    existence), exposed here as a reusable set so this page's 'clicked'
+    engagement bucket can never define it differently. Deliberately a new,
+    independent function rather than a refactor of warm_but_silent() itself
+    (which needs more than a flat set — a per-recipient stage breakdown) —
+    test_dashboard.py pins that the two can never disagree on WHICH
+    recipients count as clicked."""
+    return {r["recipient"] for r in conn.execute("SELECT DISTINCT recipient FROM events WHERE type = 'click'")}
+
+
+def reply_tags(conn) -> dict:
+    """Every recipient's resolved reply-tag status — 'untagged' (replied,
+    pending triage), 'ooo', 'real', or 'not_interested' — keyed by
+    recipient; a recipient who has never replied at all is simply absent
+    from this dict (there's nothing to tag). Mirrors needs_triage()'s exact
+    "latest of reply/ooo_tagged/reply_reviewed event wins" resolution rule
+    (see that function's own docstring for why that's the right criterion),
+    generalized from "is it still open" to "what did it resolve to."
+    Deliberately a fresh, independent read of the same event types rather
+    than a refactor of needs_triage() itself, to avoid touching that
+    already-tested query for an unrelated feature — test_dashboard.py pins
+    that a recipient in needs_triage()'s result always maps to 'untagged'
+    here, and vice versa, so the two can never silently drift apart."""
+    rows = conn.execute(
+        "SELECT recipient, type, meta FROM events WHERE type IN ('reply', 'ooo_tagged', 'reply_reviewed') "
+        "ORDER BY id ASC"
+    ).fetchall()
+    latest: dict = {}
+    for row in rows:
+        latest[row["recipient"]] = row  # ORDER BY id ASC -> last write per recipient wins
+    tags = {}
+    for recipient, row in latest.items():
+        if row["type"] == "reply":
+            tags[recipient] = "untagged"
+        elif row["type"] == "ooo_tagged":
+            tags[recipient] = "ooo"
+        elif row["type"] == "reply_reviewed":
+            meta = json.loads(row["meta"]) if row["meta"] else {}
+            tags[recipient] = meta.get("tag")
+    return tags
+
+
+def _recipient_drop_meta(conn) -> dict:
+    """Per recipient, the company/role/req_id captured at their MOST RECENT
+    `queued` event (see slap.queue.stage_recipient's docstring for why
+    these ride in meta — the exact same precedent already established for
+    persona). A recipient staged before this capture existed, or whose drop
+    simply left a field blank, has an empty string here — never fabricated,
+    never backfilled from anywhere else (e.g. never guessed from a
+    rendered email body, which DOES contain the filled-in value as
+    unstructured prose but is not a reliable, parseable source of it)."""
+    rows = conn.execute(
+        "SELECT recipient, meta FROM events WHERE type = 'queued' ORDER BY id ASC"
+    ).fetchall()
+    result: dict = {}
+    for row in rows:
+        meta = json.loads(row["meta"]) if row["meta"] else {}
+        result[row["recipient"]] = {
+            "company": meta.get("company") or "",
+            "role": meta.get("role") or "",
+            "req_id": meta.get("req_id") or "",
+        }
+    return result
+
+
+def reachouts_rows(conn) -> list:
+    """One row per recipient (the `recipients` cache's own natural grain —
+    a recipient's single current row already reflects whichever campaign
+    they're most recently associated with), spanning every campaign with no
+    restriction — the full read-only dataset behind the Reach-outs page,
+    before any filtering. Every category reuses an existing definition
+    rather than recomputing one slightly differently:
+
+    - engagement: 'replied' (recipients.replied_at IS NOT NULL — the same
+      first-write-wins signal engagement_intelligence()/
+      companies_contacted() already rely on) takes priority over 'clicked'
+      (_clicked_recipients(), same criterion as warm_but_silent()); else
+      'none'.
+    - reply_tag: reply_tags() (mirrors needs_triage()'s resolution rule);
+      None for a recipient who's never replied.
+    - status: recipients.status, EXCEPT a recipient with first_sent_at IS
+      NULL is reported as 'queued' rather than 'active' — the raw status
+      column alone can't distinguish "just staged, nothing sent yet" from
+      "sent at least once, still mid-sequence," both of which are 'active'.
+      There is no 'failed' status here on purpose: send_failed is a
+      transient per-attempt event, not a resting state — it's always
+      retried automatically by the next drain (§11), so a recipient is
+      never durably "in a failed state" the way they can durably be
+      bounced/replied/done.
+    - date: first_sent_at if set, else last_event_at — covers a
+      queued-but-never-sent recipient (whose first_sent_at is always None)
+      with their queued timestamp instead of leaving them dateless.
+    - domain: domains.domain_of(recipient) — always reliable (derived live
+      from the recipient's own email), unlike company below.
+    - company / req_id_present: _recipient_drop_meta() — only reliable for
+      recipients staged after that capture shipped; blank/False for older
+      ones, never guessed.
+    """
+    clicked = _clicked_recipients(conn)
+    tags = reply_tags(conn)
+    drop_meta = _recipient_drop_meta(conn)
+    rows = conn.execute("SELECT * FROM recipients").fetchall()
+
+    result = []
+    for row in rows:
+        recipient = row["recipient"]
+        if row["replied_at"]:
+            engagement = "replied"
+        elif recipient in clicked:
+            engagement = "clicked"
+        else:
+            engagement = "none"
+
+        status = row["status"]
+        if row["first_sent_at"] is None and status == "active":
+            status = "queued"
+
+        meta = drop_meta.get(recipient, {"company": "", "role": "", "req_id": ""})
+        date = row["first_sent_at"] or row["last_event_at"]
+
+        result.append({
+            "recipient": recipient,
+            "campaign": row["campaign"],
+            "persona": row["persona"],
+            "status": status,
+            "engagement": engagement,
+            "reply_tag": tags.get(recipient),
+            "domain": domains.domain_of(recipient),
+            "company": meta["company"],
+            "req_id_present": bool(meta["req_id"]),
+            "date": date,
+            # Precomputed LOCAL calendar date (YYYY-MM-DD), reusing the same
+            # _local_date() conversion todays_runs()/companies_contacted()
+            # already use — so the client-side date-range filter (reachouts.
+            # html) can do a plain ISO-string compare against an
+            # <input type=date> value without redoing timezone math in JS
+            # (and without ever risking it disagreeing with this function's
+            # own, Python-tested date_start/date_end filtering).
+            "date_local": _local_date(date).isoformat() if date else None,
+        })
+    return result
+
+
+def filter_reachouts(rows: list, filters: dict) -> list:
+    """AND-combine every provided filter dimension over `rows` (the output
+    of reachouts_rows()). Every key in `filters` is optional — absent or
+    None means "no constraint on this dimension," never "match nothing."
+    This is the one, unit-tested definition of "what counts as a match";
+    dashboard_templates/reachouts.html's client-side JS mirrors it for
+    interactive filtering (see that template's own comment for why the
+    actual filtering happens in the browser rather than round-tripping
+    through this function on every interaction — a hard requirement here is
+    zero network calls per filter/sort change)."""
+    result = rows
+    if filters.get("campaign"):
+        result = [r for r in result if r["campaign"] == filters["campaign"]]
+    if filters.get("persona"):
+        result = [r for r in result if r["persona"] == filters["persona"]]
+    if filters.get("status"):
+        result = [r for r in result if r["status"] == filters["status"]]
+    if filters.get("engagement"):
+        result = [r for r in result if r["engagement"] == filters["engagement"]]
+    if filters.get("reply_tag"):
+        result = [r for r in result if r["reply_tag"] == filters["reply_tag"]]
+    if filters.get("domain"):
+        result = [r for r in result if r["domain"] == filters["domain"]]
+    if filters.get("req_id_present") is not None:
+        result = [r for r in result if r["req_id_present"] == filters["req_id_present"]]
+    if filters.get("date_start"):
+        # ISO "YYYY-MM-DD" strings compare correctly lexicographically —
+        # the same format reachouts_rows()'s date_local uses and an
+        # <input type=date> produces, so this needs no date parsing at all.
+        result = [r for r in result if r["date_local"] and r["date_local"] >= filters["date_start"]]
+    if filters.get("date_end"):
+        result = [r for r in result if r["date_local"] and r["date_local"] <= filters["date_end"]]
+    if filters.get("search"):
+        needle = filters["search"].strip().lower()
+        if needle:
+            result = [
+                r for r in result
+                if needle in r["recipient"].lower() or needle in (r["company"] or "").lower()
+            ]
+    return result
+
+
 def _to_local(value) -> str:
     """UTC (a datetime, or an ISO string as stored in `events`) -> local
     display string. Convert to local only at dashboard display (§5)."""
@@ -580,6 +779,21 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
             companies=companies_contacted(conn, consumer_domains),
             next_drain=next_drain(conn, global_config),
         )
+
+    @app.route("/reachouts")
+    def reachouts():
+        # Read-only, local-state-only page (§ Reach-outs): deliberately does
+        # NOT call sync_reports() — every other route's on-open GMass poll is
+        # optional per the feature's own spec ("if the page itself needs a
+        # fresh poll on open, that's fine — but filtering afterward is a pure
+        # local-data operation"). Skipping it entirely here is the simplest
+        # way to guarantee this page can NEVER make a GMass call, no matter
+        # how it's used. Rows are rendered in full (unfiltered) — filtering/
+        # sorting happens client-side in the page's own <script>, never a
+        # server round-trip, so no pagination or query-param handling is
+        # needed here either.
+        rows = reachouts_rows(get_conn())
+        return render_template("reachouts.html", rows=rows, total_count=len(rows))
 
     @app.route("/reply/<string:recipient>/tag", methods=["POST"])
     def reply_tag(recipient):

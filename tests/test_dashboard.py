@@ -14,9 +14,10 @@ from werkzeug.serving import make_server
 
 from slap.config import GlobalConfig, ScheduleConfig
 from slap.dashboard import (
-    actionable_replies, bounces, companies_contacted, create_app, engagement_intelligence,
-    needs_triage, next_drain, pipeline, sync_reports, tag_reply, this_week, today_strip,
-    todays_runs, warm_but_silent,
+    _clicked_recipients, _recipient_drop_meta, actionable_replies, bounces, companies_contacted,
+    create_app, engagement_intelligence, filter_reachouts, needs_triage, next_drain, pipeline,
+    reachouts_rows, reply_tags, sync_reports, tag_reply, this_week, today_strip, todays_runs,
+    warm_but_silent,
 )
 from slap.tracking import append_event, connect
 
@@ -785,3 +786,349 @@ def test_dashboard_survives_real_concurrent_request_threads(tmp_path, monkeypatc
         finally:
             server.shutdown()
             thread.join()
+
+
+# --- Reach-outs: all-campaigns, filterable, read-only recipient table ------
+
+def _stage_and_send(conn, *, recipient, campaign, persona, company="", role="", req_id="",
+                     timestamp=None, send=True):
+    append_event(conn, type="queued", recipient=recipient, campaign=campaign, stage=0,
+                 meta={"persona": persona, "company": company, "role": role, "req_id": req_id},
+                 timestamp=timestamp)
+    if send:
+        append_event(conn, type="sent", recipient=recipient, campaign=campaign, stage=0,
+                     gmass_campaign_id="1", timestamp=timestamp)
+
+
+# --- _clicked_recipients ----------------------------------------------------
+
+def test_clicked_recipients_includes_anyone_with_a_click_event(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="click", recipient="a@x.com", campaign="c", stage=0)
+    assert _clicked_recipients(conn) == {"a@x.com"}
+
+
+def test_clicked_recipients_empty_when_no_clicks(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    assert _clicked_recipients(conn) == set()
+
+
+def test_clicked_recipients_agrees_with_warm_but_silent_on_who_clicked(conn):
+    # Cross-consistency pin (see _clicked_recipients()'s own docstring):
+    # warm_but_silent() is a STRICT SUBSET of "has clicked" (clicked minus
+    # already-replied), not the same set, so the real invariant isn't
+    # equality — it's that every recipient warm_but_silent() reports as
+    # having clicked genuinely IS in _clicked_recipients()'s set too, i.e.
+    # the two can never disagree about whether a click happened, only about
+    # whether a later reply excludes someone from the "still silent" view.
+    _stage_and_send(conn, recipient="silent@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="click", recipient="silent@x.com", campaign="c", stage=0)
+
+    _stage_and_send(conn, recipient="clicked_then_replied@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="click", recipient="clicked_then_replied@x.com", campaign="c", stage=0)
+    append_event(conn, type="reply", recipient="clicked_then_replied@x.com", campaign="c")
+
+    clicked = _clicked_recipients(conn)
+    warm = {w["recipient"] for w in warm_but_silent(conn)}
+
+    assert clicked == {"silent@x.com", "clicked_then_replied@x.com"}
+    assert warm == {"silent@x.com"}  # excluded for having replied, not for a click disagreement
+    assert warm <= clicked  # every "warm but silent" recipient is also a "clicked" recipient
+
+
+# --- reply_tags --------------------------------------------------------------
+
+def test_reply_tags_untagged_for_unresolved_reply(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
+    assert reply_tags(conn) == {"a@x.com": "untagged"}
+
+
+def test_reply_tags_real_and_not_interested_from_reply_reviewed(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
+    append_event(conn, type="reply_reviewed", recipient="a@x.com", campaign="c", meta={"tag": "real"})
+
+    _stage_and_send(conn, recipient="b@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="reply", recipient="b@x.com", campaign="c")
+    append_event(conn, type="reply_reviewed", recipient="b@x.com", campaign="c", meta={"tag": "not_interested"})
+
+    assert reply_tags(conn) == {"a@x.com": "real", "b@x.com": "not_interested"}
+
+
+def test_reply_tags_ooo_from_ooo_tagged(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
+    append_event(conn, type="ooo_tagged", recipient="a@x.com", campaign="c")
+    assert reply_tags(conn) == {"a@x.com": "ooo"}
+
+
+def test_reply_tags_absent_for_recipient_who_never_replied(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    assert reply_tags(conn) == {}
+
+
+def test_reply_tags_agrees_with_needs_triage_on_who_is_still_open(conn):
+    # Cross-consistency pin (see reply_tags()'s own docstring): a recipient
+    # in needs_triage()'s result must map to 'untagged' here, and a
+    # recipient reply_tags() reports as anything OTHER than 'untagged' must
+    # NOT appear in needs_triage() — the two must never silently disagree
+    # about which replies are still open. Covers every resolution path
+    # (plain open reply, reviewed-and-closed, OOO-tagged, and REOPENED after
+    # a prior review) since those are exactly where the two independently
+    # implemented resolution rules — needs_triage()'s SQL self-join with
+    # NOT EXISTS vs. reply_tags()'s Python "latest wins" walk — could
+    # silently diverge; a single plain-open-vs-resolved case wouldn't catch
+    # an ordering bug in either one.
+    _stage_and_send(conn, recipient="open@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="reply", recipient="open@x.com", campaign="c")
+
+    _stage_and_send(conn, recipient="resolved@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="reply", recipient="resolved@x.com", campaign="c")
+    append_event(conn, type="reply_reviewed", recipient="resolved@x.com", campaign="c", meta={"tag": "real"})
+
+    _stage_and_send(conn, recipient="ooo@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="reply", recipient="ooo@x.com", campaign="c")
+    append_event(conn, type="ooo_tagged", recipient="ooo@x.com", campaign="c")
+
+    _stage_and_send(conn, recipient="reopened@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="reply", recipient="reopened@x.com", campaign="c")
+    append_event(conn, type="reply_reviewed", recipient="reopened@x.com", campaign="c", meta={"tag": "real"})
+    append_event(conn, type="reply", recipient="reopened@x.com", campaign="c")
+
+    triage_recipients = {r["recipient"] for r in needs_triage(conn)}
+    tags = reply_tags(conn)
+
+    assert triage_recipients == {"open@x.com", "reopened@x.com"}
+    for recipient in triage_recipients:
+        assert tags[recipient] == "untagged"
+    for recipient in ("resolved@x.com", "ooo@x.com"):
+        assert tags[recipient] != "untagged"
+        assert recipient not in triage_recipients
+    assert tags["ooo@x.com"] == "ooo"
+    assert tags["resolved@x.com"] == "real"
+
+
+# --- _recipient_drop_meta -----------------------------------------------------
+
+def test_recipient_drop_meta_reads_latest_queued_event(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter",
+                     company="Acme", role="Backend Engineer", req_id="REQ-1")
+    assert _recipient_drop_meta(conn)["a@x.com"] == {
+        "company": "Acme", "role": "Backend Engineer", "req_id": "REQ-1",
+    }
+
+
+def test_recipient_drop_meta_blank_for_a_queued_event_without_these_keys(conn):
+    # Backward compatibility: a queued event written before this capture
+    # existed simply has no company/role/req_id keys in its meta at all.
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter"})
+    assert _recipient_drop_meta(conn)["a@x.com"] == {"company": "", "role": "", "req_id": ""}
+
+
+def test_recipient_drop_meta_uses_the_most_recent_queued_event(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c1", persona="recruiter", company="Old Co")
+    _stage_and_send(conn, recipient="a@x.com", campaign="c2", persona="founder", company="New Co")
+    assert _recipient_drop_meta(conn)["a@x.com"]["company"] == "New Co"
+
+
+# --- reachouts_rows ------------------------------------------------------------
+
+def test_reachouts_rows_spans_all_three_campaigns_with_no_filter(conn):
+    _stage_and_send(conn, recipient="jane@acme.com", campaign="coldpost-founder", persona="founder",
+                     company="Acme", role="Founding Engineer")
+    _stage_and_send(conn, recipient="bob@widgets.com", campaign="coldpost-recruiter", persona="recruiter",
+                     company="Widgets Inc", role="Backend Engineer", req_id="REQ-123")
+    _stage_and_send(conn, recipient="carol@other.com", campaign="linkpost-hiringmanager",
+                     persona="hiring_manager", send=False)
+
+    rows = {r["recipient"]: r for r in reachouts_rows(conn)}
+
+    assert set(rows) == {"jane@acme.com", "bob@widgets.com", "carol@other.com"}
+    assert rows["jane@acme.com"]["campaign"] == "coldpost-founder"
+    assert rows["bob@widgets.com"]["campaign"] == "coldpost-recruiter"
+    assert rows["carol@other.com"]["campaign"] == "linkpost-hiringmanager"
+
+
+def test_reachouts_rows_status_queued_vs_active(conn):
+    _stage_and_send(conn, recipient="sent@x.com", campaign="c", persona="recruiter", send=True)
+    _stage_and_send(conn, recipient="queued@x.com", campaign="c", persona="recruiter", send=False)
+
+    rows = {r["recipient"]: r for r in reachouts_rows(conn)}
+    assert rows["sent@x.com"]["status"] == "active"
+    assert rows["queued@x.com"]["status"] == "queued"
+
+
+def test_reachouts_rows_engagement_replied_beats_clicked(conn):
+    _stage_and_send(conn, recipient="clicked@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="click", recipient="clicked@x.com", campaign="c", stage=0)
+
+    _stage_and_send(conn, recipient="replied@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="click", recipient="replied@x.com", campaign="c", stage=0)
+    append_event(conn, type="reply", recipient="replied@x.com", campaign="c")
+
+    _stage_and_send(conn, recipient="neither@x.com", campaign="c", persona="recruiter")
+
+    rows = {r["recipient"]: r for r in reachouts_rows(conn)}
+    assert rows["clicked@x.com"]["engagement"] == "clicked"
+    assert rows["replied@x.com"]["engagement"] == "replied"
+    assert rows["neither@x.com"]["engagement"] == "none"
+
+
+def test_reachouts_rows_domain_company_and_req_id_present(conn):
+    _stage_and_send(conn, recipient="jane@acme.com", campaign="c", persona="recruiter",
+                     company="Acme", req_id="REQ-1")
+    _stage_and_send(conn, recipient="bob@x.com", campaign="c", persona="recruiter")
+
+    rows = {r["recipient"]: r for r in reachouts_rows(conn)}
+    assert rows["jane@acme.com"]["domain"] == "acme.com"
+    assert rows["jane@acme.com"]["company"] == "Acme"
+    assert rows["jane@acme.com"]["req_id_present"] is True
+    assert rows["bob@x.com"]["company"] == ""
+    assert rows["bob@x.com"]["req_id_present"] is False
+
+
+def test_reachouts_rows_date_falls_back_to_last_event_at_when_never_sent(conn):
+    ts = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+    _stage_and_send(conn, recipient="queued@x.com", campaign="c", persona="recruiter",
+                     send=False, timestamp=ts)
+    row = reachouts_rows(conn)[0]
+    assert row["date"] is not None
+    assert row["date_local"] == ts.astimezone().date().isoformat()
+
+
+def test_reachouts_rows_reply_tag_none_when_never_replied(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    assert reachouts_rows(conn)[0]["reply_tag"] is None
+
+
+# --- filter_reachouts (pure function — no DB needed) --------------------------
+
+def _row(**overrides):
+    base = {
+        "recipient": "jane@acme.com", "campaign": "coldpost-recruiter", "persona": "recruiter",
+        "status": "active", "engagement": "none", "reply_tag": None, "domain": "acme.com",
+        "company": "Acme", "req_id_present": False, "date": "2026-06-15T00:00:00+00:00",
+        "date_local": "2026-06-15",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_filter_reachouts_no_filters_returns_everything():
+    rows = [_row(recipient="a@x.com"), _row(recipient="b@x.com")]
+    assert filter_reachouts(rows, {}) == rows
+
+
+def test_filter_reachouts_by_campaign():
+    rows = [_row(recipient="a@x.com", campaign="coldpost-founder"), _row(recipient="b@x.com", campaign="coldpost-recruiter")]
+    result = filter_reachouts(rows, {"campaign": "coldpost-founder"})
+    assert [r["recipient"] for r in result] == ["a@x.com"]
+
+
+def test_filter_reachouts_by_persona():
+    rows = [_row(recipient="a@x.com", persona="founder"), _row(recipient="b@x.com", persona="recruiter")]
+    result = filter_reachouts(rows, {"persona": "founder"})
+    assert [r["recipient"] for r in result] == ["a@x.com"]
+
+
+def test_filter_reachouts_by_status():
+    rows = [_row(recipient="a@x.com", status="bounced"), _row(recipient="b@x.com", status="active")]
+    result = filter_reachouts(rows, {"status": "bounced"})
+    assert [r["recipient"] for r in result] == ["a@x.com"]
+
+
+def test_filter_reachouts_by_engagement():
+    rows = [_row(recipient="a@x.com", engagement="clicked"), _row(recipient="b@x.com", engagement="none")]
+    result = filter_reachouts(rows, {"engagement": "clicked"})
+    assert [r["recipient"] for r in result] == ["a@x.com"]
+
+
+def test_filter_reachouts_by_reply_tag():
+    rows = [_row(recipient="a@x.com", reply_tag="real"), _row(recipient="b@x.com", reply_tag="untagged"),
+            _row(recipient="c@x.com", reply_tag=None)]
+    result = filter_reachouts(rows, {"reply_tag": "untagged"})
+    assert [r["recipient"] for r in result] == ["b@x.com"]
+
+
+def test_filter_reachouts_by_domain():
+    rows = [_row(recipient="a@acme.com", domain="acme.com"), _row(recipient="b@widgets.com", domain="widgets.com")]
+    result = filter_reachouts(rows, {"domain": "widgets.com"})
+    assert [r["recipient"] for r in result] == ["b@widgets.com"]
+
+
+def test_filter_reachouts_by_req_id_present():
+    rows = [_row(recipient="a@x.com", req_id_present=True), _row(recipient="b@x.com", req_id_present=False)]
+    assert [r["recipient"] for r in filter_reachouts(rows, {"req_id_present": True})] == ["a@x.com"]
+    assert [r["recipient"] for r in filter_reachouts(rows, {"req_id_present": False})] == ["b@x.com"]
+
+
+def test_filter_reachouts_by_date_range():
+    rows = [_row(recipient="early@x.com", date_local="2026-06-01"),
+            _row(recipient="mid@x.com", date_local="2026-06-15"),
+            _row(recipient="late@x.com", date_local="2026-06-30")]
+    result = filter_reachouts(rows, {"date_start": "2026-06-10", "date_end": "2026-06-20"})
+    assert [r["recipient"] for r in result] == ["mid@x.com"]
+
+
+def test_filter_reachouts_by_search_matches_recipient_or_company():
+    rows = [_row(recipient="jane@acme.com", company="Acme"), _row(recipient="bob@widgets.com", company="Widgets Inc")]
+    assert [r["recipient"] for r in filter_reachouts(rows, {"search": "acme"})] == ["jane@acme.com"]
+    assert [r["recipient"] for r in filter_reachouts(rows, {"search": "widgets"})] == ["bob@widgets.com"]
+    assert [r["recipient"] for r in filter_reachouts(rows, {"search": "bob"})] == ["bob@widgets.com"]
+
+
+def test_filter_reachouts_combines_with_and_not_or():
+    rows = [
+        _row(recipient="a@x.com", campaign="coldpost-founder", status="bounced"),
+        _row(recipient="b@x.com", campaign="coldpost-founder", status="active"),
+        _row(recipient="c@x.com", campaign="coldpost-recruiter", status="bounced"),
+    ]
+    result = filter_reachouts(rows, {"campaign": "coldpost-founder", "status": "bounced"})
+    assert [r["recipient"] for r in result] == ["a@x.com"]
+
+
+def test_filter_reachouts_no_match_returns_empty_list():
+    rows = [_row(recipient="a@x.com", campaign="coldpost-founder")]
+    assert filter_reachouts(rows, {"campaign": "coldpost-recruiter"}) == []
+
+
+# --- create_app: /reachouts route --------------------------------------------
+
+def test_create_app_reachouts_empty_state_when_no_recipients(app):
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+        client = app.test_client()
+        resp = client.get("/reachouts")
+    assert resp.status_code == 200
+    assert b"No reach-outs yet" in resp.data
+
+
+def test_create_app_reachouts_renders_rows_across_campaigns(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    _stage_and_send(conn, recipient="jane@acme.com", campaign="coldpost-founder", persona="founder",
+                     company="Acme")
+    _stage_and_send(conn, recipient="bob@widgets.com", campaign="coldpost-recruiter", persona="recruiter")
+    conn.close()
+
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+        client = app.test_client()
+        resp = client.get("/reachouts")
+
+    assert resp.status_code == 200
+    assert b"jane@acme.com" in resp.data
+    assert b"bob@widgets.com" in resp.data
+    assert b"2 of 2 reach-outs shown" in resp.data
+
+
+def test_create_app_reachouts_never_calls_gmass(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    _stage_and_send(conn, recipient="jane@acme.com", campaign="c", persona="recruiter")
+    conn.close()
+
+    with patch("slap.dashboard.gmass.get_reports") as mock_get_reports:
+        client = app.test_client()
+        resp = client.get("/reachouts")
+
+    assert resp.status_code == 200
+    mock_get_reports.assert_not_called()

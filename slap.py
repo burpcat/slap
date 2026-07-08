@@ -244,7 +244,7 @@ def _prep_one_recipient(conn, campaign, consumer_domains, values, recipient, arc
         attachment_path=attachment_path, attachment_name=campaign.attachment_name,
         latex_enabled=campaign.latex_enabled,
         company=values.get("company", ""), role=values.get("role_catted", ""),
-        archive_dir=archive_dir,
+        req_id=values.get("req_id", ""), archive_dir=archive_dir,
     )
     display.success(f"Staged {recipient}.")
 

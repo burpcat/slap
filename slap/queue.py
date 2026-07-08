@@ -27,7 +27,7 @@ MANIFEST_NAME = "staged.json"
 def stage_recipient(conn, *, campaign: str, recipient: str, persona: str, cadence: list,
                      subject: str, body: str, stage_bodies: list,
                      attachment_path: Path, attachment_name: str, latex_enabled: bool,
-                     company: str = "", role: str = "", archive_dir: Path = None,
+                     company: str = "", role: str = "", req_id: str = "", archive_dir: Path = None,
                      when: date = None, workdir_root: Path = WORKDIR_ROOT) -> Path:
     """Write the queued event + staged manifest for one recipient (does not
     send). Returns the recipient's workdir.
@@ -51,7 +51,19 @@ def stage_recipient(conn, *, campaign: str, recipient: str, persona: str, cadenc
     this recipient's staging: a broken/missing archive dir only warns (see
     slap.archive's own docstring), and any unexpected error is caught here
     too, matching the one-recipient-blast-radius guarantee used everywhere
-    else sends can partially fail (e.g. runner.drain)."""
+    else sends can partially fail (e.g. runner.drain).
+
+    `company`/`role`/`req_id` also ride in the `queued` event's `meta`
+    alongside `persona` (the exact precedent already documented in
+    slap.tracking's module docstring: "persona isn't a fixed events column,
+    so it must ride in a queued event's meta ... the caller knows it at
+    queue time"). These are drop-parsed field values that were previously
+    used only for the archive filename and then discarded — persisting them
+    is what makes the dashboard's "Reach-outs" page able to filter/show
+    company and req_id-present at all, since nothing else in the schema
+    tracks them. Additive and backward-compatible: a `queued` event written
+    before this change simply lacks these keys, and every reader treats a
+    missing key as blank/unknown, never a guessed value."""
     workdir = recipient_workdir(campaign, recipient, root=workdir_root)
 
     if latex_enabled:
@@ -77,7 +89,7 @@ def stage_recipient(conn, *, campaign: str, recipient: str, persona: str, cadenc
         display.warn(f"resume archive: unexpected error archiving for {recipient}: {e}")
 
     append_event(conn, type="queued", recipient=recipient, campaign=campaign, stage=0,
-                 meta={"persona": persona})
+                 meta={"persona": persona, "company": company, "role": role, "req_id": req_id})
     return workdir
 
 

@@ -58,6 +58,7 @@
 <p class="synced">
   last synced: {{ sync_result.synced_at | to_local }}
   &middot; +{{ sync_result.new_replies }} replies, +{{ sync_result.new_clicks }} clicks, +{{ sync_result.new_bounces }} bounces this sync
+  &middot; <a href="/reachouts">All reach-outs &rarr;</a>
 </p>
 {% if sync_result.errors %}
 <div class="panel full" style="border-color: var(--critical);">

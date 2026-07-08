@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>slap dashboard — reach-outs</title>
+<style>
+  :root {
+    --surface-1: #fcfcfb; --page: #f9f9f7;
+    --text-primary: #0b0b0b; --text-secondary: #52514e; --text-muted: #898781;
+    --hairline: #e1e0d9; --border: rgba(11,11,11,0.10);
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--page); color: var(--text-primary);
+    margin: 0; padding: 24px; font-size: 14px;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  a.back { color: var(--text-secondary); font-size: 13px; }
+  .count { color: var(--text-muted); font-size: 12px; margin: 8px 0 16px; }
+  .filters {
+    display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end;
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px; margin-bottom: 16px;
+  }
+  .filters .field { display: flex; flex-direction: column; gap: 3px; }
+  .filters label { font-size: 11px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.03em; }
+  .filters select, .filters input {
+    font-size: 13px; padding: 4px 6px; border: 1px solid var(--border); border-radius: 4px;
+    background: white; color: var(--text-primary);
+  }
+  .filters input[type="search"] { min-width: 180px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; background: var(--surface-1);
+          border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--hairline); }
+  th { color: var(--text-secondary); font-weight: 500; cursor: pointer; user-select: none; white-space: nowrap; }
+  th:hover { color: var(--text-primary); }
+  th .arrow { font-size: 10px; color: var(--text-muted); }
+  .muted { color: var(--text-muted); }
+  .empty { color: var(--text-muted); font-style: italic; padding: 16px 0; }
+</style>
+</head>
+<body>
+
+<a class="back" href="/">&larr; back to dashboard</a>
+<h1>Reach-outs</h1>
+
+{% if total_count == 0 %}
+<p class="empty">No reach-outs yet — nothing staged or sent.</p>
+{% else %}
+<p class="count" id="count-line">{{ total_count }} of {{ total_count }} reach-outs shown</p>
+
+<div class="filters">
+  <div class="field">
+    <label for="f-search">Search</label>
+    <input type="search" id="f-search" placeholder="recipient or company">
+  </div>
+  <div class="field">
+    <label for="f-campaign">Campaign</label>
+    <select id="f-campaign">
+      <option value="">Any</option>
+      {% for v in rows | map(attribute='campaign') | reject('none') | unique | sort %}
+      <option value="{{ v }}">{{ v }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label for="f-persona">Persona</label>
+    <select id="f-persona">
+      <option value="">Any</option>
+      {% for v in rows | map(attribute='persona') | reject('none') | unique | sort %}
+      <option value="{{ v }}">{{ v }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label for="f-status">Status</label>
+    <select id="f-status">
+      <option value="">Any</option>
+      {% for v in rows | map(attribute='status') | reject('none') | unique | sort %}
+      <option value="{{ v }}">{{ v }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label for="f-engagement">Engagement</label>
+    <select id="f-engagement">
+      <option value="">Any</option>
+      <option value="replied">Replied</option>
+      <option value="clicked">Clicked, no reply</option>
+      <option value="none">No engagement yet</option>
+    </select>
+  </div>
+  <div class="field">
+    <label for="f-reply-tag">Reply tag</label>
+    <select id="f-reply-tag">
+      <option value="">Any</option>
+      <option value="real">Real</option>
+      <option value="ooo">OOO</option>
+      <option value="not_interested">Not interested</option>
+      <option value="untagged">Untagged</option>
+    </select>
+  </div>
+  <div class="field">
+    <label for="f-domain">Domain</label>
+    <select id="f-domain">
+      <option value="">Any</option>
+      {% for v in rows | map(attribute='domain') | reject('none') | unique | sort %}
+      <option value="{{ v }}">{{ v }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label for="f-req-id">Req ID</label>
+    <select id="f-req-id">
+      <option value="">Any</option>
+      <option value="present">Present</option>
+      <option value="blank">Blank</option>
+    </select>
+  </div>
+  <div class="field">
+    <label for="f-date-start">From</label>
+    <input type="date" id="f-date-start">
+  </div>
+  <div class="field">
+    <label for="f-date-end">To</label>
+    <input type="date" id="f-date-end">
+  </div>
+</div>
+
+<p class="empty" id="no-matches" style="display: none;">No reach-outs match these filters.</p>
+
+<table id="reachouts-table">
+  <thead>
+    <tr>
+      <th data-sort="recipient">Recipient <span class="arrow"></span></th>
+      <th data-sort="company">Company <span class="arrow"></span></th>
+      <th data-sort="campaign">Campaign <span class="arrow"></span></th>
+      <th data-sort="persona">Persona <span class="arrow"></span></th>
+      <th data-sort="status">Status <span class="arrow"></span></th>
+      <th data-sort="engagement">Engagement <span class="arrow"></span></th>
+      <th data-sort="reply-tag">Reply tag <span class="arrow"></span></th>
+      <th data-sort="domain">Domain <span class="arrow"></span></th>
+      <th data-sort="req-id">Req ID <span class="arrow"></span></th>
+      <th data-sort="date">Date <span class="arrow"></span></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+    <tr class="row"
+        data-recipient="{{ r.recipient }}"
+        data-company="{{ r.company }}"
+        data-campaign="{{ r.campaign or '' }}"
+        data-persona="{{ r.persona or '' }}"
+        data-status="{{ r.status or '' }}"
+        data-engagement="{{ r.engagement }}"
+        data-reply-tag="{{ r.reply_tag or '' }}"
+        data-domain="{{ r.domain }}"
+        data-req-id="{{ 'present' if r.req_id_present else 'blank' }}"
+        data-date="{{ r.date_local or '' }}"
+        data-search="{{ (r.recipient ~ ' ' ~ r.company) | lower }}">
+      <td>{{ r.recipient }}</td>
+      <td>{{ r.company if r.company else '—' }}</td>
+      <td>{{ r.campaign or '—' }}</td>
+      <td>{{ r.persona or '—' }}</td>
+      <td>{{ r.status or '—' }}</td>
+      <td>{{ {'replied': 'Replied', 'clicked': 'Clicked, no reply', 'none': 'No engagement yet'}[r.engagement] }}</td>
+      <td>{{ r.reply_tag or '—' }}</td>
+      <td>{{ r.domain }}</td>
+      <td>{{ 'Present' if r.req_id_present else 'Blank' }}</td>
+      <td>{{ r.date | to_local if r.date else '—' }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<script>
+(function () {
+  var table = document.getElementById('reachouts-table');
+  if (!table) return;  // total_count == 0 -- no table/filters rendered at all
+
+  var rows = Array.prototype.slice.call(table.querySelectorAll('tbody tr.row'));
+  var totalCount = rows.length;
+  var countLine = document.getElementById('count-line');
+  var noMatches = document.getElementById('no-matches');
+
+  var filterIds = {
+    search: 'f-search', campaign: 'f-campaign', persona: 'f-persona', status: 'f-status',
+    engagement: 'f-engagement', replyTag: 'f-reply-tag', domain: 'f-domain',
+    reqId: 'f-req-id', dateStart: 'f-date-start', dateEnd: 'f-date-end',
+  };
+  var controls = {};
+  Object.keys(filterIds).forEach(function (key) {
+    controls[key] = document.getElementById(filterIds[key]);
+  });
+
+  // AND-combines every filter dimension, mirroring slap.dashboard.
+  // filter_reachouts()'s exact semantics (see that function's docstring and
+  // tests/test_dashboard.py for the tested, authoritative definition) — an
+  // empty/blank control value means "no constraint," never "match nothing."
+  function matches(row) {
+    var search = controls.search.value.trim().toLowerCase();
+    if (search && row.dataset.search.indexOf(search) === -1) return false;
+    if (controls.campaign.value && row.dataset.campaign !== controls.campaign.value) return false;
+    if (controls.persona.value && row.dataset.persona !== controls.persona.value) return false;
+    if (controls.status.value && row.dataset.status !== controls.status.value) return false;
+    if (controls.engagement.value && row.dataset.engagement !== controls.engagement.value) return false;
+    if (controls.replyTag.value && row.dataset.replyTag !== controls.replyTag.value) return false;
+    if (controls.domain.value && row.dataset.domain !== controls.domain.value) return false;
+    if (controls.reqId.value && row.dataset.reqId !== controls.reqId.value) return false;
+    if (controls.dateStart.value && (!row.dataset.date || row.dataset.date < controls.dateStart.value)) return false;
+    if (controls.dateEnd.value && (!row.dataset.date || row.dataset.date > controls.dateEnd.value)) return false;
+    return true;
+  }
+
+  function applyFilters() {
+    var shown = 0;
+    rows.forEach(function (row) {
+      var visible = matches(row);
+      row.style.display = visible ? '' : 'none';
+      if (visible) shown++;
+    });
+    countLine.textContent = shown + ' of ' + totalCount + ' reach-outs shown';
+    noMatches.style.display = (shown === 0) ? '' : 'none';
+  }
+
+  Object.keys(controls).forEach(function (key) {
+    var el = controls[key];
+    el.addEventListener(el.tagName === 'SELECT' || el.type === 'date' ? 'change' : 'input', applyFilters);
+  });
+
+  // Sorting: click a column header to sort ascending, click again for
+  // descending. Reorders <tr> DOM nodes only — never touches visibility,
+  // so the current filter selection survives a re-sort untouched.
+  var sortState = { key: null, dir: 1 };
+  table.querySelectorAll('th[data-sort]').forEach(function (th) {
+    th.addEventListener('click', function () {
+      var key = th.getAttribute('data-sort');
+      sortState.dir = (sortState.key === key) ? -sortState.dir : 1;
+      sortState.key = key;
+      table.querySelectorAll('th[data-sort] .arrow').forEach(function (a) { a.textContent = ''; });
+      th.querySelector('.arrow').textContent = sortState.dir === 1 ? '▲' : '▼';
+
+      var attr = 'data-' + key;
+      var sorted = rows.slice().sort(function (a, b) {
+        var av = a.getAttribute(attr) || '';
+        var bv = b.getAttribute(attr) || '';
+        if (av < bv) return -sortState.dir;
+        if (av > bv) return sortState.dir;
+        return 0;
+      });
+      var tbody = table.querySelector('tbody');
+      sorted.forEach(function (row) { tbody.appendChild(row); });
+    });
+  });
+
+  applyFilters();
+})();
+</script>
+
+</body>
+</html>
