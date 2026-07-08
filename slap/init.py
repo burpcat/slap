@@ -173,17 +173,17 @@ latex:
 attachment_file: resume.pdf      # used only when latex.enabled is false -- replace this placeholder PDF
 fields:
   - { key: email,        label: Email }
-  - { key: role,         label: Role }
+  - { key: role_catted,  label: Role }
   - { key: company,      label: Company }
   - { key: req_id,       label: Req ID, optional: true }   # inline, e.g. leading space " (Req #1234)" -- blank drops the whole line it's on
   - { key: contact_name, label: Contact name }
   - { key: byebye,       label: Signoff }
 """,
-    "initial.txt": """Subject: {{role}} at {{company}}{{req_id}} -- quick intro
+    "initial.txt": """Subject: {{role_catted}} at {{company}}{{req_id}} -- quick intro
 
 hi {{contact_name}},
 
-I came across the {{role}} role at {{company}} and wanted to reach out directly.
+I came across the {{role_catted}} role at {{company}} and wanted to reach out directly.
 
 <one or two lines on why you're relevant -- keep it short and specific>
 
@@ -193,17 +193,17 @@ Happy to send more detail or get pointed to the right person. Resume attached.
 Your Name
 your-linkedin-or-site-here
 """,
-    "stage1.txt": """Following up in case this got buried -- still interested in {{role}} at {{company}} if there's a fit.
+    "stage1.txt": """Following up in case this got buried -- still interested in {{role_catted}} at {{company}} if there's a fit.
 
 {{byebye}},
 Your Name
 """,
-    "stage2.txt": """Last note on this one -- if {{role}} at {{company}} isn't the right fit anymore, no worries, and thanks for reading either way.
+    "stage2.txt": """Last note on this one -- if {{role_catted}} at {{company}} isn't the right fit anymore, no worries, and thanks for reading either way.
 
 {{byebye}},
 Your Name
 """,
-    "stage3.txt": """One final check-in on {{role}} at {{company}} -- I'll leave it here after this.
+    "stage3.txt": """One final check-in on {{role_catted}} at {{company}} -- I'll leave it here after this.
 
 {{byebye}},
 Your Name
@@ -423,6 +423,11 @@ def step_finish(global_config) -> None:
     display.plain(
         f"\n  Your safe self-test address: {local}+testmass1@{domain} — use this as the Email field "
         f"the first time you run `python slap.py send <campaign>`, so nothing goes to a real lead."
+    )
+    display.plain(
+        "\n  Optional: set RESUME_ARCHIVE_DIR in .env to a folder path and every résumé you send gets "
+        "symlinked there as <company>-<role>-<date>.pdf — one place to browse everything you've ever "
+        "sent. Off by default and never blocks a send either way — see README.md."
     )
     if ok:
         display.success("\ninit complete — all checks passed. You're ready to `python slap.py send <campaign>`.")

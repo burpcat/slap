@@ -63,7 +63,8 @@ time (it asks before overwriting anything real) and walks through:
 8. **Launchd** — prints the generated `.plist` and the exact `cp`/`launchctl load`
    commands to install the unattended runner (see [`LAUNCHD.md`](LAUNCHD.md) for the
    one-time wake-test — this can only be verified on real hardware).
-9. **Finish** — runs the same checks as `doctor` and prints your safe self-test address.
+9. **Finish** — runs the same checks as `doctor`, prints your safe self-test address, and
+   mentions the optional résumé archive (see below).
 
 **Before sending anything real**, test-send to yourself using the `local+testmass1@domain`
 address `init` prints at the end — this guarantees a test send can only ever reach your
@@ -133,13 +134,22 @@ dashboard, deliverability tips). Quick reference:
 | `python slap.py rebuild` | Rebuilds the `recipients` cache table by replaying the full `events` log. Use this if the cache ever looks wrong — `events` is always the source of truth. |
 | `python slap.py runner` | The unattended drain — asks the DB what's queued and due, and sends it. Meant to be triggered by **launchd**, not run by hand day-to-day. See [`LAUNCHD.md`](LAUNCHD.md) for setup and the one-time manual test. Guards itself against `config.yaml`'s `schedule.active_days` — exits without draining on a day that isn't listed. |
 | `python slap.py plist` | Prints the launchd `.plist` for `runner`, generated from the current `config.yaml` (one `StartCalendarInterval` entry per `schedule.active_days` day) — redirect it into `~/Library/LaunchAgents/`. See [`LAUNCHD.md`](LAUNCHD.md). |
-| `python slap.py cleanup [--confirm]` | Deletes stale compiled résumé PDFs for recipients who are done/dead/never replied and have been idle 15+ days. Dry run by default; `--confirm` actually deletes. Never touches `resume.tex`. |
+| `python slap.py cleanup [--confirm]` | Deletes stale compiled résumé PDFs for recipients who are done/dead/never replied and have been idle 15+ days — except one still referenced by a live `RESUME_ARCHIVE_DIR` symlink, which is kept. Dry run by default; `--confirm` actually deletes. Never touches `resume.tex`. |
 
 Typical flow: `send` a few recipients through the interactive prep loop (staging them to
 the queue, not sending yet) → either `send --now` to drain immediately, or let the
 launchd-scheduled `runner` pick them up on its normal daily cadence → check `dashboard`
 periodically for replies and to tag OOO auto-responses (which re-queues the next stage as
 a threaded reply).
+
+## Résumé archive (optional)
+
+Set `RESUME_ARCHIVE_DIR` in `.env` to a folder path and every résumé you send gets
+symlinked there (never copied) as `<company>-<role>-<date>.pdf` — one place to browse
+everything you've ever sent, while the real bytes stay in exactly one place. Off by
+default and never blocks a send — a missing/unwritable folder just warns. `doctor` reports
+its status separately, and `cleanup` won't delete a PDF a live archive symlink still
+points at. See [`USAGE.md`](USAGE.md#résumé-archive-optional) for details.
 
 ## Unattended sending (launchd)
 

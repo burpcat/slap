@@ -62,7 +62,7 @@ attachment_file: resume.pdf       # required when latex.enabled is false; put th
                                    # PDF at campaigns/my-campaign/resume.pdf
 fields:
   - { key: email,          label: Email }
-  - { key: role,           label: Role }
+  - { key: role_catted,    label: Role }
   - { key: company,        label: Company }
   - { key: req_id,         label: Req ID }                       # inline field, see below
   - { key: contact_name,   label: Contact name }
@@ -98,7 +98,7 @@ This distinction matters and is easy to get backwards:
   inline field like `req_id` is to put the punctuation/spacing INSIDE the value itself —
   e.g. type `Req ID:  (Req #4521)` (leading space) in the drop when present, and leave it
   as `Req ID:` (nothing after the colon) when there's no req id — so the template
-  (`{{role}} at {{company}}{{req_id}}`) reads naturally either way with no stray gap.
+  (`{{role_catted}} at {{company}}{{req_id}}`) reads naturally either way with no stray gap.
 - A field marked **`optional: true`** (e.g. `company_signal` above) drops its **entire
   line** from the rendered message when empty — not just the placeholder. Use this when
   the field lives on its own dedicated line (a personalization sentence, a P.S.) that
@@ -188,16 +188,48 @@ confirm it lands and looks right, then you're clear to send to real recipients.
 | `python slap.py list` | Lists every auto-discovered campaign (persona, LaTeX on/off). |
 | `python slap.py send <campaign> [--now]` | The prep flow above. `--now` also drains immediately. |
 | `python slap.py dashboard` | Starts the localhost dashboard at `http://127.0.0.1:5000`. |
-| `python slap.py doctor` | Preflight checks — sender fields, API key, DB, consumer domains file, every campaign's attachment/LaTeX toolchain. Safe to run any time; also runs automatically before every `send` and every drain. |
+| `python slap.py doctor` | Preflight checks — sender fields, API key, DB, consumer domains file, every campaign's attachment/LaTeX toolchain, and (separately, never blocking) `RESUME_ARCHIVE_DIR`'s validity and any dangling symlinks in it. Safe to run any time; the core checks also run automatically before every `send` and every drain. |
 | `python slap.py domains` | Prints a read-only index of who you've contacted, grouped by email domain — for manual inspection. |
 | `python slap.py rebuild` | Rebuilds the `recipients` cache table by replaying the full `events` log from scratch. Use this if the cache ever looks wrong — `events` is always the source of truth, the cache is fully disposable. |
-| `python slap.py cleanup [--confirm] [--min-days-idle N]` | Deletes stale *compiled* résumé PDFs (LaTeX campaigns only) for recipients who are done/dead/never-replied and idle 15+ days by default. Dry run unless you pass `--confirm`. Never touches the `.tex` source. |
+| `python slap.py cleanup [--confirm] [--min-days-idle N]` | Deletes stale *compiled* résumé PDFs (LaTeX campaigns only) for recipients who are done/dead/never-replied and idle 15+ days by default — except a PDF still referenced by a live `RESUME_ARCHIVE_DIR` symlink, which is kept and reported separately. Dry run unless you pass `--confirm`. Never touches the `.tex` source. |
 | `python slap.py runner` | The unattended drain — asks the DB what's queued and due, and sends it. Meant to be fired by **launchd** (see Scheduler below), not run by hand day-to-day. |
 | `python slap.py plist` | Prints the launchd `.plist` for `runner`, generated fresh from your current `config.yaml`. |
 
 Typical day-to-day flow: `send` a few recipients through the interactive prep loop →
 either `--now` or let the scheduled `runner` pick them up → check `dashboard`
 periodically for replies and to tag anything that needs a human decision.
+
+## Résumé archive (optional)
+
+By default, a résumé PDF only lives inside `workdir/<campaign>/<recipient>/` (LaTeX
+campaigns) or `campaigns/<name>/` (static campaigns) — there's no single place to browse
+"every résumé I've ever sent." Set `RESUME_ARCHIVE_DIR` in `.env` to a folder path to turn
+that on:
+
+```
+RESUME_ARCHIVE_DIR=/Users/you/slap-resume-archive
+```
+
+Every time a recipient is staged, `send` drops a **symlink** (never a copy) into that
+folder pointing at the real PDF, named `<company>-<role>-<date>.pdf` (slugified, date =
+the day it was staged). Symlinks, not copies, so there's still exactly one real copy of
+each PDF's bytes on disk — the archive is just a browsable index into files that already
+exist. Re-staging the same recipient doesn't create a duplicate; two different recipients
+that land on the same name (same company/role/day) get `-2`, `-3`, ... appended.
+
+- **Unset, or pointing at a folder that doesn't exist / isn't writable → archiving is
+  simply skipped, with a warning** — it never blocks a send. `doctor` reports
+  `RESUME_ARCHIVE_DIR`'s status and flags any dangling symlink inside it (e.g. after a
+  `cleanup` run reclaimed the file it pointed at) separately from every other check, so a
+  stale archive folder can never fail a `send` or a scheduled drain.
+- **`cleanup` respects the archive**: a PDF `cleanup` would otherwise delete as
+  stale/dead is kept instead if a live archive symlink still points at it, and reported in
+  its own "kept — still referenced by a résumé archive symlink" line rather than being
+  silently deleted out from under the archive.
+- If your campaign's `fields` don't include a field with key `company` and/or
+  `role_catted`, the archive filename just ends up missing that part (with a warning
+  printed) rather than failing — name your fields to match if you want fully descriptive
+  archive filenames.
 
 ## Dashboard + replies
 

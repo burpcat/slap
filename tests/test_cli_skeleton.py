@@ -31,6 +31,17 @@ def run(*args, cwd=None, env=None, input=None):
     full_env.pop("FORCE_COLOR", None)
     full_env.pop("CLICOLOR_FORCE", None)
     full_env["NO_COLOR"] = "1"
+    # Hermetic against a real developer .env: slap.py's own load_dotenv() call
+    # walks UP from slap.py's file location looking for a .env — when tests
+    # run from a worktree nested under the real repo (as they do here), that
+    # walk can find the real, non-test .env and pick up a real
+    # RESUME_ARCHIVE_DIR, silently writing real symlinks into a real folder
+    # outside this test's cwd/tmp_path sandbox. Forcing it blank here (not
+    # popped — python-dotenv's load_dotenv(override=False) only skips a key
+    # ALREADY present in os.environ, and a blank value still counts as
+    # present) makes every subprocess spawned via run() archiving-off by
+    # construction, regardless of what any real .env on this machine says.
+    full_env.setdefault("RESUME_ARCHIVE_DIR", "")
     return subprocess.run(
         [sys.executable, str(SLAP_PY), *args],
         input=input,
@@ -147,6 +158,7 @@ def test_send_never_leaks_ansi_into_the_staged_message_even_with_color_forced(tm
 
     env_with_key = {**os.environ, "GMASS_API_KEY": "fake-key", "FORCE_COLOR": "1"}
     env_with_key.pop("NO_COLOR", None)
+    env_with_key.setdefault("RESUME_ARCHIVE_DIR", "")  # hermetic — see run()'s own comment above
     result = subprocess.run(
         [sys.executable, str(SLAP_PY), "send", "coldpost"],
         input=scripted_stdin, capture_output=True, text=True, cwd=tmp_path, env=env_with_key, timeout=10,
