@@ -15,7 +15,7 @@ send  ──stages──>  queue (SQLite events)  ──drains──>  GMass  �
                                                           │   stopping automatically
                                                           │   on reply
                                                           └─ tracks opens/clicks/
-                                                              replies/bounces
+                                                              replies/bounces/blocks
                                                           │
                                             dashboard  <──┘  (you check status,
                                                               tag replies)
@@ -86,6 +86,18 @@ Key rules, enforced fail-loud by `doctor` and `send`:
   every recipient, never duplicated per recipient.
 - **LaTeX campaigns** (`latex.enabled: true`) compile a fresh, genuinely per-recipient
   résumé at send time — see "The send flow" below.
+- **`{{signature}}`** is available in every template without declaring it in `fields` —
+  see "The shared signature" below.
+
+### The shared signature
+
+Every `initial.txt`/`stageN.txt` can end with `{{signature}}`. Unlike every other
+placeholder, it isn't filled from the pasted drop — it comes from `config.yaml`'s
+`signature:` key, one place shared by every campaign, so your sign-off (name, links,
+whatever else you sign every email with) isn't duplicated and hand-edited across a dozen
+template files. `config.yaml`'s `signature:` key is **required** (missing it fails loud,
+before any preview or send) but can deliberately be set to an empty string `""` if you'd
+rather send with no signature at all.
 
 ### Two kinds of field: inline vs. whole-line-optional
 
@@ -160,8 +172,14 @@ python slap.py send my-campaign
      `consumer_domains.txt` below).
    - Either warning prompts `Proceed anyway? [y/N]` — answer `n` to skip this recipient
      without staging anything.
-4. **Preview** — the exact rendered subject + body, the attachment name, and the cadence
-   about to be applied. Nothing is sent yet.
+   - If the SOFT WARN fires for a **static** (`latex.enabled: false`) campaign and
+     `RESUME_ARCHIVE_DIR` has an archived résumé for that company, `send` also offers to
+     **reuse** it instead of the campaign's default résumé — see "Résumé archive
+     (optional)" below. `0` (or just pressing enter) declines and uses the default; this
+     is an offer, never forced.
+4. **Preview** — the exact rendered subject + body, the attachment name (or which archived
+   résumé you chose to reuse, if you did), and the cadence about to be applied. Nothing is
+   sent yet.
 5. **`Stage this send? [y/N]`** — `y` writes a `queued` event and staged message data to
    `workdir/`; the recipient now sits in the queue until the runner (or `--now`) drains
    it. `n` discards this recipient.
@@ -187,7 +205,7 @@ confirm it lands and looks right, then you're clear to send to real recipients.
 | `python slap.py init` | Interactive installer (config.yaml, .env, schedule, DB, launchd). Re-runnable any time. |
 | `python slap.py list` | Lists every auto-discovered campaign (persona, LaTeX on/off). |
 | `python slap.py send <campaign> [--now]` | The prep flow above. `--now` also drains immediately. |
-| `python slap.py dashboard` | Starts the localhost dashboard at `http://127.0.0.1:5000`. |
+| `python slap.py dashboard` | Starts the localhost dashboard at `http://127.0.0.1:5000`, plus the filterable all-campaigns Reach-outs page at `/reachouts`. |
 | `python slap.py doctor` | Preflight checks — sender fields, API key, DB, consumer domains file, every campaign's attachment/LaTeX toolchain, and (separately, never blocking) `RESUME_ARCHIVE_DIR`'s validity and any dangling symlinks in it. Safe to run any time; the core checks also run automatically before every `send` and every drain. |
 | `python slap.py domains` | Prints a read-only index of who you've contacted, grouped by email domain — for manual inspection. |
 | `python slap.py rebuild` | Rebuilds the `recipients` cache table by replaying the full `events` log from scratch. Use this if the cache ever looks wrong — `events` is always the source of truth, the cache is fully disposable. |
@@ -231,6 +249,28 @@ that land on the same name (same company/role/day) get `-2`, `-3`, ... appended.
   printed) rather than failing — name your fields to match if you want fully descriptive
   archive filenames.
 
+### Résumé reuse (static campaigns only)
+
+With the archive on, `send` offers something extra when the domain SOFT WARN fires (see
+"The send flow" above): a numbered choice of every archived résumé matching that
+company, to reuse for the new recipient instead of the campaign's usual
+`attachment_file`.
+
+- Only offered for **static** (`latex.enabled: false`) campaigns — there's no LaTeX
+  paste/compile loop to skip cleanly for a LaTeX campaign, so this doesn't apply there.
+- The default answer (`0`, or just pressing enter) is **"use the default resume"** — this
+  is an offer, not a nudge toward reusing one.
+- Picking one resolves the archive symlink to its real file, validates it's still a real,
+  non-empty, readable PDF, and copies (never symlinks) it into the new recipient's own
+  workdir — so it stays correct no matter what `cleanup` later does to the *original*
+  recipient's files. A broken pick (the archived file went missing or is unreadable)
+  fails loud for that one recipient only; it never aborts the rest of the batch.
+- The preview says so plainly (`Attachment: reused from <archived-filename>.pdf`) instead
+  of silently swapping in a different file than what the campaign normally sends. The
+  reused résumé still gets its own fresh archive entry under the new send's own
+  company/role/date — two people who got the same résumé content produce two archive
+  entries, one per actual send.
+
 ## Dashboard + replies
 
 ```bash
@@ -255,11 +295,50 @@ Opens `http://127.0.0.1:5000`. Panels, top to bottom:
     GMass's own conversation auto-detection. (GMass usually filters real auto-responders
     itself; this is a manual safety net for the ones that slip through.)
   - **not interested** — pure bookkeeping; stops the row from showing as needing triage.
-- **Bounces** — hard/soft bounces reported back by GMass.
+- **Bounces & blocks** — every delivery failure GMass reports back, tagged **Bounced** or
+  **Blocked**. GMass tracks these as two separate categories (different report endpoints,
+  different reasons) — both are shown here rather than one blended into the other, so a
+  recipient whose mail got blocked by a spam filter doesn't look identical to one whose
+  address just doesn't exist.
 - **Companies contacted** — a rollup by company domain.
 - **Pipeline** — who's mid-sequence at which stage, and what's scheduled to fire today/tomorrow.
 - **Today's runs** — each drain that actually did something today (fired, sent, failed
   counts) — a drain that found nothing queued is omitted as noise.
+
+There's also an **"All reach-outs →"** link at the top — see "Reach-outs (all campaigns,
+filterable)" below.
+
+## Reach-outs (all campaigns, filterable)
+
+```
+http://127.0.0.1:5000/reachouts
+```
+
+A separate, read-only page: one row per recipient across every campaign, filterable and
+sortable, for when you want to slice "everyone I've contacted" by whatever you care about
+that day instead of hunting through per-campaign panels. No reply-tagging here — that
+stays on the main dashboard.
+
+Filter controls (all combine with AND — narrowing by campaign AND status AND date range,
+for instance, not any of them):
+
+- **Campaign, persona, domain** — exact-match dropdowns, built from your actual data.
+- **Status** — `queued` (staged, nothing sent yet), `active` (sent at least once, still
+  mid-sequence), `done`, `replied`, `bounced`, `ooo_requeued`.
+- **Engagement** — replied / clicked-no-reply / no engagement yet.
+- **Reply tag** — real / OOO / not-interested / untagged (untagged means "replied,
+  pending triage" — someone who's never replied at all just won't match any of these).
+- **Req ID** — present vs. blank.
+- **Date range** — two date pickers; matches whichever of "first sent" or "last event"
+  a recipient actually has (a queued-but-never-sent recipient still gets a date).
+- **Search** — free text across recipient email and company name.
+
+A count line ("N of M reach-outs shown") tracks the current filter. Filtering and sorting
+happen instantly in the browser — no page reload, no extra GMass calls; the page only
+reads local data already synced.
+
+**Company and Req ID columns can show blank** for recipients staged before this page's
+underlying data capture existed — never guessed, just genuinely unknown for older sends.
 
 ## Scheduler (launchd)
 

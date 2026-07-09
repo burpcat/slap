@@ -4,8 +4,8 @@ A personal cold job-outreach CLI over the [GMass](https://www.gmass.co/) API. `s
 fills an email template from a pasted "drop" (line-by-line `key: value`), optionally
 compiles a pasted LaTeX résumé and attaches it, then sends via GMass — which relays
 through your own Gmail account and runs the follow-up cadence on GMass's servers.
-Everything sent is tracked in local SQLite, with a localhost dashboard for status and
-reply triage.
+Everything sent is tracked in local SQLite, with a localhost dashboard for status, reply
+triage, and an all-campaigns filterable Reach-outs view.
 
 Single-owner, personal-use tool. Not multi-tenant, not a SaaS product.
 
@@ -70,6 +70,13 @@ time (it asks before overwriting anything real) and walks through:
 address `init` prints at the end — this guarantees a test send can only ever reach your
 own inbox, never a real lead, no matter what campaign you point it at.
 
+**Also fill in `config.yaml`'s `signature:` key** — every campaign template ends with
+`{{signature}}`, filled from this one place instead of being hardcoded per template.
+`init` doesn't prompt for it, so a freshly-scaffolded `config.yaml` only has the
+`config.yaml.example` placeholder text (`<Your Name>` / `<link>`) — edit it before your
+first real send, or that placeholder is exactly what goes out. The key must be present
+(an empty string `""` is a valid, deliberate "no signature" — just not a missing key).
+
 `doctor` (step 9, and re-runnable any time via `python slap.py doctor`) verifies:
 `GMASS_API_KEY` is set, `config.yaml`'s sender fields are filled in, the SQLite tracking
 DB is reachable, and `consumer_domains.txt` is present (it seeds the default
@@ -114,6 +121,10 @@ Every field except `email` is optional per-campaign, but at least one field with
 `stageN.txt`) use `{{key}}` placeholders filled from the pasted drop; a field marked
 `optional: true` that's empty drops its whole line instead of leaving a gap.
 
+Every template can also end with `{{signature}}` — filled from `config.yaml`'s
+`signature:` key (one place, shared by every campaign), not a per-campaign `fields`
+entry. No campaign.yaml declaration needed for it.
+
 The number of `stageN.txt` files must exactly match the chosen persona's cadence length
 (e.g. `recruiter`'s default `[2, 3, 5]` needs `stage1.txt`/`stage2.txt`/`stage3.txt`) —
 `doctor` and `send` both fail loud if it doesn't.
@@ -127,8 +138,8 @@ dashboard, deliverability tips). Quick reference:
 |---|---|
 | `python slap.py init` | Interactive installer — see Setup above. Safe to re-run any time. |
 | `python slap.py list` | Lists every auto-discovered campaign (persona, LaTeX on/off). |
-| `python slap.py send <campaign> [--now]` | Interactive prep: paste a drop, optionally compile/preview a LaTeX résumé, see domain-dedup warnings and a preview, then stage the send to the queue. `--now` also drains the queue immediately afterward instead of waiting for the scheduled runner. |
-| `python slap.py dashboard` | Starts the localhost dashboard at `http://127.0.0.1:5000` — today/week stats, engagement metrics, replies needing triage (tag as real/OOO/not-interested), pipeline, and recent run history. |
+| `python slap.py send <campaign> [--now]` | Interactive prep: paste a drop, optionally compile/preview a LaTeX résumé, see domain-dedup warnings (and, for a static campaign, an offer to reuse an archived résumé) and a preview, then stage the send to the queue. `--now` also drains the queue immediately afterward instead of waiting for the scheduled runner. |
+| `python slap.py dashboard` | Starts the localhost dashboard at `http://127.0.0.1:5000` — today/week stats, engagement metrics, replies needing triage (tag as real/OOO/not-interested), bounces & blocks, pipeline, recent run history, and a link to the all-campaigns **Reach-outs** page (`/reachouts`, filterable, read-only). |
 | `python slap.py doctor` | Preflight checks — see Setup above. Safe to run any time. |
 | `python slap.py domains` | Regenerates and prints a read-only domain index from tracked events (who you've contacted, grouped by email domain) — for manual inspection, not itself a source of truth. |
 | `python slap.py rebuild` | Rebuilds the `recipients` cache table by replaying the full `events` log. Use this if the cache ever looks wrong — `events` is always the source of truth. |
@@ -149,7 +160,13 @@ symlinked there (never copied) as `<company>-<role>-<date>.pdf` — one place to
 everything you've ever sent, while the real bytes stay in exactly one place. Off by
 default and never blocks a send — a missing/unwritable folder just warns. `doctor` reports
 its status separately, and `cleanup` won't delete a PDF a live archive symlink still
-points at. See [`USAGE.md`](USAGE.md#résumé-archive-optional) for details.
+points at.
+
+With the archive on, `send` also offers to **reuse** a previously-sent résumé when the
+domain soft-warn fires (a different person at a company you've already emailed) — for
+static (`latex.enabled: false`) campaigns only. Purely an offer: the default answer is
+"use this campaign's normal resume," never forced. See
+[`USAGE.md`](USAGE.md#résumé-archive-optional) for both features in full.
 
 ## Unattended sending (launchd)
 
