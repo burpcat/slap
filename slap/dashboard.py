@@ -1,20 +1,35 @@
 """Localhost dashboard (Build Order step 11). See SLAP_BUILD_PROMPT.md §8.
 
 sync_reports() is the on-open GMass poll: "Polls GMass reports on open
-(writes new click/reply/bounce events), then renders." Every create_draft()
-call is for exactly one recipient, so a gmass_campaign_id maps 1:1 back to a
-recipient — polling is keyed off every distinct campaign_id this app has
-ever recorded, not a live "list my campaigns" call GMass doesn't offer.
+(writes new click/reply/bounce/block events), then renders." Every
+create_draft() call is for exactly one recipient, so a gmass_campaign_id
+maps 1:1 back to a recipient — polling is keyed off every distinct
+campaign_id this app has ever recorded, not a live "list my campaigns" call
+GMass doesn't offer.
 
-Dedup strategy per report type (none of clicks/bounces carry a stable
+Dedup strategy per report type (none of clicks/bounces/blocks carry a stable
 GMass-issued ID in the verified schema, per CONTROL_SHEET.md):
 - replies: GMass's own `replyId` (stable, verified in the swagger capture).
 - clicks: (url, clickTime) — a recipient clicking the identical link at the
   identical GMass-recorded timestamp twice is not realistically distinct.
-- bounces: (bounceReason, bounceTime) — same reasoning.
+- bounces/blocks: (reason, time) — same reasoning.
 Each already-recorded item's key is reconstructed from that event's own
 `meta` (written using the same field names), so re-polling never re-inserts
 the same real-world item as a second event.
+
+**Bounces vs. blocks (found via real usage — see CONTROL_SHEET.md's
+"missing second bounce" section for the full investigation)**: GMass
+reports these as two entirely separate report categories —
+`/api/reports/{id}/bounces` and `/api/reports/{id}/blocks` — with their own
+reason/time field names (`bounceReason`/`bounceTime` vs.
+`blockReason`/`blockTime`). `_sync_blocks()` polls the second endpoint that
+`_sync_bounces()` alone was silently never covering. Both write the SAME
+`bounce` event type (not a new one) — see `_sync_blocks()`'s own docstring
+for why a genuinely new SQL-level event type was deliberately avoided —
+distinguished only by `meta["category"]` (`"bounce"` or `"block"`), the
+exact same "one event type, a meta discriminator for the sub-category"
+pattern `reply_reviewed`'s `meta["tag"]` already established for
+real/ooo/not_interested.
 """
 from __future__ import annotations
 
@@ -105,6 +120,17 @@ def _sync_clicks(conn, api_key: str, campaign_id, recipient: str, campaign: str)
     return count, None
 
 
+def _bounce_lifecycle_dedup_keys(conn, recipient: str) -> set:
+    """Every (reason, time) pair already recorded for this recipient across
+    BOTH bounces and blocks — they share the same `bounce` event type and
+    the same `bounce_reason`/`bounce_time` meta keys (see module docstring),
+    so one shared dedup set correctly prevents re-inserting either kind
+    twice, with no risk of a bounce and an unrelated block being conflated
+    (their reason/time text never coincidentally matches in practice)."""
+    return {(m["bounce_reason"], m["bounce_time"]) for m in _event_meta_values(conn, recipient, "bounce")
+            if "bounce_reason" in m and "bounce_time" in m}
+
+
 def _sync_bounces(conn, api_key: str, campaign_id, recipient: str, campaign: str):
     try:
         items = gmass.get_reports(api_key, campaign_id, "bounces")
@@ -112,22 +138,64 @@ def _sync_bounces(conn, api_key: str, campaign_id, recipient: str, campaign: str
         return 0, None
     except gmass.GMassError as e:
         return 0, str(e)
-    seen = {(m["bounce_reason"], m["bounce_time"]) for m in _event_meta_values(conn, recipient, "bounce")
-            if "bounce_reason" in m and "bounce_time" in m}
+    seen = _bounce_lifecycle_dedup_keys(conn, recipient)
     count = 0
     for item in items:
         key = (item.get("bounceReason"), item.get("bounceTime"))
         if key in seen:
             continue
         append_event(conn, type="bounce", recipient=recipient, campaign=campaign,
-                     meta={"bounce_reason": item.get("bounceReason"), "bounce_time": item.get("bounceTime")})
+                     meta={"bounce_reason": item.get("bounceReason"), "bounce_time": item.get("bounceTime"),
+                           "category": "bounce"})
+        seen.add(key)
+        count += 1
+    return count, None
+
+
+def _sync_blocks(conn, api_key: str, campaign_id, recipient: str, campaign: str):
+    """The `/blocks` report counterpart to _sync_bounces() — found missing
+    via real usage (the owner saw two delivery failures, the Bounces widget
+    showed only one). GMass reports blocks as an entirely separate category
+    from bounces (separate endpoint, separate `blockReason`/`blockTime`
+    field names — see slap.gmass.REPORT_TYPES, which already listed
+    "blocks" as a valid report type that nothing ever actually polled).
+
+    Writes the SAME `bounce` event type as _sync_bounces() — NOT a new
+    `block` type — deliberately: this app's `events.type` column has a SQL
+    CHECK constraint baked into every already-existing, populated slap.db
+    at table-creation time (see slap/tracking.py's _SCHEMA). Adding a new
+    literal event type would require a real ALTER-TABLE-style migration of
+    every owner's live database (SQLite has no ALTER TABLE ... ADD CHECK
+    VALUE — the only path is a full table rebuild), a live-data-migration
+    risk this fix does not need to take on. A block is functionally a dead-
+    delivery signal for every purpose this app already treats a bounce as
+    one (cleanup eligibility in slap.cleanup, dedup, recipients.status) —
+    reusing `bounce` means zero changes needed anywhere else in the app.
+    `meta["category"] = "block"` (mirroring reply_reviewed's meta["tag"]
+    pattern) is what lets the Bounces widget still show the distinction to
+    the owner instead of silently blending the two — see bounces() below."""
+    try:
+        items = gmass.get_reports(api_key, campaign_id, "blocks")
+    except requests.exceptions.RequestException:
+        return 0, None
+    except gmass.GMassError as e:
+        return 0, str(e)
+    seen = _bounce_lifecycle_dedup_keys(conn, recipient)
+    count = 0
+    for item in items:
+        key = (item.get("blockReason"), item.get("blockTime"))
+        if key in seen:
+            continue
+        append_event(conn, type="bounce", recipient=recipient, campaign=campaign,
+                     meta={"bounce_reason": item.get("blockReason"), "bounce_time": item.get("blockTime"),
+                           "category": "block"})
         seen.add(key)
         count += 1
     return count, None
 
 
 def sync_reports(conn, api_key: str) -> dict:
-    """Poll every known campaign for new replies/clicks/bounces, write
+    """Poll every known campaign for new replies/clicks/bounces/blocks, write
     events for anything not already recorded, and return a summary
     including the UTC "last synced" instant (§8) — convert to local only at
     display time.
@@ -138,7 +206,13 @@ def sync_reports(conn, api_key: str) -> dict:
     API-level problem (bad/expired key, GMass schema drift) raises
     `gmass.GMassError` instead, which is NOT swallowed the same way: it's
     collected into `errors` and surfaced in the dashboard header, so an
-    auth failure doesn't silently look like "nothing new" forever."""
+    auth failure doesn't silently look like "nothing new" forever.
+
+    `new_bounces` combines both _sync_bounces() and _sync_blocks() counts —
+    the top-of-dashboard sync summary just needs "how many new delivery
+    failures arrived," not a sub-category breakdown; the per-recipient
+    bounce/block distinction is what the Bounces widget itself (bounces(),
+    below) surfaces."""
     new_replies = new_clicks = new_bounces = 0
     errors = []
     for row in _all_campaign_ids(conn):
@@ -152,6 +226,10 @@ def sync_reports(conn, api_key: str) -> dict:
         if error:
             errors.append(error)
         count, error = _sync_bounces(conn, api_key, cid, recipient, campaign)
+        new_bounces += count
+        if error:
+            errors.append(error)
+        count, error = _sync_blocks(conn, api_key, cid, recipient, campaign)
         new_bounces += count
         if error:
             errors.append(error)
@@ -464,15 +542,37 @@ def warm_but_silent(conn) -> list:
     return sorted(by_recipient.values(), key=lambda e: e["recipient"])
 
 
+def _latest_bounce_category(conn, recipient: str) -> str:
+    """This recipient's most recent bounce-lifecycle event's category
+    ("bounce" or "block") — matches the same latest-event-wins convention
+    every other "current state" derivation in this app already uses (e.g.
+    reply_tags(), needs_triage()). A pre-existing event recorded before
+    `category` existed (see _sync_bounces()) simply has no such key —
+    defaults to "bounce", never guessed as "block" (the only category that
+    predates this field is real bounces; blocks were never recorded at all
+    until _sync_blocks() shipped, so there's no ambiguity to resolve)."""
+    row = conn.execute(
+        "SELECT meta FROM events WHERE recipient = ? AND type = 'bounce' ORDER BY id DESC LIMIT 1",
+        (recipient,),
+    ).fetchone()
+    if row is None or not row["meta"]:
+        return "bounce"
+    return json.loads(row["meta"]).get("category", "bounce")
+
+
 def bounces(conn) -> list:
-    """Bounced/undeliverable recipients — already recorded in `events` but
-    previously invisible on the dashboard, so a dead address could keep
-    getting silently "followed up" forever with no owner visibility."""
+    """Bounced/blocked/undeliverable recipients — already recorded in
+    `events` but previously invisible on the dashboard, so a dead address
+    could keep getting silently "followed up" forever with no owner
+    visibility. GMass reports bounces and blocks as two separate categories
+    (see module docstring) — both are surfaced here, distinguished by
+    `category` per row, rather than blended into one indistinguishable
+    list."""
     rows = conn.execute(
         "SELECT recipient, campaign, last_event_at FROM recipients "
         "WHERE status = 'bounced' ORDER BY last_event_at DESC"
     ).fetchall()
-    return [dict(r) for r in rows]
+    return [{**dict(r), "category": _latest_bounce_category(conn, r["recipient"])} for r in rows]
 
 
 def companies_contacted(conn, consumer_domains: set, *, today: date = None) -> dict:

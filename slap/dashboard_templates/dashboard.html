@@ -190,20 +190,21 @@
   </div>
 
   <div class="panel">
-    <h2>Bounces</h2>
+    <h2>Bounces &amp; blocks</h2>
     {% if bounces %}
     <table>
-      <tr><th>Recipient</th><th>Campaign</th><th>Last event</th></tr>
+      <tr><th>Recipient</th><th>Campaign</th><th>Type</th><th>Last event</th></tr>
       {% for b in bounces %}
       <tr>
         <td>{{ b.recipient }}</td>
         <td>{{ b.campaign }}</td>
+        <td>{% if b.category == 'block' %}<span class="badge warn">Blocked</span>{% else %}Bounced{% endif %}</td>
         <td>{{ b.last_event_at | to_local }}</td>
       </tr>
       {% endfor %}
     </table>
     {% else %}
-    <p class="empty">No bounces.</p>
+    <p class="empty">No bounces or blocks.</p>
     {% endif %}
   </div>
 

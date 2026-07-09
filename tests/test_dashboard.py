@@ -2,6 +2,7 @@
 on-open poll writes new events; panels render from tracking data;
 reply-tag -> OOO -> re-queue fires a send-as-reply.
 """
+import json
 import threading
 import urllib.error
 import urllib.parse
@@ -110,6 +111,66 @@ def test_sync_reports_dedupes_bounces_by_reason_and_time(conn):
 
     assert r1["new_bounces"] == 1
     assert r2["new_bounces"] == 0
+
+
+def test_sync_reports_records_a_block_that_bounces_alone_would_miss(conn):
+    # Reproduces the actual reported bug: GMass classifies a delivery
+    # failure as a BLOCK (a separate report category/endpoint from
+    # bounces, with its own blockReason/blockTime fields), and the owner
+    # saw it as a real failure but the dashboard never recorded it — because
+    # sync_reports() used to poll only /bounces, never /blocks. If this test
+    # only mocked "bounces" and left "blocks" returning [], it would pass
+    # even with the bug still present — it must return a REAL item for
+    # "blocks" and nothing for "bounces" to actually exercise the gap.
+    seed_sent_recipient(conn, recipient="broutray@redhat.com")
+    with patch("slap.dashboard.gmass.get_reports") as mock_get:
+        def side_effect(api_key, cid, report_type):
+            if report_type == "blocks":
+                return [{"emailAddress": "broutray@redhat.com", "blockReason": "554 rejected", "blockTime": "t1"}]
+            return []  # bounces (and everything else) genuinely empty for this recipient
+        mock_get.side_effect = side_effect
+        result = sync_reports(conn, "fake-key")
+
+    assert result["new_bounces"] == 1  # combined bounce+block counter — see sync_reports()'s docstring
+    events = [dict(r) for r in conn.execute("SELECT * FROM events WHERE type = 'bounce'")]
+    assert len(events) == 1
+    meta = json.loads(events[0]["meta"])
+    assert meta["category"] == "block"
+    assert meta["bounce_reason"] == "554 rejected"
+
+
+def test_sync_reports_dedupes_blocks_by_reason_and_time(conn):
+    seed_sent_recipient(conn)
+    with patch("slap.dashboard.gmass.get_reports") as mock_get:
+        def side_effect(api_key, cid, report_type):
+            if report_type == "blocks":
+                return [{"emailAddress": "jane@acme.com", "blockReason": "security policy", "blockTime": "t1"}]
+            return []
+        mock_get.side_effect = side_effect
+        r1 = sync_reports(conn, "fake-key")
+        r2 = sync_reports(conn, "fake-key")
+
+    assert r1["new_bounces"] == 1
+    assert r2["new_bounces"] == 0
+
+
+def test_sync_reports_records_both_a_bounce_and_a_block_for_different_recipients(conn):
+    seed_sent_recipient(conn, recipient="bounced@x.com", campaign_id="1")
+    seed_sent_recipient(conn, recipient="blocked@x.com", campaign_id="2")
+    with patch("slap.dashboard.gmass.get_reports") as mock_get:
+        def side_effect(api_key, cid, report_type):
+            if cid == "1" and report_type == "bounces":
+                return [{"emailAddress": "bounced@x.com", "bounceReason": "mailbox full", "bounceTime": "t1"}]
+            if cid == "2" and report_type == "blocks":
+                return [{"emailAddress": "blocked@x.com", "blockReason": "spam policy", "blockTime": "t2"}]
+            return []
+        mock_get.side_effect = side_effect
+        result = sync_reports(conn, "fake-key")
+
+    assert result["new_bounces"] == 2
+    events = {r["recipient"]: json.loads(r["meta"])["category"]
+              for r in conn.execute("SELECT recipient, meta FROM events WHERE type = 'bounce'")}
+    assert events == {"bounced@x.com": "bounce", "blocked@x.com": "block"}
 
 
 def test_sync_reports_distinguishes_different_clicks(conn):
@@ -223,7 +284,7 @@ def test_sync_reports_surfaces_gmass_api_errors_without_crashing(conn):
         result = sync_reports(conn, "fake-key")
 
     assert result["new_replies"] == 1  # fine@acme.com's reply still got recorded
-    assert len(result["errors"]) == 3  # one per report type (replies/clicks/bounces) polled for cid=1
+    assert len(result["errors"]) == 4  # one per report type (replies/clicks/bounces/blocks) polled for cid=1
     assert any("401" in e for e in result["errors"])
 
 
@@ -632,6 +693,36 @@ def test_bounces_excludes_non_bounced_recipients(conn):
     append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
     append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=0)
     assert bounces(conn) == []
+
+
+def test_bounces_distinguishes_bounce_from_block_category(conn):
+    # The widget must not blend the two into an indistinguishable list —
+    # each row reports which GMass category it actually was.
+    append_event(conn, type="queued", recipient="bounced@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter"})
+    append_event(conn, type="bounce", recipient="bounced@x.com", campaign="c",
+                 meta={"bounce_reason": "mailbox full", "bounce_time": "t1", "category": "bounce"})
+
+    append_event(conn, type="queued", recipient="blocked@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter"})
+    append_event(conn, type="bounce", recipient="blocked@x.com", campaign="c",
+                 meta={"bounce_reason": "spam policy", "bounce_time": "t2", "category": "block"})
+
+    result = {r["recipient"]: r["category"] for r in bounces(conn)}
+    assert result == {"bounced@x.com": "bounce", "blocked@x.com": "block"}
+
+
+def test_bounces_defaults_category_to_bounce_for_pre_existing_events_without_it(conn):
+    # Backward compatibility: a bounce event recorded before `category`
+    # existed (e.g. the real, already-recorded gmccormick@expediagroup.com
+    # event this investigation started from) has no such meta key at all —
+    # must default to "bounce", never crash, never guess "block".
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter"})
+    append_event(conn, type="bounce", recipient="a@x.com", campaign="c",
+                 meta={"bounce_reason": "mailbox full", "bounce_time": "t1"})  # no "category" key
+    result = bounces(conn)
+    assert result[0]["category"] == "bounce"
 
 
 def test_companies_contacted_counts_distinct_non_consumer_domains(conn):
