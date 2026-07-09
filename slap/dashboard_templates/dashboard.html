@@ -47,6 +47,8 @@
     border: 1px solid var(--border); background: var(--surface-1); cursor: pointer;
   }
   button.tag-btn:hover { background: var(--hairline); }
+  input.ooo-date { font-size: 12px; padding: 2px 4px; margin-right: 4px; border: 1px solid var(--border);
+                   border-radius: 4px; }
   .empty { color: var(--text-muted); font-style: italic; }
   ul.plain { list-style: none; padding: 0; margin: 0; }
   ul.plain li { padding: 3px 0; }
@@ -176,8 +178,11 @@
         </td>
         <td>
           <form class="tag-form" method="post" action="/reply/{{ r.recipient }}/tag">
+            <input type="hidden" name="redirect_to" value="index">
             <button class="tag-btn" name="tag" value="real">Real</button>
-            <button class="tag-btn" name="tag" value="ooo">OOO</button>
+            <input type="date" name="resume_date" class="ooo-date" title="Return date (required for OOO)">
+            <button class="tag-btn" name="tag" value="ooo"
+                    onclick="return confirm('Mark {{ r.recipient }} OOO? This permanently suppresses their GMass follow-ups account-wide (every campaign, not just this one) and needs a return date entered above.');">OOO</button>
             <button class="tag-btn" name="tag" value="not_interested">Not interested</button>
           </form>
         </td>

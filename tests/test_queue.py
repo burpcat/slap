@@ -1,9 +1,12 @@
 """Queue staging tests (Build Order step 9), per SLAP_BUILD_PROMPT.md §13 B:
 send stages without firing. Also covers OOO re-queue tagging (step 10, §7).
 """
+import json
 from datetime import date
 
-from slap.queue import due_for_ooo_resend, due_recipients, load_manifest, stage_recipient, tag_ooo
+from slap.queue import (
+    _pending_ooo_resume_date, due_for_ooo_resend, due_recipients, load_manifest, stage_recipient, tag_ooo,
+)
 from slap.tracking import append_event, connect
 
 
@@ -195,7 +198,7 @@ def test_tag_ooo_writes_ooo_tagged_event_with_campaign_from_cache(tmp_path):
     conn = connect(tmp_path / "test.db")
     append_event(conn, type="queued", recipient="a@x.com", campaign="c1", stage=0,
                  meta={"persona": "recruiter"})
-    tag_ooo(conn, "a@x.com")
+    tag_ooo(conn, "a@x.com", date.today())
     events = [dict(r) for r in conn.execute("SELECT * FROM events WHERE type = 'ooo_tagged'")]
     assert len(events) == 1
     assert events[0]["campaign"] == "c1"
@@ -205,7 +208,7 @@ def test_tag_ooo_sets_status_ooo_requeued(tmp_path):
     conn = connect(tmp_path / "test.db")
     append_event(conn, type="queued", recipient="a@x.com", campaign="c1", stage=0,
                  meta={"persona": "recruiter"})
-    tag_ooo(conn, "a@x.com")
+    tag_ooo(conn, "a@x.com", date.today())
     row = conn.execute("SELECT status FROM recipients WHERE recipient = ?", ("a@x.com",)).fetchone()
     assert row["status"] == "ooo_requeued"
 
@@ -219,7 +222,7 @@ def test_due_for_ooo_resend_includes_tagged_recipient(tmp_path):
     conn = connect(tmp_path / "test.db")
     append_event(conn, type="queued", recipient="a@x.com", campaign="c1", stage=0,
                  meta={"persona": "recruiter"})
-    tag_ooo(conn, "a@x.com")
+    tag_ooo(conn, "a@x.com", date.today())
     assert [r["recipient"] for r in due_for_ooo_resend(conn)] == ["a@x.com"]
 
 
@@ -227,7 +230,7 @@ def test_due_for_ooo_resend_excludes_recipient_after_successful_requeue(tmp_path
     conn = connect(tmp_path / "test.db")
     append_event(conn, type="queued", recipient="a@x.com", campaign="c1", stage=0,
                  meta={"persona": "recruiter"})
-    tag_ooo(conn, "a@x.com")
+    tag_ooo(conn, "a@x.com", date.today())
     append_event(conn, type="requeued", recipient="a@x.com", campaign="c1", stage=1,
                  gmass_campaign_id="1")
     assert due_for_ooo_resend(conn) == []
@@ -237,10 +240,211 @@ def test_due_for_ooo_resend_still_includes_recipient_after_failed_resend(tmp_pat
     conn = connect(tmp_path / "test.db")
     append_event(conn, type="queued", recipient="a@x.com", campaign="c1", stage=0,
                  meta={"persona": "recruiter"})
-    tag_ooo(conn, "a@x.com")
+    tag_ooo(conn, "a@x.com", date.today())
     append_event(conn, type="send_failed", recipient="a@x.com", campaign="c1",
                  meta={"error": "boom"})
     assert [r["recipient"] for r in due_for_ooo_resend(conn)] == ["a@x.com"]
+
+
+# --- manual OOO-pause date gating (post-launch feature) ---------------------
+# Core requirement: tag_ooo is callable for ANY recipient at ANY time (no
+# reply/engagement precondition), and due_for_ooo_resend must hold off until
+# the owner-chosen resume_date arrives -- unlike the original reply-detected
+# recovery, which resent on the very next drain with no wait at all.
+
+def test_tag_ooo_writes_resume_date_in_meta(tmp_path):
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c1", stage=0,
+                 meta={"persona": "recruiter"})
+    tag_ooo(conn, "a@x.com", date(2026, 8, 1))
+    row = conn.execute("SELECT meta FROM events WHERE type = 'ooo_tagged'").fetchone()
+    assert json.loads(row["meta"]) == {"resume_date": "2026-08-01"}
+
+
+def test_tag_ooo_callable_with_no_prior_reply_or_engagement_at_all(tmp_path):
+    # The whole point of the manual-OOO-pause feature: markable even when
+    # SLAP never saw a reply (the OOO notice arrived somewhere else
+    # entirely). No 'reply' event anywhere in this recipient's history.
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c1", stage=0,
+                 meta={"persona": "recruiter"})
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c1", stage=0, gmass_campaign_id="1")
+    tag_ooo(conn, "a@x.com", date(2026, 8, 1))  # no reply, no click, nothing -- still works
+    row = conn.execute("SELECT status FROM recipients WHERE recipient = ?", ("a@x.com",)).fetchone()
+    assert row["status"] == "ooo_requeued"
+
+
+def test_due_for_ooo_resend_excludes_recipient_before_resume_date(tmp_path):
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c1", stage=0,
+                 meta={"persona": "recruiter"})
+    tag_ooo(conn, "a@x.com", date(2026, 8, 10))
+    assert due_for_ooo_resend(conn, today=date(2026, 8, 9)) == []
+
+
+def test_due_for_ooo_resend_includes_recipient_exactly_on_resume_date(tmp_path):
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c1", stage=0,
+                 meta={"persona": "recruiter"})
+    tag_ooo(conn, "a@x.com", date(2026, 8, 10))
+    assert [r["recipient"] for r in due_for_ooo_resend(conn, today=date(2026, 8, 10))] == ["a@x.com"]
+
+
+def test_due_for_ooo_resend_includes_recipient_after_resume_date(tmp_path):
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c1", stage=0,
+                 meta={"persona": "recruiter"})
+    tag_ooo(conn, "a@x.com", date(2026, 8, 10))
+    assert [r["recipient"] for r in due_for_ooo_resend(conn, today=date(2026, 8, 20))] == ["a@x.com"]
+
+
+def test_due_for_ooo_resend_treats_missing_resume_date_as_immediately_due(tmp_path):
+    # An ooo_tagged event written before this feature existed (no meta at
+    # all) must behave exactly like the ORIGINAL reply-detected recovery --
+    # due on the very next drain, never silently stuck waiting forever.
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c1", stage=0,
+                 meta={"persona": "recruiter"})
+    append_event(conn, type="ooo_tagged", recipient="a@x.com", campaign="c1")  # no meta
+    assert [r["recipient"] for r in due_for_ooo_resend(conn, today=date(2020, 1, 1))] == ["a@x.com"]
+
+
+def test_pending_ooo_resume_date_none_for_normal_recipient_with_no_ooo_history(tmp_path):
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c1", stage=0,
+                 meta={"persona": "recruiter"})
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c1", stage=0, gmass_campaign_id="1")
+    assert _pending_ooo_resume_date(conn, "a@x.com", "c1") is None
+
+
+def test_pending_ooo_resume_date_reads_next_resume_date_from_requeued_meta(tmp_path):
+    # Simulates the auto-continuation state _send_ooo_resend produces when
+    # more stages remain (see slap.runner._send_ooo_resend) -- a `requeued`
+    # event carrying next_resume_date, NOT a fresh ooo_tagged.
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c1", stage=0,
+                 meta={"persona": "recruiter"})
+    tag_ooo(conn, "a@x.com", date(2026, 8, 1))
+    append_event(conn, type="requeued", recipient="a@x.com", campaign="c1", stage=1,
+                 gmass_campaign_id="1", meta={"next_resume_date": "2026-08-04"})
+    assert _pending_ooo_resume_date(conn, "a@x.com", "c1") == date(2026, 8, 4)
+
+
+def test_pending_ooo_resume_date_none_when_requeued_has_no_next_resume_date(tmp_path):
+    # Final-stage resend -- sequence exhausted, nothing left pending.
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c1", stage=0,
+                 meta={"persona": "recruiter"})
+    tag_ooo(conn, "a@x.com", date(2026, 8, 1))
+    append_event(conn, type="requeued", recipient="a@x.com", campaign="c1", stage=1, gmass_campaign_id="1")
+    assert _pending_ooo_resume_date(conn, "a@x.com", "c1") is None
+
+
+def test_fresh_manual_ooo_retag_overrides_a_pending_auto_continuation(tmp_path):
+    # A FRESH owner-driven re-tag is always the latest event and must
+    # override whatever next_resume_date an in-progress auto-continuation
+    # had already scheduled -- "any recipient, any time" includes overriding
+    # SLAP's own auto-computed schedule.
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c1", stage=0,
+                 meta={"persona": "recruiter"})
+    tag_ooo(conn, "a@x.com", date(2026, 8, 1))
+    append_event(conn, type="requeued", recipient="a@x.com", campaign="c1", stage=1,
+                 gmass_campaign_id="1", meta={"next_resume_date": "2026-08-04"})
+    tag_ooo(conn, "a@x.com", date(2026, 8, 2))  # owner overrides with an earlier date
+    assert _pending_ooo_resume_date(conn, "a@x.com", "c1") == date(2026, 8, 2)
+
+
+def test_due_for_ooo_resend_includes_active_status_continuation_recipient_once_due(tmp_path):
+    # After ONE stage of a multi-stage OOO pause fires, status flips back to
+    # 'active' (requeued's existing, unchanged cache handler) even though
+    # another stage is still pending -- due_for_ooo_resend must still find
+    # them via the pending next_resume_date, not via status alone.
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c1", stage=0,
+                 meta={"persona": "recruiter"})
+    tag_ooo(conn, "a@x.com", date(2026, 8, 1))
+    append_event(conn, type="requeued", recipient="a@x.com", campaign="c1", stage=1,
+                 gmass_campaign_id="1", meta={"next_resume_date": "2026-08-04"})
+    row = conn.execute("SELECT status FROM recipients WHERE recipient = ?", ("a@x.com",)).fetchone()
+    assert row["status"] == "active"  # sanity: confirms this is testing the 'active' branch
+    assert due_for_ooo_resend(conn, today=date(2026, 8, 3)) == []
+    assert [r["recipient"] for r in due_for_ooo_resend(conn, today=date(2026, 8, 4))] == ["a@x.com"]
+
+
+def test_pending_ooo_resume_date_is_campaign_scoped_not_recipient_wide(tmp_path):
+    # iron-audit BLOCKER fix: a recipient's dangling OOO continuation for an
+    # OLD campaign must never resume against a NEW campaign they've since
+    # been re-staged into (a supported flow -- the dedup hard-warn only
+    # warns, never blocks re-contacting the same person). Without
+    # campaign-scoping, this would silently cross-contaminate: the new
+    # campaign's stage body sent threaded into the old campaign's Gmail
+    # conversation, alongside a normal initial send in the same drain.
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="queued", recipient="a@x.com", campaign="old-campaign", stage=0,
+                 meta={"persona": "recruiter"})
+    tag_ooo(conn, "a@x.com", date(2026, 8, 1))
+    append_event(conn, type="requeued", recipient="a@x.com", campaign="old-campaign", stage=1,
+                 gmass_campaign_id="1", meta={"next_resume_date": "2026-08-04"})
+    # Re-staged into a brand new campaign before the continuation resolves.
+    append_event(conn, type="queued", recipient="a@x.com", campaign="new-campaign", stage=0,
+                 meta={"persona": "founder"})
+
+    # The dangling old-campaign continuation must be invisible now -- it can
+    # never resume against a campaign it was never paused for.
+    assert _pending_ooo_resume_date(conn, "a@x.com", "new-campaign") is None
+    assert due_for_ooo_resend(conn, today=date(2026, 8, 4)) == []
+    # The OLD campaign's own pending date is still there if queried directly
+    # (nothing corrupted) -- it's simply orphaned now that recipients.campaign
+    # has moved on, exactly like the recipients cache's own one-row-per-
+    # recipient grain already treats a re-staged recipient elsewhere.
+    assert _pending_ooo_resume_date(conn, "a@x.com", "old-campaign") == date(2026, 8, 4)
+
+
+def test_due_for_ooo_resend_never_overlaps_due_recipients_after_a_restage(tmp_path):
+    # The actual double-send scenario the campaign-scoping fix closes: a
+    # re-staged recipient must appear in due_recipients() (fresh initial send
+    # due) but NEVER ALSO in due_for_ooo_resend() in the same drain.
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="queued", recipient="a@x.com", campaign="old-campaign", stage=0,
+                 meta={"persona": "recruiter"})
+    tag_ooo(conn, "a@x.com", date(2026, 8, 1))
+    append_event(conn, type="requeued", recipient="a@x.com", campaign="old-campaign", stage=1,
+                 gmass_campaign_id="1", meta={"next_resume_date": "2026-08-04"})
+    append_event(conn, type="queued", recipient="a@x.com", campaign="new-campaign", stage=0,
+                 meta={"persona": "founder"})
+
+    assert [r["recipient"] for r in due_recipients(conn)] == ["a@x.com"]
+    assert due_for_ooo_resend(conn, today=date(2026, 8, 4)) == []
+
+
+def test_transient_send_failed_does_not_close_a_pending_ooo_resend(tmp_path):
+    # Mirrors due_recipients()'s own convention: a transient failed attempt
+    # stays due for retry on the next drain -- only the specific
+    # "ooo_cadence_exhausted" reason is terminal (see the next test).
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c1", stage=0,
+                 meta={"persona": "recruiter"})
+    tag_ooo(conn, "a@x.com", date(2026, 8, 1))
+    append_event(conn, type="send_failed", recipient="a@x.com", campaign="c1",
+                 meta={"stage": "create_draft_ooo", "error": "boom"})
+    assert _pending_ooo_resume_date(conn, "a@x.com", "c1") == date(2026, 8, 1)
+
+
+def test_ooo_cadence_exhausted_send_failed_permanently_closes_the_pending_resend(tmp_path):
+    # iron-audit SHOULD-FIX: without this discriminator, a recipient marked
+    # OOO with nothing left to resend (e.g. a single-stage persona, or
+    # already at their final stage -- newly reachable via the unconditional
+    # Mark OOO action) would generate an identical send_failed on every
+    # single future drain, forever.
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c1", stage=0,
+                 meta={"persona": "recruiter"})
+    tag_ooo(conn, "a@x.com", date(2026, 8, 1))
+    append_event(conn, type="send_failed", recipient="a@x.com", campaign="c1",
+                 meta={"stage": "ooo_cadence_exhausted", "error": "no next stage"})
+    assert _pending_ooo_resume_date(conn, "a@x.com", "c1") is None
+    assert due_for_ooo_resend(conn, today=date(2099, 1, 1)) == []
 
 
 # --- résumé archive integration (post-launch feature) -----------------------

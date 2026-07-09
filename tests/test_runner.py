@@ -71,17 +71,19 @@ def fake_gmass(draft_id="r-fake", campaign_id=999, create_fails=False, send_fail
     return create_draft_fn, send_campaign_fn, calls
 
 
-def send_reply_and_tag_ooo(conn, tmp_path, recipient="jane@acme.com", cadence=None):
+def send_reply_and_tag_ooo(conn, tmp_path, recipient="jane@acme.com", cadence=None, resume_date=None):
     """Sets up the precondition for an OOO resend test: stage -> real drain
     (so first_sent_at/last_gmass_campaign_id are genuinely populated, not
-    hand-inserted) -> reply -> tag_ooo. Returns the sent campaign_id."""
+    hand-inserted) -> reply -> tag_ooo. resume_date defaults to today (due
+    immediately), matching this helper's pre-date-gating behavior. Returns
+    the sent campaign_id."""
     stage_one(conn, tmp_path, recipient=recipient, cadence=cadence)
     create_fn, send_fn, _ = fake_gmass(campaign_id=555)
     gc = make_global_config(tmp_path)
     drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
           create_draft_fn=create_fn, send_campaign_fn=send_fn)
     append_event(conn, type="reply", recipient=recipient, campaign="c")
-    tag_ooo(conn, recipient)
+    tag_ooo(conn, recipient, resume_date or date.today())
     return 555
 
 
@@ -724,7 +726,7 @@ def test_ooo_resend_exhausted_cadence_does_not_crash_drain(conn, tmp_path):
     append_event(conn, type="requeued", recipient="exhausted@acme.com", campaign="c",
                  stage=1, gmass_campaign_id="1")  # current_stage now 1 == len(cadence)
     append_event(conn, type="reply", recipient="exhausted@acme.com", campaign="c")
-    tag_ooo(conn, "exhausted@acme.com")  # tagged again — but nothing left to resend
+    tag_ooo(conn, "exhausted@acme.com", date.today())  # tagged again — but nothing left to resend
 
     stage_one(conn, tmp_path, recipient="fine@acme.com")  # a normal recipient in the same batch
     gc = make_global_config(tmp_path)
@@ -779,7 +781,7 @@ def test_due_for_ooo_resend_repeats_across_multiple_ooo_cycles(conn, tmp_path):
 
     # Reply again, tag OOO again — should now target stage 2.
     append_event(conn, type="reply", recipient="jane@acme.com", campaign="c")
-    tag_ooo(conn, "jane@acme.com")
+    tag_ooo(conn, "jane@acme.com", date.today())
 
     captured = {}
 
@@ -802,3 +804,240 @@ def test_due_for_ooo_resend_repeats_across_multiple_ooo_cycles(conn, tmp_path):
     assert captured["campaign_settings"]["campaignIdToReplyTo"] == 777
     row = conn.execute("SELECT * FROM recipients WHERE recipient = ?", ("jane@acme.com",)).fetchone()
     assert row["current_stage"] == 2
+
+
+# --- manual OOO-pause: date-gated resend + auto-continuation (post-launch) --
+# GMass's native follow-up timer is permanently suppressed (account-wide
+# unsubscribe, at mark-OOO time — see slap.dashboard.tag_reply) the moment a
+# recipient is first marked OOO, so SLAP itself must now own EVERY remaining
+# stage's timing, not just fire one resend and stop. These tests check the
+# actual scheduling behavior end to end via real drain() calls with a fixed
+# `now`, not just that due_for_ooo_resend()'s query returns the right rows in
+# isolation (already covered in test_queue.py).
+
+def test_send_ooo_resend_schedules_next_resume_date_when_stages_remain(conn, tmp_path):
+    # recruiter cadence [2, 3, 5] — resending stage 1 (index 0) leaves stages
+    # 2 and 3 remaining, so the next resend must be scheduled.
+    send_reply_and_tag_ooo(conn, tmp_path, resume_date=date(2026, 8, 1))
+    create_fn, send_fn, _ = fake_gmass(campaign_id=777)
+    gc = make_global_config(tmp_path)
+    drain(conn, gc, "fake-key", now=date(2026, 8, 1), sleep_fn=lambda s: None,
+          workdir_root=tmp_path / "workdir", create_draft_fn=create_fn, send_campaign_fn=send_fn)
+
+    row = conn.execute(
+        "SELECT meta FROM events WHERE recipient = 'jane@acme.com' AND type = 'requeued' "
+        "ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    meta = json.loads(row["meta"])
+    # cadence[1] (the gap INTO stage 2) = 3 days, anchored to `now`, not to
+    # the recipient's original first_sent_at schedule.
+    assert meta == {"next_resume_date": "2026-08-04"}
+
+
+def test_send_ooo_resend_no_next_resume_date_on_final_stage(conn, tmp_path):
+    # A single-stage persona — the one resend IS the final stage.
+    send_reply_and_tag_ooo(conn, tmp_path, cadence=[2], resume_date=date(2026, 8, 1))
+    create_fn, send_fn, _ = fake_gmass(campaign_id=777)
+    gc = make_global_config(tmp_path)
+    drain(conn, gc, "fake-key", now=date(2026, 8, 1), sleep_fn=lambda s: None,
+          workdir_root=tmp_path / "workdir", create_draft_fn=create_fn, send_campaign_fn=send_fn)
+
+    row = conn.execute(
+        "SELECT meta FROM events WHERE recipient = 'jane@acme.com' AND type = 'requeued' "
+        "ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert row["meta"] is None
+    assert due_for_ooo_resend(conn, today=date(2099, 1, 1)) == []  # never due again
+
+
+def test_drain_skips_ooo_paused_recipient_before_resume_date(conn, tmp_path):
+    # The actual behavior check the task demands: attempt a real drain
+    # inside the pause window and confirm nothing fires — not just that a
+    # flag/query looks right in isolation.
+    send_reply_and_tag_ooo(conn, tmp_path, resume_date=date(2026, 8, 10))
+    create_fn, send_fn, calls = fake_gmass(campaign_id=777)
+    gc = make_global_config(tmp_path)
+    result = drain(conn, gc, "fake-key", now=date(2026, 8, 5), sleep_fn=lambda s: None,
+                    workdir_root=tmp_path / "workdir", create_draft_fn=create_fn, send_campaign_fn=send_fn)
+
+    assert calls["create"] == 0
+    assert calls["send"] == 0
+    assert result.sent == 0
+    types = [dict(r)["type"] for r in conn.execute(
+        "SELECT type FROM events WHERE recipient = 'jane@acme.com' ORDER BY id")]
+    assert "requeued" not in types  # still paused, nothing fired
+
+
+def test_drain_fires_ooo_paused_recipient_exactly_on_resume_date(conn, tmp_path):
+    send_reply_and_tag_ooo(conn, tmp_path, resume_date=date(2026, 8, 10))
+    create_fn, send_fn, calls = fake_gmass(campaign_id=777)
+    gc = make_global_config(tmp_path)
+    result = drain(conn, gc, "fake-key", now=date(2026, 8, 10), sleep_fn=lambda s: None,
+                    workdir_root=tmp_path / "workdir", create_draft_fn=create_fn, send_campaign_fn=send_fn)
+
+    assert calls["send"] == 1
+    assert result.sent == 1
+
+
+def test_drain_dispatches_active_status_continuation_recipient_to_ooo_resend(conn, tmp_path):
+    # Regression guard for a real routing bug this feature introduced and
+    # fixed: drain() used to pick _send_one vs _send_ooo_resend based on
+    # row["status"] == "ooo_requeued", but a mid-continuation recipient has
+    # status='active' (requeued's existing handler, unchanged) while still
+    # being due for an OOO resend, not a fresh initial send. Dispatch must
+    # be tagged by which due-list a row came from instead.
+    send_reply_and_tag_ooo(conn, tmp_path, resume_date=date(2026, 8, 1))
+    create_fn1, send_fn1, _ = fake_gmass(campaign_id=777)
+    gc = make_global_config(tmp_path)
+    drain(conn, gc, "fake-key", now=date(2026, 8, 1), sleep_fn=lambda s: None,
+          workdir_root=tmp_path / "workdir", create_draft_fn=create_fn1, send_campaign_fn=send_fn1)
+    row = conn.execute("SELECT status FROM recipients WHERE recipient = ?", ("jane@acme.com",)).fetchone()
+    assert row["status"] == "active"  # confirms we're testing the vulnerable state
+
+    captured = {}
+
+    def create_draft_fn2(api_key, *, recipient, subject, message, attachment=None):
+        captured["attachment"] = attachment
+        return {"draft_id": "r-2", "raw": {}}
+
+    def send_campaign_fn2(api_key, draft_id, *, campaign_settings):
+        captured["campaign_settings"] = campaign_settings
+        return {"campaign_id": 888, "raw": {}}
+
+    # Second stage due 2026-08-04 (cadence[1] = 3 days after the first resend).
+    drain(conn, gc, "fake-key", now=date(2026, 8, 4), sleep_fn=lambda s: None,
+          workdir_root=tmp_path / "workdir", create_draft_fn=create_draft_fn2, send_campaign_fn=send_campaign_fn2)
+
+    # Proof it went through _send_ooo_resend, not _send_one: a threaded
+    # reply (sendAsReply, no attachment) — _send_one would attach the résumé
+    # and never set sendAsReply at all.
+    assert captured["attachment"] is None
+    assert captured["campaign_settings"]["sendAsReply"] is True
+    types = [dict(r)["type"] for r in conn.execute(
+        "SELECT type FROM events WHERE recipient = 'jane@acme.com' ORDER BY id")]
+    assert types.count("requeued") == 2
+    assert "sent" not in types[types.index("requeued"):]  # never mistakenly re-ran the initial send
+
+
+def test_multi_stage_ooo_pause_fires_on_correct_dates_across_full_persona_cadence(conn, tmp_path):
+    # Full end-to-end integration: recruiter cadence [2, 3, 5]. Mark OOO with
+    # resume_date=Aug 1. Expected fire dates: stage 1 on Aug 1 (the owner's
+    # own chosen date, overriding whatever the original schedule would have
+    # been), stage 2 on Aug 1 + cadence[1]=3 -> Aug 4, stage 3 on
+    # Aug 4 + cadence[2]=5 -> Aug 9. Every other day, drain must do nothing
+    # for this recipient.
+    send_reply_and_tag_ooo(conn, tmp_path, resume_date=date(2026, 8, 1))
+    gc = make_global_config(tmp_path)
+
+    def drain_on(d, campaign_id):
+        create_fn, send_fn, calls = fake_gmass(campaign_id=campaign_id)
+        result = drain(conn, gc, "fake-key", now=d, sleep_fn=lambda s: None,
+                        workdir_root=tmp_path / "workdir", create_draft_fn=create_fn, send_campaign_fn=send_fn)
+        return result.sent
+
+    assert drain_on(date(2026, 7, 31), 701) == 0   # before resume_date
+    assert drain_on(date(2026, 8, 1), 702) == 1    # stage 1 fires
+    assert drain_on(date(2026, 8, 2), 703) == 0    # mid-continuation gap
+    assert drain_on(date(2026, 8, 3), 704) == 0    # still not due (due Aug 4)
+    assert drain_on(date(2026, 8, 4), 705) == 1    # stage 2 fires
+    assert drain_on(date(2026, 8, 5), 706) == 0    # mid-continuation gap
+    assert drain_on(date(2026, 8, 8), 707) == 0    # still not due (due Aug 9)
+    assert drain_on(date(2026, 8, 9), 708) == 1    # stage 3 fires — final stage
+    assert drain_on(date(2026, 8, 20), 709) == 0   # cadence exhausted, never fires again
+
+    row = conn.execute("SELECT * FROM recipients WHERE recipient = ?", ("jane@acme.com",)).fetchone()
+    assert row["current_stage"] == 3
+    assert row["status"] == "active"
+
+
+def test_drain_does_not_double_send_a_recipient_restaged_into_a_new_campaign_mid_ooo_pause(conn, tmp_path):
+    # iron-audit BLOCKER regression test. Sequence: jane is OOO-paused in
+    # campaign "c" (recruiter, [2,3,5]); stage 1 fires, leaving a pending
+    # stage-2 continuation. BEFORE that continuation resolves, jane is
+    # re-staged into a brand new campaign "c2" (a supported flow — the
+    # dedup hard-warn only warns, never blocks re-contacting the same
+    # person). A later drain, landing on/after the old continuation's due
+    # date AND with the new campaign's initial also due, must send exactly
+    # ONE email (the new campaign's initial) — never both, and never the
+    # new campaign's body threaded into the old campaign's conversation.
+    send_reply_and_tag_ooo(conn, tmp_path, resume_date=date(2026, 8, 1))
+    create_fn1, send_fn1, _ = fake_gmass(campaign_id=701)
+    gc = make_global_config(tmp_path)
+    drain(conn, gc, "fake-key", now=date(2026, 8, 1), sleep_fn=lambda s: None,
+          workdir_root=tmp_path / "workdir", create_draft_fn=create_fn1, send_campaign_fn=send_fn1)
+    # Stage 2 now pending for campaign "c" on 2026-08-04.
+    assert due_for_ooo_resend(conn, today=date(2026, 8, 4)) != []
+
+    # Re-staged into a NEW campaign before the continuation resolves.
+    stage_recipient(
+        conn, campaign="c2", recipient="jane@acme.com", persona="founder", cadence=[2, 5, 7],
+        subject="Hi again", body="Body", stage_bodies=["s1", "s2", "s3"],
+        attachment_path=make_attachment(tmp_path, "jane2.pdf"), attachment_name="r.pdf",
+        latex_enabled=True, workdir_root=tmp_path / "workdir",
+    )
+
+    captured = []
+
+    def create_draft_fn2(api_key, *, recipient, subject, message, attachment=None):
+        captured.append({"subject": subject, "message": message})
+        return {"draft_id": f"r-{len(captured)}", "raw": {}}
+
+    def send_campaign_fn2(api_key, draft_id, *, campaign_settings):
+        return {"campaign_id": 999, "raw": {}}
+
+    result = drain(conn, gc, "fake-key", now=date(2026, 8, 4), sleep_fn=lambda s: None,
+                    workdir_root=tmp_path / "workdir", create_draft_fn=create_draft_fn2,
+                    send_campaign_fn=send_campaign_fn2)
+
+    # Exactly one send — the new campaign's initial — never the dangling
+    # old-campaign OOO continuation, and never both.
+    assert result.sent == 1
+    assert len(captured) == 1
+    assert captured[0]["subject"] == "Hi again"  # the NEW campaign's initial, not a "Re:" thread
+    row = conn.execute("SELECT * FROM recipients WHERE recipient = ?", ("jane@acme.com",)).fetchone()
+    assert row["campaign"] == "c2"
+
+
+def test_send_ooo_resend_writes_terminal_marker_when_cadence_exhausted(conn, tmp_path):
+    send_reply_and_tag_ooo(conn, tmp_path, cadence=[2], resume_date=date(2026, 8, 1))
+    create_fn, send_fn, _ = fake_gmass(campaign_id=777)
+    gc = make_global_config(tmp_path)
+    # First resend fires the ONLY stage.
+    drain(conn, gc, "fake-key", now=date(2026, 8, 1), sleep_fn=lambda s: None,
+          workdir_root=tmp_path / "workdir", create_draft_fn=create_fn, send_campaign_fn=send_fn)
+
+    # Mark OOO again — nothing left to resend.
+    tag_ooo(conn, "jane@acme.com", date(2026, 8, 5))
+    result = drain(conn, gc, "fake-key", now=date(2026, 8, 5), sleep_fn=lambda s: None,
+                    workdir_root=tmp_path / "workdir", create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    assert result.failed == 1
+    row = conn.execute(
+        "SELECT meta FROM events WHERE recipient = 'jane@acme.com' AND type = 'send_failed' "
+        "ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert json.loads(row["meta"])["stage"] == "ooo_cadence_exhausted"
+
+
+def test_ooo_cadence_exhausted_recipient_does_not_retry_forever(conn, tmp_path):
+    # Regression guard for the SHOULD-FIX: without the terminal marker, this
+    # recipient would generate a fresh send_failed on every single future
+    # drain, forever.
+    send_reply_and_tag_ooo(conn, tmp_path, cadence=[2], resume_date=date(2026, 8, 1))
+    create_fn, send_fn, _ = fake_gmass(campaign_id=777)
+    gc = make_global_config(tmp_path)
+    drain(conn, gc, "fake-key", now=date(2026, 8, 1), sleep_fn=lambda s: None,
+          workdir_root=tmp_path / "workdir", create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    tag_ooo(conn, "jane@acme.com", date(2026, 8, 5))
+    drain(conn, gc, "fake-key", now=date(2026, 8, 5), sleep_fn=lambda s: None,
+          workdir_root=tmp_path / "workdir", create_draft_fn=create_fn, send_campaign_fn=send_fn)
+
+    # Every later drain must be a genuine no-op for this recipient.
+    for d in (date(2026, 8, 6), date(2026, 8, 30), date(2027, 1, 1)):
+        result = drain(conn, gc, "fake-key", now=d, sleep_fn=lambda s: None,
+                        workdir_root=tmp_path / "workdir", create_draft_fn=create_fn, send_campaign_fn=send_fn)
+        assert result.sent == 0
+        assert result.failed == 0
+    failed_count = conn.execute(
+        "SELECT COUNT(*) AS n FROM events WHERE recipient = 'jane@acme.com' AND type = 'send_failed'"
+    ).fetchone()["n"]
+    assert failed_count == 1  # exactly the one terminal marker, never repeated

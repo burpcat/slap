@@ -29,6 +29,12 @@ from the brief's §3 examples that Phase-0 caught:
   preserved, bare URLs auto-linkified into real `<a href>` tags) and sends
   `messageType: "html"` — campaign `.txt` template authoring stays 100%
   plain text; only the wire format changes.
+- **`unsubscribe_recipient()` uses the ACCOUNT-WIDE `POST /api/unsubscribes`,
+  not the per-campaign `POST /api/unsubscribes/{campaignId}` its own name
+  suggests.** Live-tested first: the per-campaign variant never actually
+  registers anything (see that function's own docstring + CONTROL_SHEET.md's
+  "manual OOO pause" section for the full evidence). This is a real,
+  accepted tradeoff — see the function's docstring.
 
 Idempotency (§3): create_draft() and send_campaign() are deliberately two
 separate calls, mirroring the two real API calls. The caller MUST persist
@@ -145,6 +151,66 @@ def send_campaign(api_key: str, draft_id, *, campaign_settings: dict) -> dict:
     if not campaign_id:
         raise GMassError(f"campaigns response had no campaign id: {data!r}")
     return {"campaign_id": campaign_id, "raw": data}
+
+
+def unsubscribe_recipient(api_key: str, email: str) -> dict:
+    """POST /api/unsubscribes — GMass's ACCOUNT-WIDE unsubscribe list. Called
+    by the manual OOO pause (slap.dashboard.tag_reply) the moment the owner
+    marks a recipient OOO, including from an email SLAP never saw (so there
+    was never a detected `reply` event for the per-stage
+    `stageNAction: "r"` stop-on-reply to react to) — this is the mechanism
+    SLAP relies on to stop GMass's own native follow-up timer for that
+    recipient.
+
+    **What is actually verified, and what is NOT — read carefully before
+    trusting this more than the evidence supports.** VERIFIED live
+    (`probes/run.py unsubscribe`, findings recorded in
+    `probes/findings/unsubscribe_*.json` — see CONTROL_SHEET.md for the full
+    writeup): the call registers a real, queryable record (real timestamp,
+    shows up immediately in `GET /api/reports/0/unsubscribes`), and a LATER
+    manual send to the same address (exactly what the OOO-pause reschedule
+    does) still goes out normally afterward. **NOT verified — genuinely
+    unproven, not just untested**: whether this registered record actually
+    causes GMass to skip firing its own native follow-up stages for this
+    recipient. That can only be observed days out, after a real stage's
+    scheduled fire date passes, and hasn't been. This is inferred (not
+    confirmed) from it being GMass's own real, compliance-driven "stop
+    sending this address" list — the same class of residual gap as the
+    original stop-on-reply proof (see CONTROL_SHEET.md's tracked
+    follow-ups), not a settled fact. Design accordingly: local pause-window
+    enforcement (slap.queue.due_for_ooo_resend) is what actually controls
+    SLAP's OWN sends and is fully verified; this call is SLAP's only lever
+    against GMass's native timer and is the one part of the whole feature
+    still resting on an unconfirmed assumption.
+
+    ACCOUNT-WIDE, NOT PER-CAMPAIGN — a deliberate choice, not an oversight.
+    GMass's docs also describe a per-campaign variant
+    (`POST /api/unsubscribes/{campaignId}`, "suppresses an email address for
+    just a particular email campaign"), which is what this feature's design
+    originally called for (narrower blast radius). Live-tested it first and
+    it does NOT appear to register anything AT ALL: its own response echoes
+    a zero-value default timestamp (`0001-01-01T00:00:00`, not a real one),
+    the campaign's own `GET /api/campaigns/{id}` read-back shows
+    `statistics.unsubscribes` staying at 0, and the address never appears in
+    ANY unsubscribes report — that campaign's own, a sibling campaign's, or
+    the account-wide one (`campaignId=0`) — even after ~90s of polling. The
+    account-wide endpoint used here, by contrast, is the one confirmed to
+    register at all (see above).
+
+    Real, accepted tradeoff (owner-confirmed): marking one recipient OOO in
+    one campaign now also silences their native GMass follow-ups in every
+    OTHER campaign they're ever contacted in — broader than originally
+    scoped, but the only mechanism GMass's API actually registers anything
+    for. No reversal (`DELETE /api/unsubscribes`) is ever called by this
+    app — once marked OOO, SLAP's own scheduling permanently owns the rest
+    of that recipient's sequence; there's no path back to GMass's native
+    timer.
+
+    Returns the parsed `unsubscribe` object ({emailAddress, unsubscribeTime,
+    sender})."""
+    resp = requests.post(f"{BASE_URL}/unsubscribes", headers=_headers(api_key),
+                          json={"emailAddress": email})
+    return _parse(resp, "unsubscribes")
 
 
 def get_reports(api_key: str, campaign_id, report_type: str) -> list:

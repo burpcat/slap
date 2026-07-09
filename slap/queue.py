@@ -9,6 +9,36 @@ tag_ooo()/due_for_ooo_resend() are the OOO re-queue counterpart (§7):
 ooo_tagged is the "due for resend" marker (like queued), requeued is the
 completion marker (like sent) — see slap.tracking's module docstring for
 why that mapping means no new schema column is needed.
+
+Manual OOO pause (post-launch): tag_ooo() now takes a mandatory
+`resume_date` — the owner-chosen date this recipient is expected back,
+covering the case where the OOO notice arrived somewhere SLAP/GMass never
+saw at all (no detected `reply` to gate on). **This deliberately supersedes
+SLAP_BUILD_PROMPT.md §7's original "no special date parsing, no
+per-recipient scheduling" line for the OOO re-queue** — per explicit owner
+instruction for this specific feature (a manual, unconditional OOO mark
+with a real return date is fundamentally incompatible with that constraint;
+the override was the whole point of the request, not an oversight of the
+brief). due_for_ooo_resend() holds a
+recipient's resend until date.today() >= that date; the original
+reply-detected recovery had no such wait (resent on the very next drain).
+Subsequent stages beyond the first are a CONTINUATION of the same pause,
+not a fresh manual re-tag: slap.runner._send_ooo_resend records the next
+stage's own due date directly in the `requeued` event's own meta
+(`next_resume_date`) rather than appending a second `ooo_tagged` event —
+one atomic write per resend, and _apply_event_to_cache's existing
+`requeued`/`ooo_tagged` handlers need no changes at all (see
+due_for_ooo_resend()'s docstring for the full resolution rule). GMass's
+native follow-up timer is BELIEVED suppressed the moment a recipient is
+first marked OOO (slap.dashboard.tag_reply calls slap.gmass.
+unsubscribe_recipient before ever calling tag_ooo — see that function's
+docstring for exactly what's verified vs. still an unconfirmed assumption,
+and for why this is account-wide, not per-campaign) — nothing in this
+module talks to GMass directly. This module's own guarantee (the pause
+window before `resume_date`, and never firing the same stage twice) holds
+regardless of whether GMass's native timer actually stays silent — see
+slap.gmass.unsubscribe_recipient's docstring for the one part of this
+whole feature that isn't fully proven.
 """
 from __future__ import annotations
 
@@ -135,22 +165,127 @@ def due_recipients(conn) -> list:
     return [dict(r) for r in rows]
 
 
-def tag_ooo(conn, recipient: str) -> None:
-    """Owner tags a reply as OOO (§7) — a rare false-positive safety net,
-    since GMass normally filters auto-responder replies itself. Marks the
-    recipient due for the app's own resend of their next stage, fired later
-    on the runner's normal cadence (no special scheduling) — this function
-    itself never sends anything."""
+def tag_ooo(conn, recipient: str, resume_date: date) -> None:
+    """Marks `recipient` OOO-paused, due for resend once `resume_date`
+    arrives — never immediately. Callable for ANY recipient at ANY time,
+    regardless of current status or whether SLAP ever detected a reply: the
+    real-world trigger for this (an OOO notice landing somewhere SLAP/GMass
+    never saw) is itself untethered from any signal SLAP could gate on, so
+    this function has no precondition on prior state.
+
+    This is a pure DB write — it does NOT talk to GMass. The caller
+    (slap.dashboard.tag_reply) is responsible for calling
+    slap.gmass.unsubscribe_recipient() FIRST, before this, so GMass's own
+    native follow-up timer is suppressed before any local pause is ever
+    recorded (see that function's docstring for why — a local-only pause
+    with no working GMass-side suppression would be worse than no pause at
+    all)."""
     row = conn.execute("SELECT campaign FROM recipients WHERE recipient = ?", (recipient,)).fetchone()
     campaign = row["campaign"] if row else None
-    append_event(conn, type="ooo_tagged", recipient=recipient, campaign=campaign)
+    append_event(conn, type="ooo_tagged", recipient=recipient, campaign=campaign,
+                 meta={"resume_date": resume_date.isoformat()})
 
 
-def due_for_ooo_resend(conn) -> list:
-    """Recipients tagged OOO but not yet actually resent. A successful
-    resend writes `requeued`, which flips status back to 'active' — so this
-    is simply everyone still sitting in 'ooo_requeued', no join needed."""
+def _pending_ooo_resume_date(conn, recipient: str, campaign: str):
+    """The next OOO-pause-driven resend date still pending for `recipient`
+    IN `campaign` specifically, or None if there isn't one (never paused,
+    already fully resolved, or paused for a DIFFERENT campaign — see below).
+    Reads the LATEST of ooo_tagged/requeued/send_failed for this
+    (recipient, campaign) pair — whichever is more recent wins, the same
+    "latest event wins" resolution rule slap.dashboard's needs_triage()/
+    reply_tags() already establish:
+
+    - Latest is `ooo_tagged`: this is either the ORIGINAL owner-driven pause,
+      or a fresh manual re-tag (always allowed, always overrides whatever
+      was pending before) — due date is its own `resume_date`. An
+      `ooo_tagged` written before this feature existed (no `resume_date` in
+      its meta) is treated as immediately due (date.min) — matches the
+      ORIGINAL reply-detected recovery's behavior exactly (resend on the
+      very next drain), so an already-in-flight OOO tag from before this
+      feature shipped is never silently stuck waiting forever.
+    - Latest is `requeued`: a prior stage in this same OOO pause already
+      fired. If its meta carries `next_resume_date`, the persona's cadence
+      still has a stage left and THIS is when it's due (see
+      slap.runner._send_ooo_resend). No `next_resume_date` means the
+      cadence was already exhausted by that resend — nothing pending.
+    - `send_failed` is normally SKIPPED (irrelevant — a transient failed
+      attempt stays due for retry on the next drain, matching
+      due_recipients()'s identical convention for its own queue), EXCEPT one
+      specific, genuinely terminal reason:
+      `meta["stage"] == "ooo_cadence_exhausted"` (an iron-audit SHOULD-FIX:
+      the persona's cadence has no next stage at all for this recipient —
+      retrying can never succeed, since a cadence's length never changes for
+      an already-staged recipient — so without this, a recipient marked OOO
+      with nothing left to resend would generate a fresh, identical
+      send_failed on every single future drain, forever).
+
+    **Campaign-scoped, not just recipient-scoped — an iron-audit BLOCKER
+    fix.** The `recipients` cache holds ONE row per recipient, reflecting
+    whichever campaign they're MOST RECENTLY associated with (same grain the
+    Reach-outs page already documents) — the existing dedup hard-warn
+    explicitly allows re-staging an already-contacted recipient into a NEW
+    campaign (warn, don't block). Without this scoping, a recipient with a
+    pending OOO continuation for an OLD campaign who gets re-staged into a
+    NEW one before that continuation resolves would have their OLD
+    campaign's pending resend fire using the NEW campaign's `current_stage`/
+    workdir/stage bodies but the OLD campaign's `last_gmass_campaign_id` —
+    silently sending the new campaign's stage body threaded into the old
+    campaign's Gmail conversation, alongside a normal initial send to the
+    same recipient in the same drain (a genuine double-send + cross-campaign
+    data corruption). Scoping this query to `campaign` (the recipient's
+    CURRENT `recipients.campaign`) means a re-staged recipient's dangling
+    old-campaign continuation is safely abandoned — it can never resume
+    against a campaign it wasn't paused for — rather than corrupting the new
+    one."""
     rows = conn.execute(
-        "SELECT * FROM recipients WHERE status = 'ooo_requeued' ORDER BY recipient"
+        "SELECT type, meta FROM events WHERE recipient = ? AND campaign = ? "
+        "AND type IN ('ooo_tagged', 'requeued', 'send_failed') ORDER BY id DESC",
+        (recipient, campaign),
     ).fetchall()
-    return [dict(r) for r in rows]
+    for row in rows:
+        meta = json.loads(row["meta"]) if row["meta"] else {}
+        if row["type"] == "send_failed":
+            if meta.get("stage") == "ooo_cadence_exhausted":
+                return None  # terminal — nothing pending, ever again
+            continue  # a transient failed attempt — keep looking backwards
+        if row["type"] == "ooo_tagged":
+            resume_date = meta.get("resume_date")
+            return date.fromisoformat(resume_date) if resume_date else date.min
+        next_resume_date = meta.get("next_resume_date")
+        return date.fromisoformat(next_resume_date) if next_resume_date else None
+    return None
+
+
+def due_for_ooo_resend(conn, *, today: date = None) -> list:
+    """Recipients due for an OOO-pause resend right now: their latest
+    ooo_tagged/requeued/send_failed event FOR THEIR CURRENT CAMPAIGN (see
+    _pending_ooo_resume_date) has a pending resume date that's today or
+    earlier. Checks BOTH 'ooo_requeued' status (the original pause, or a
+    fresh manual re-tag — _apply_event_to_cache's existing ooo_tagged
+    handler already sets this) AND 'active' status (a recipient mid-way
+    through a multi-stage OOO pause continuation: requeued's existing
+    handler always flips status back to 'active' after ANY successful
+    resend, unchanged from before this feature — whether there's a FURTHER
+    stage still pending is tracked in that same event's meta, not in
+    `status`, so no changes were needed to _apply_event_to_cache at all). A
+    normal, never-OOO'd active recipient always has no ooo_tagged/requeued
+    history at all, so this never produces a false positive for them.
+
+    Deliberately does NOT overlap with due_recipients() even in principle:
+    that function requires the recipient's CURRENT campaign to have a fresh,
+    never-sent `queued` event; this function requires a pending OOO
+    continuation FOR THAT SAME CURRENT campaign specifically (see
+    _pending_ooo_resume_date's own docstring) — a freshly re-staged
+    recipient has no such history for their new campaign yet, so they can
+    never satisfy both at once. drain() still defensively dedupes the two
+    lists anyway (belt-and-suspenders, not load-bearing on its own)."""
+    today = today or date.today()
+    rows = conn.execute(
+        "SELECT * FROM recipients WHERE status IN ('ooo_requeued', 'active') ORDER BY recipient"
+    ).fetchall()
+    due = []
+    for row in rows:
+        resume_date = _pending_ooo_resume_date(conn, row["recipient"], row["campaign"])
+        if resume_date is not None and resume_date <= today:
+            due.append(dict(row))
+    return due

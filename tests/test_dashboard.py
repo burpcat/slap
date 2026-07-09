@@ -484,13 +484,68 @@ def test_actionable_replies_includes_domain_context(conn):
     assert replies[0]["dedup_context"].hard_warning is not None  # already-contacted context
 
 
+def _fake_unsubscribe(api_key, email):
+    return {"emailAddress": email, "unsubscribeTime": "2026-01-01T00:00:00", "sender": None}
+
+
 def test_tag_reply_ooo_calls_the_real_requeue_mechanism(conn):
     append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
     append_event(conn, type="reply", recipient="a@x.com", campaign="c")
-    tag_reply(conn, "a@x.com", "ooo")
+    tag_reply(conn, "a@x.com", "ooo", resume_date=date.today(), api_key="fake-key",
+              unsubscribe_fn=_fake_unsubscribe)
     row = conn.execute("SELECT status FROM recipients WHERE recipient = ?", ("a@x.com",)).fetchone()
     assert row["status"] == "ooo_requeued"
     assert needs_triage(conn) == []  # resolved
+
+
+def test_tag_reply_ooo_requires_resume_date(conn):
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
+    with pytest.raises(ValueError, match="resume_date"):
+        tag_reply(conn, "a@x.com", "ooo", api_key="fake-key", unsubscribe_fn=_fake_unsubscribe)
+
+
+def test_tag_reply_ooo_available_with_no_prior_reply_or_engagement_at_all(conn):
+    # The core requirement: markable OOO even when SLAP never detected
+    # anything at all (no reply, no click) — the real-world trigger is an
+    # OOO notice arriving somewhere SLAP/GMass never saw.
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=0, gmass_campaign_id="1")
+    tag_reply(conn, "a@x.com", "ooo", resume_date=date(2026, 8, 1), api_key="fake-key",
+              unsubscribe_fn=_fake_unsubscribe)
+    row = conn.execute("SELECT status FROM recipients WHERE recipient = ?", ("a@x.com",)).fetchone()
+    assert row["status"] == "ooo_requeued"
+
+
+def test_tag_reply_ooo_calls_unsubscribe_before_recording_anything_locally(conn):
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
+
+    def failing_unsubscribe(api_key, email):
+        raise RuntimeError("simulated GMass failure")
+
+    with pytest.raises(RuntimeError, match="simulated GMass failure"):
+        tag_reply(conn, "a@x.com", "ooo", resume_date=date(2026, 8, 1), api_key="fake-key",
+                  unsubscribe_fn=failing_unsubscribe)
+    # Nothing was recorded locally — a local-only pause with no working
+    # GMass-side suppression would be worse than not marking OOO at all
+    # (false confidence the double-send risk was handled).
+    assert conn.execute("SELECT * FROM events WHERE type = 'ooo_tagged'").fetchone() is None
+    row = conn.execute("SELECT status FROM recipients WHERE recipient = ?", ("a@x.com",)).fetchone()
+    assert row["status"] == "active"  # unchanged from the queued event
+
+
+def test_tag_reply_ooo_calls_unsubscribe_with_the_recipient_and_api_key(conn):
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
+    captured = {}
+
+    def capturing_unsubscribe(api_key, email):
+        captured["api_key"] = api_key
+        captured["email"] = email
+        return _fake_unsubscribe(api_key, email)
+
+    tag_reply(conn, "a@x.com", "ooo", resume_date=date(2026, 8, 1), api_key="the-real-key",
+              unsubscribe_fn=capturing_unsubscribe)
+    assert captured == {"api_key": "the-real-key", "email": "a@x.com"}
 
 
 def test_tag_reply_real_writes_reply_reviewed(conn):
@@ -840,6 +895,122 @@ def test_create_app_reply_tag_invalid_returns_400(app, tmp_path):
     client = app.test_client()
     resp = client.post("/reply/carol@x.com/tag", data={"tag": "bogus"})
     assert resp.status_code == 400
+
+
+def test_create_app_reply_tag_ooo_requires_resume_date_returns_400(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="queued", recipient="carol@x.com", campaign="c", stage=0,
+                 meta={"persona": "founder"})
+    conn.close()
+
+    client = app.test_client()
+    resp = client.post("/reply/carol@x.com/tag", data={"tag": "ooo"})
+    assert resp.status_code == 400
+
+
+def test_create_app_reply_tag_ooo_invalid_resume_date_format_returns_400(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="queued", recipient="carol@x.com", campaign="c", stage=0,
+                 meta={"persona": "founder"})
+    conn.close()
+
+    client = app.test_client()
+    resp = client.post("/reply/carol@x.com/tag", data={"tag": "ooo", "resume_date": "not-a-date"})
+    assert resp.status_code == 400
+
+
+def test_create_app_reply_tag_ooo_success_calls_unsubscribe_and_redirects_to_dashboard(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="queued", recipient="carol@x.com", campaign="c", stage=0,
+                 meta={"persona": "founder"})
+    append_event(conn, type="sent", recipient="carol@x.com", campaign="c", stage=0, gmass_campaign_id="1")
+    append_event(conn, type="reply", recipient="carol@x.com", campaign="c", stage=0)
+    conn.close()
+
+    with patch("slap.dashboard.gmass.unsubscribe_recipient", return_value=_fake_unsubscribe(None, None)) as mock_unsub:
+        client = app.test_client()
+        resp = client.post("/reply/carol@x.com/tag",
+                            data={"tag": "ooo", "resume_date": "2026-08-01", "redirect_to": "index"})
+        assert resp.status_code == 302
+        assert resp.headers["Location"] == "/"
+        mock_unsub.assert_called_once_with("fake-key", "carol@x.com")
+
+    conn2 = connect(tmp_path / "test.db")
+    row = conn2.execute("SELECT status FROM recipients WHERE recipient = ?", ("carol@x.com",)).fetchone()
+    assert row["status"] == "ooo_requeued"
+
+
+def test_create_app_reply_tag_ooo_failure_returns_502_and_records_nothing(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="queued", recipient="carol@x.com", campaign="c", stage=0,
+                 meta={"persona": "founder"})
+    conn.close()
+
+    with patch("slap.dashboard.gmass.unsubscribe_recipient", side_effect=RuntimeError("network down")):
+        client = app.test_client()
+        resp = client.post("/reply/carol@x.com/tag", data={"tag": "ooo", "resume_date": "2026-08-01"})
+        assert resp.status_code == 502
+
+    conn2 = connect(tmp_path / "test.db")
+    assert conn2.execute("SELECT * FROM events WHERE type = 'ooo_tagged'").fetchone() is None
+
+
+def test_create_app_mark_ooo_from_reachouts_row_with_no_reply_redirects_to_reachouts(app, tmp_path):
+    # The core Reach-outs requirement: available on a row with NO detected
+    # reply and no engagement at all — not gated on needs_triage() like the
+    # dashboard widget is.
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="queued", recipient="dana@x.com", campaign="c", stage=0,
+                 meta={"persona": "founder"})
+    append_event(conn, type="sent", recipient="dana@x.com", campaign="c", stage=0, gmass_campaign_id="1")
+    conn.close()
+
+    with patch("slap.dashboard.gmass.unsubscribe_recipient", return_value=_fake_unsubscribe(None, None)):
+        client = app.test_client()
+        resp = client.post("/reply/dana@x.com/tag",
+                            data={"tag": "ooo", "resume_date": "2026-08-01", "redirect_to": "reachouts"})
+        assert resp.status_code == 302
+        assert resp.headers["Location"] == "/reachouts"
+
+    conn2 = connect(tmp_path / "test.db")
+    row = conn2.execute("SELECT status FROM recipients WHERE recipient = ?", ("dana@x.com",)).fetchone()
+    assert row["status"] == "ooo_requeued"
+
+
+def test_create_app_reply_tag_widget_and_reachouts_action_produce_identical_ooo_state(app, tmp_path):
+    # Both entry points hit the same route and call the same tag_reply() —
+    # prove they produce byte-identical resulting state (same meta shape,
+    # same status transition), not just "both happen to work."
+    conn = connect(tmp_path / "test.db")
+    for recipient in ("widget@x.com", "reachouts@x.com"):
+        append_event(conn, type="queued", recipient=recipient, campaign="c", stage=0,
+                     meta={"persona": "founder"})
+        append_event(conn, type="sent", recipient=recipient, campaign="c", stage=0, gmass_campaign_id="1")
+        append_event(conn, type="reply", recipient=recipient, campaign="c", stage=0)
+    conn.close()
+
+    with patch("slap.dashboard.gmass.unsubscribe_recipient", return_value=_fake_unsubscribe(None, None)):
+        client = app.test_client()
+        # Simulates dashboard.html's reply-tag widget form.
+        client.post("/reply/widget@x.com/tag",
+                    data={"tag": "ooo", "resume_date": "2026-08-01", "redirect_to": "index"})
+        # Simulates reachouts.html's per-row "Mark OOO" action.
+        client.post("/reply/reachouts@x.com/tag",
+                    data={"tag": "ooo", "resume_date": "2026-08-01", "redirect_to": "reachouts"})
+
+    conn2 = connect(tmp_path / "test.db")
+    metas = {}
+    statuses = {}
+    for recipient in ("widget@x.com", "reachouts@x.com"):
+        row = conn2.execute(
+            "SELECT meta FROM events WHERE recipient = ? AND type = 'ooo_tagged'", (recipient,)
+        ).fetchone()
+        metas[recipient] = json.loads(row["meta"])
+        statuses[recipient] = conn2.execute(
+            "SELECT status FROM recipients WHERE recipient = ?", (recipient,)
+        ).fetchone()["status"]
+    assert metas["widget@x.com"] == metas["reachouts@x.com"] == {"resume_date": "2026-08-01"}
+    assert statuses["widget@x.com"] == statuses["reachouts@x.com"] == "ooo_requeued"
 
 
 @pytest.mark.slow

@@ -13,7 +13,7 @@ inbox, never to one hardcoded person's. This makes emailing a real lead with tes
 data impossible.
 
 Usage:
-    python probes/run.py <auth|attach|casing|stop|thread|reports|verify|swagger|client|all>
+    python probes/run.py <auth|attach|casing|stop|thread|reports|verify|swagger|client|resend|clicktest|unsubscribe|all>
 """
 import argparse
 import base64
@@ -660,6 +660,190 @@ def probe_client(key: str) -> None:
     _record("client", result)
 
 
+def probe_unsubscribe(key: str) -> None:
+    """Verifies the manual-OOO-pause feature's core safety mechanism before any
+    production code relies on it: does POST /api/unsubscribes/{campaignId}
+    actually scope to just that one campaign (its OWN summary's claim --
+    "Suppresses an email address for just a particular email campaign",
+    operationId Unsubscribes_AddUnsubscribeForCampaign) or does it apply
+    account-wide (GET /api/reports/{campaignId}/unsubscribes's OWN description's
+    claim -- "Unsubscribed addresses apply account-wide and are eliminated from
+    future campaigns")? GMass's own docs directly contradict each other on this
+    -- checked empirically here rather than trusted from either description.
+
+    Also checks the question the whole reschedule design actually depends on:
+    does unsubscribing a recipient block a SUBSEQUENT manual send to them (a
+    fresh create_draft + send_campaign call -- exactly what the OOO-pause
+    reschedule does on the recipient's return date), or does GMass's
+    unsubscribe suppression only affect its OWN native automated follow-up
+    firing, leaving an explicit single-recipient API-driven send unaffected?
+    If suppression silently swallows the manual resend too, the reschedule
+    design as specified cannot work.
+
+    Real sends, guarded test address only. Three campaigns to the SAME
+    guarded address: A (gets unsubscribed after sending), B (an independent
+    control, left untouched, to check for cross-campaign leakage), C (created
+    AFTER A is unsubscribed, to check whether a manual resend still actually
+    goes out). NOTE: whether GMass's native stage-2/3 timer for campaign A
+    actually stays silent is inherently timing-dependent (days out, per that
+    campaign's own cadence) and is NOT something this probe can prove in one
+    run -- see CONTROL_SHEET.md's tracked follow-ups for the same class of gap
+    already open on stop-on-reply."""
+    print("[unsubscribe] does POST /api/unsubscribes/{campaignId} stay scoped to one "
+          "campaign, and does it block a later manual resend to the same address?")
+    recipient = owner_test_address(10)
+    result = {"probe": "unsubscribe", "recipient": recipient}
+    hdr = {"X-apikey": key}
+
+    def _send(label):
+        draft = _create_draft(key, recipient, subject=f"slap probe unsubscribe ({label})",
+                              message=f"unsubscribe probe body ({label})")
+        entry = {"draft": draft, "campaign_id": None}
+        print(f"  [{label}] draft: HTTP {draft['response']['status']}, draft_id={draft['draft_id']}")
+        if draft["draft_id"]:
+            send_fields = {
+                "openTracking": False, "clickTracking": True, "createDrafts": False,
+                "stageOneDays": 2, "stageOneCampaignText": f"unsubscribe probe {label} stage one",
+                "stageOneAction": "r",
+            }
+            r = _post_campaign(key, draft["draft_id"], send_fields, "path")
+            summary = _summarize(r)
+            campaign_id = _campaign_id(summary)
+            print(f"  [{label}] send: HTTP {r.status_code}, campaign_id={campaign_id}")
+            entry["send"] = {"sent_fields": send_fields, "response": summary, "campaign_id": campaign_id}
+            entry["campaign_id"] = campaign_id
+            if campaign_id:
+                _RUN_STATE["campaign_ids"].append(campaign_id)
+        return entry
+
+    entry_a = _send("A-to-be-unsubscribed")
+    result["campaign_a"] = entry_a
+    campaign_a_id = entry_a["campaign_id"]
+
+    time.sleep(3)
+    entry_b = _send("B-control-untouched")
+    result["campaign_b"] = entry_b
+    campaign_b_id = entry_b["campaign_id"]
+
+    if not campaign_a_id:
+        _record("unsubscribe", result)
+        return
+
+    time.sleep(3)
+    unsub_resp = requests.post(f"{BASE_URL}/unsubscribes/{campaign_a_id}", headers=hdr,
+                               json={"emailAddress": recipient})
+    result["unsubscribe_call"] = _summarize(unsub_resp)
+    print(f"  unsubscribe recipient for campaign {campaign_a_id}: HTTP {unsub_resp.status_code}")
+
+    time.sleep(3)
+
+    # Q1: cross-campaign scope.
+    scope_checks = {}
+    for label, cid in (("campaign_a", campaign_a_id), ("campaign_b", campaign_b_id), ("account_wide", 0)):
+        if cid is None:
+            continue
+        rr = requests.get(f"{BASE_URL}/reports/{cid}/unsubscribes", headers=hdr)
+        summary = _summarize(rr)
+        data = summary["body"].get("data") if isinstance(summary["body"], dict) else None
+        found = isinstance(data, list) and any(
+            (item.get("emailAddress") or "").lower() == recipient.lower() for item in data
+        )
+        scope_checks[label] = {"campaign_id": cid, "response": summary, "recipient_present": found}
+        print(f"  unsubscribes report [{label}] (campaign_id={cid}): HTTP {rr.status_code}, "
+              f"recipient present={found}")
+    result["scope_checks"] = scope_checks
+
+    # Campaign A's own first-party read model: GET /api/campaigns/{id} exposes
+    # statistics.unsubscribes -- a campaign-scoped counter independent of the
+    # reports/unsubscribes endpoint used above. If the per-campaign POST had
+    # actually registered anything against campaign A specifically, THIS
+    # counter is where it would show up.
+    rc = requests.get(f"{BASE_URL}/campaigns/{campaign_a_id}", headers=hdr)
+    rc_summary = _summarize(rc)
+    unsubscribes_stat = None
+    if isinstance(rc_summary["body"], dict):
+        unsubscribes_stat = rc_summary["body"].get("statistics", {}).get("unsubscribes")
+    result["campaign_a_readback"] = rc_summary
+    result["campaign_a_statistics_unsubscribes"] = unsubscribes_stat
+    print(f"  GET campaign {campaign_a_id} back: HTTP {rc.status_code}, "
+          f"statistics.unsubscribes={unsubscribes_stat}")
+
+    # Control: does the ACCOUNT-WIDE POST /api/unsubscribes (no campaignId)
+    # actually work at all, on this same account/plan? Uses a SEPARATE
+    # address so it can't be confused with campaign_a/b/c's own recipient,
+    # and is reversed (DELETE) at the end so no stray state is left on the
+    # real account.
+    account_wide_email = owner_test_address(11)
+    aw_resp = requests.post(f"{BASE_URL}/unsubscribes", headers=hdr, json={"emailAddress": account_wide_email})
+    result["account_wide_unsubscribe_call"] = _summarize(aw_resp)
+    print(f"  account-wide POST /api/unsubscribes for {account_wide_email}: HTTP {aw_resp.status_code}")
+    time.sleep(3)
+    aw_report = requests.get(f"{BASE_URL}/reports/0/unsubscribes", headers=hdr)
+    aw_report_summary = _summarize(aw_report)
+    aw_data = aw_report_summary["body"].get("data") if isinstance(aw_report_summary["body"], dict) else None
+    aw_found = isinstance(aw_data, list) and any(
+        (item.get("emailAddress") or "").lower() == account_wide_email.lower() for item in aw_data
+    )
+    result["account_wide_control"] = {
+        "email": account_wide_email, "report_after_post": aw_report_summary, "recipient_present": aw_found,
+    }
+    print(f"  account-wide report after account-wide POST: HTTP {aw_report.status_code}, present={aw_found}")
+    # Reverse it -- this is a real, permanent-ish suppression on the real
+    # account; don't leave stray state behind from this probe run.
+    del_resp = requests.delete(f"{BASE_URL}/unsubscribes", headers=hdr, params={"emailAddress": account_wide_email})
+    result["account_wide_control_cleanup_delete"] = _summarize(del_resp)
+    print(f"  cleanup DELETE /api/unsubscribes for {account_wide_email}: HTTP {del_resp.status_code}")
+
+    result["conclusion"] = (
+        "POST /api/unsubscribes/{campaignId} (per-campaign) does NOT appear to register "
+        "anything -- its own response echoes a zero-value default timestamp, campaign A's "
+        "own statistics.unsubscribes counter never increments, and the address never shows "
+        "up in ANY unsubscribes report (that campaign's, a sibling's, or the account-wide "
+        "one). POST /api/unsubscribes (account-wide, no campaignId) DOES work -- real "
+        "timestamp, shows up immediately in the account-wide report. A manual resend to the "
+        "address after either unsubscribe attempt still goes out normally (see campaign_c) "
+        "-- suppression, whichever kind, does not block an explicit API-driven send."
+        if unsubscribes_stat == 0 and not any(c["recipient_present"] for c in scope_checks.values()) and aw_found
+        else "UNEXPECTED -- re-check the individual fields above before trusting the summary in "
+             "slap.gmass.unsubscribe_recipient's docstring."
+    )
+
+    # Q2 (the one the whole feature depends on): does a brand-new manual send
+    # to the now-unsubscribed address -- exactly what the reschedule does on
+    # the return date -- still actually go out?
+    time.sleep(3)
+    entry_c = _send("C-after-unsubscribe")
+    result["campaign_c"] = entry_c
+    campaign_c_id = entry_c["campaign_id"]
+
+    if campaign_c_id:
+        recipients_polls = []
+        last_report = None
+        for attempt in range(8):
+            time.sleep(15)
+            rr = requests.get(f"{BASE_URL}/reports/{campaign_c_id}/recipients", headers=hdr)
+            last_report = _summarize(rr)
+            data = last_report["body"].get("data") if isinstance(last_report["body"], dict) else None
+            record_count = len(data) if isinstance(data, list) else None
+            recipients_polls.append({"attempt": attempt + 1, "status": rr.status_code,
+                                     "record_count": record_count})
+            print(f"  post-unsubscribe manual send poll {attempt + 1}: HTTP {rr.status_code}, "
+                  f"records={record_count}")
+            if record_count:
+                break
+        result["campaign_c_recipients_polls"] = recipients_polls
+        result["campaign_c_recipients_report"] = last_report
+        result["manual_send_after_unsubscribe_appears_to_have_gone_out"] = bool(
+            last_report and isinstance(last_report["body"], dict) and last_report["body"].get("data")
+        )
+
+    print("  MANUAL STEP STILL REQUIRED: confirm in Gmail that campaign C's email actually "
+          "arrived (the recipients report populating is a strong signal GMass processed the "
+          "send, not proof of inbox delivery -- same residual gap as every other real send "
+          "this probe suite has ever made).")
+    _record("unsubscribe", result)
+
+
 def _tiny_pdf() -> bytes:
     """Smallest valid one-page PDF."""
     return (b"%PDF-1.1\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
@@ -679,7 +863,7 @@ PROBES = {
     "auth": probe_auth, "attach": probe_attach, "casing": probe_casing,
     "stop": probe_stop, "thread": probe_thread, "reports": probe_reports,
     "verify": probe_verify, "swagger": probe_swagger, "client": probe_client,
-    "resend": probe_resend, "clicktest": probe_clicktest,
+    "resend": probe_resend, "clicktest": probe_clicktest, "unsubscribe": probe_unsubscribe,
 }
 
 

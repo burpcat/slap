@@ -419,15 +419,46 @@ def actionable_replies(conn, consumer_domains: set) -> list:
     return result
 
 
-def tag_reply(conn, recipient: str, tag: str) -> None:
-    """The dashboard's single write action (§8): tag a reply real/OOO/
-    not-interested. 'ooo' triggers the real re-queue mechanism (step 10);
-    'real'/'not_interested' are pure triage bookkeeping with no state
-    transition (neither is a valid recipients.status value)."""
+def tag_reply(conn, recipient: str, tag: str, *, resume_date: date = None, api_key: str = None,
+              unsubscribe_fn=None) -> None:
+    """The single underlying action behind BOTH OOO entry points: the
+    original reply-tag widget (dashboard.html, gated on a detected `reply`
+    event) and the manual "Mark OOO" action on every Reach-outs row
+    (reachouts.html, unconditional — any recipient, any time, no reply
+    needed). Both hit the exact same `/reply/<recipient>/tag` route, which
+    calls this one function — never duplicated.
+
+    'ooo' now requires `resume_date` (the owner-chosen date this recipient
+    is expected back) and, before any local state changes, calls
+    `unsubscribe_fn` (slap.gmass.unsubscribe_recipient) to suppress GMass's
+    own native follow-up timer for this recipient — deliberately FIRST,
+    since that's the step that actually prevents a double-send (GMass firing
+    a native stage while SLAP separately, later, also fires one manually).
+    If that call raises, this function raises too and NOTHING is recorded
+    locally — a locally-recorded pause with no working GMass-side
+    suppression would be worse than not marking OOO at all: it would look
+    "handled" on the dashboard while GMass's native timer stayed fully live.
+    See slap.gmass.unsubscribe_recipient's docstring for why this is
+    account-wide, not per-campaign.
+
+    'real'/'not_interested' are unchanged: pure triage bookkeeping with no
+    state transition (neither is a valid recipients.status value).
+
+    `unsubscribe_fn` defaults to None and is resolved to
+    `gmass.unsubscribe_recipient` INSIDE this function body, not as a bound
+    default parameter — a default parameter value is captured once, at
+    module-import time, which would silently ignore a test's
+    `patch("slap.dashboard.gmass.unsubscribe_recipient", ...)` (the patch
+    replaces the module attribute; a stale bound-at-def-time reference never
+    sees it). Resolving it here instead means every call always sees
+    whatever `gmass.unsubscribe_recipient` currently is."""
     if tag not in ("real", "ooo", "not_interested"):
         raise ValueError(f"unknown tag {tag!r} — must be 'real', 'ooo', or 'not_interested'")
     if tag == "ooo":
-        _tag_ooo(conn, recipient)
+        if resume_date is None:
+            raise ValueError("resume_date is required when tag='ooo'")
+        (unsubscribe_fn or gmass.unsubscribe_recipient)(api_key, recipient)
+        _tag_ooo(conn, recipient, resume_date)
         return
     row = conn.execute("SELECT campaign FROM recipients WHERE recipient = ?", (recipient,)).fetchone()
     campaign = row["campaign"] if row else None
@@ -897,11 +928,31 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
 
     @app.route("/reply/<string:recipient>/tag", methods=["POST"])
     def reply_tag(recipient):
+        # Shared by both OOO entry points (dashboard.html's reply-tag widget
+        # and reachouts.html's per-row "Mark OOO" action) — see
+        # slap.dashboard.tag_reply's own docstring for why this is one
+        # route/one function, not duplicated logic.
         tag = request.form.get("tag", "")
+        resume_date_str = request.form.get("resume_date", "").strip()
+        resume_date = None
+        if resume_date_str:
+            try:
+                resume_date = date.fromisoformat(resume_date_str)
+            except ValueError:
+                return f"invalid resume_date {resume_date_str!r} — expected YYYY-MM-DD", 400
         try:
-            tag_reply(get_conn(), recipient, tag)
+            tag_reply(get_conn(), recipient, tag, resume_date=resume_date, api_key=api_key)
         except ValueError as e:
             return str(e), 400
-        return redirect(url_for("index"))
+        except Exception as e:
+            # Most likely slap.gmass.unsubscribe_recipient failing (network,
+            # invalid key, GMassError) — fail loud with a clear message
+            # rather than a bare 500, and confirm nothing was recorded
+            # locally either (see tag_reply's docstring: the GMass call runs
+            # BEFORE any local event, precisely so a failure here can never
+            # leave a false "handled" local pause with no real suppression).
+            return f"could not mark {recipient} OOO — GMass suppression call failed, nothing was recorded: {e}", 502
+        redirect_to = request.form.get("redirect_to", "index")
+        return redirect(url_for("reachouts" if redirect_to == "reachouts" else "index"))
 
     return app

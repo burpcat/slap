@@ -212,12 +212,39 @@ def _send_one(conn, api_key: str, row: dict, *, workdir_root: Path = WORKDIR_ROO
 
 
 def _send_ooo_resend(conn, api_key: str, row: dict, *, workdir_root: Path = WORKDIR_ROOT,
-                      create_draft_fn=gmass.create_draft, send_campaign_fn=gmass.send_campaign) -> bool:
+                      create_draft_fn=gmass.create_draft, send_campaign_fn=gmass.send_campaign,
+                      today: date = None) -> bool:
     """The OOO counterpart to _send_one (§7, step 10): resends the
     recipient's next stage as a reply threaded into their original
     conversation. Reuses the stage body already sitting in the staged
     manifest from the original send — no new drop/template data needed, and
-    no attachment (a threaded follow-up doesn't re-attach the résumé)."""
+    no attachment (a threaded follow-up doesn't re-attach the résumé).
+
+    Manual OOO-pause continuation (post-launch): GMass's native follow-up
+    timer for this recipient is BELIEVED suppressed from the moment they were
+    first marked OOO (account-wide unsubscribe — see slap.gmass.
+    unsubscribe_recipient's docstring for exactly what's verified vs. still
+    an unconfirmed assumption there) — SLAP proceeds as though nothing else
+    will ever fire their remaining stages regardless, so if the persona's
+    cadence still has one left after this send, THIS function schedules it:
+    records `next_resume_date` in this same `requeued` event's own meta (one
+    atomic write, no second event needed — see slap.queue.
+    due_for_ooo_resend/_pending_ooo_resume_date for how that's read back),
+    anchored to `today` (the date this stage actually fired) plus the
+    persona's own inter-stage gap for the next transition — a continuation
+    of the existing sequence, never a restart from stage 1.
+
+    A cadence-exhausted recipient (no next stage at all) is a TERMINAL
+    condition, not a transient one — retrying can never succeed, since a
+    cadence's length never changes for an already-staged recipient. Marked
+    with its own `send_failed` meta discriminator
+    (`{"stage": "ooo_cadence_exhausted"}`) so slap.queue.
+    _pending_ooo_resume_date recognizes it as CLOSING the pending OOO state
+    (an iron-audit SHOULD-FIX) — without this, a recipient marked OOO with
+    nothing left to resend (newly reachable via the unconditional Reach-outs
+    "Mark OOO" action, e.g. a single-stage persona or a recipient already at
+    their final stage) would generate an identical send_failed on every
+    single future drain, forever."""
     recipient, campaign = row["recipient"], row["campaign"]
     workdir = recipient_workdir(campaign, recipient, root=workdir_root)
 
@@ -225,12 +252,20 @@ def _send_ooo_resend(conn, api_key: str, row: dict, *, workdir_root: Path = WORK
         manifest = load_manifest(workdir)
         cadence = manifest["cadence"]
         stage_bodies = manifest["stage_bodies"]
-        next_stage = row["current_stage"] + 1
-        if next_stage > len(cadence):
-            raise RunnerError(
-                f"no next stage to resend — current_stage={row['current_stage']}, "
-                f"cadence has {len(cadence)} stage(s)"
-            )
+    except Exception as e:
+        append_event(conn, type="send_failed", recipient=recipient, campaign=campaign,
+                     meta={"stage": "load_staged_data_ooo", "error": str(e)})
+        return False
+
+    next_stage = row["current_stage"] + 1
+    if next_stage > len(cadence):
+        append_event(conn, type="send_failed", recipient=recipient, campaign=campaign,
+                     meta={"stage": "ooo_cadence_exhausted",
+                           "error": f"no next stage to resend — current_stage={row['current_stage']}, "
+                                    f"cadence has {len(cadence)} stage(s)"})
+        return False
+
+    try:
         stage_body = stage_bodies[next_stage - 1]
         reply_to_campaign_id = row["last_gmass_campaign_id"]
         if not reply_to_campaign_id:
@@ -261,8 +296,13 @@ def _send_ooo_resend(conn, api_key: str, row: dict, *, workdir_root: Path = WORK
                      gmass_draft_id=draft_id, meta={"stage": "send_campaign_ooo", "error": str(e)})
         return False
 
+    next_resume_date = None
+    if next_stage < len(cadence):
+        next_resume_date = (today or date.today()) + timedelta(days=cadence[next_stage])
+
     append_event(conn, type="requeued", recipient=recipient, campaign=campaign, stage=next_stage,
-                 gmass_campaign_id=sent["campaign_id"], gmass_draft_id=draft_id)
+                 gmass_campaign_id=sent["campaign_id"], gmass_draft_id=draft_id,
+                 meta={"next_resume_date": next_resume_date.isoformat()} if next_resume_date else None)
     return True
 
 
@@ -289,18 +329,38 @@ def drain(conn, global_config, api_key: str, *, now: date = None, sleep_fn=time.
     # OOO resends (§7) share the exact same cap/gap/preflight/exception
     # handling as initial sends — "fire on the same runner cadence," no
     # special scheduling — so they're just more rows in the same batch.
-    due = due_recipients(conn) + due_for_ooo_resend(conn)
+    #
+    # Dispatch is tagged by WHICH due-list a row came from, not by
+    # row["status"]: a recipient mid-way through a multi-stage manual
+    # OOO-pause continuation (post-launch feature) shows status='active'
+    # between stages (see slap.queue.due_for_ooo_resend's docstring) — the
+    # same status a perfectly normal, never-OOO'd recipient has — so status
+    # alone can no longer tell the two apart.
+    #
+    # Defense in depth against a double-send (iron-audit BLOCKER): the two
+    # due-lists are designed to never overlap (see due_for_ooo_resend's own
+    # docstring — its campaign-scoping is the actual fix), but a recipient
+    # already dispatched to _send_one this drain is explicitly excluded from
+    # the OOO list too, belt-and-suspenders, so a future change to either
+    # query can never resend to the same recipient twice in one batch.
+    due_initial = due_recipients(conn)
+    due_ooo = due_for_ooo_resend(conn, today=today)
+    initial_recipients = {row["recipient"] for row in due_initial}
+    due = ([(row, _send_one) for row in due_initial]
+           + [(row, _send_ooo_resend) for row in due_ooo if row["recipient"] not in initial_recipients])
     to_send = due[:headroom]
 
     sent_count = 0
     failed_count = 0
-    for i, row in enumerate(to_send):
+    for i, (row, send_fn) in enumerate(to_send):
         if i > 0:
             sleep_fn(random_fn(global_config.schedule.send_delay_min, global_config.schedule.send_delay_max))
-        send_fn = _send_ooo_resend if row["status"] == "ooo_requeued" else _send_one
+        kwargs = {"workdir_root": workdir_root, "create_draft_fn": create_draft_fn,
+                  "send_campaign_fn": send_campaign_fn}
+        if send_fn is _send_ooo_resend:
+            kwargs["today"] = today
         try:
-            ok = send_fn(conn, api_key, row, workdir_root=workdir_root,
-                         create_draft_fn=create_draft_fn, send_campaign_fn=send_campaign_fn)
+            ok = send_fn(conn, api_key, row, **kwargs)
         except Exception as e:
             # Defense in depth: _send_one/_send_ooo_resend already convert
             # their own known failure modes to send_failed, but no bug in
@@ -315,7 +375,7 @@ def drain(conn, global_config, api_key: str, *, now: date = None, sleep_fn=time.
         else:
             failed_count += 1
 
-    remaining = len(due_recipients(conn)) + len(due_for_ooo_resend(conn))
+    remaining = len(due_recipients(conn)) + len(due_for_ooo_resend(conn, today=today))
     append_event(conn, type="run_completed",
                  meta={"sent": sent_count, "failed": failed_count, "remaining_queued": remaining})
     return DrainResult(ran=True, sent=sent_count, failed=failed_count, remaining_queued=remaining)

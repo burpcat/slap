@@ -13,7 +13,7 @@ import pytest
 
 from slap.gmass import (
     GMassError, build_campaign_settings, build_reply_settings, create_draft, get_reports, send_campaign,
-    _plain_text_to_html,
+    unsubscribe_recipient, _plain_text_to_html,
 )
 
 
@@ -180,6 +180,32 @@ def test_get_reports_http_error_raises(mock_get):
     mock_get.return_value = _response(500, {"error": "boom"})
     with pytest.raises(GMassError, match="HTTP 500"):
         get_reports("key", 1, "bounces")
+
+
+# --- unsubscribe_recipient (manual OOO pause, post-launch) ----------------
+# ACCOUNT-WIDE endpoint (POST /api/unsubscribes, no campaignId) — a
+# deliberate choice, not the per-campaign endpoint its own docs' naming
+# might suggest. See this function's own docstring + CONTROL_SHEET.md for
+# the live evidence the per-campaign variant doesn't actually work.
+
+@patch("slap.gmass.requests.post")
+def test_unsubscribe_recipient_posts_to_account_wide_endpoint(mock_post):
+    mock_post.return_value = _response(
+        200, {"emailAddress": "a@x.com", "unsubscribeTime": "2026-08-01T00:00:00", "sender": None}
+    )
+    result = unsubscribe_recipient("key", "a@x.com")
+    assert result == {"emailAddress": "a@x.com", "unsubscribeTime": "2026-08-01T00:00:00", "sender": None}
+    url = mock_post.call_args[0][0]
+    assert url == "https://api.gmass.co/api/unsubscribes"  # no campaignId in the path
+    assert mock_post.call_args.kwargs["json"] == {"emailAddress": "a@x.com"}
+    assert mock_post.call_args.kwargs["headers"] == {"X-apikey": "key"}
+
+
+@patch("slap.gmass.requests.post")
+def test_unsubscribe_recipient_http_error_raises(mock_post):
+    mock_post.return_value = _response(401, {"error": "invalid key"})
+    with pytest.raises(GMassError, match="HTTP 401"):
+        unsubscribe_recipient("key", "a@x.com")
 
 
 # --- build_campaign_settings ----------------------------------------------
