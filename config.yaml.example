@@ -4,6 +4,14 @@ sender:
   from_email: everythingforgenius@gmail.com
   from_name: <Owner Name>
 
+# Used to fill {{signature}} in every campaign template — required (can be
+# an empty string "" to send with no signature, but the key itself must be
+# present; see slap/config.py's load_global_config).
+signature: |-
+  <Your Name>
+  <link — e.g. LinkedIn>
+  <link — e.g. GitHub or portfolio>
+
 gmass:
   api_key_env: GMASS_API_KEY # read from env; never store the key here
 

@@ -15,6 +15,16 @@ PLACEHOLDER_RE = re.compile(r"\{\{(\w+)\}\}")
 # would silently miss (a stray space, a hyphenated key, ...).
 ANY_PLACEHOLDER_RE = re.compile(r"\{\{([^{}]*)\}\}")
 
+# {{key}}s that are constants from config.yaml, not per-recipient drop
+# values — currently just the email signature (post-launch feature: moving
+# the sign-off out of every template into one place). Referenced by
+# slap.config.load_campaign()'s placeholder-vs-field validation (so a
+# template can use {{signature}} without campaign.yaml having to declare a
+# fake "signature" drop field) AND by merge_config_values() below, which is
+# what actually supplies the value at fill time — keep both in sync if a
+# second config-sourced constant is ever added.
+CONFIG_SOURCED_KEYS = {"signature"}
+
 
 def extract_placeholder_keys(text: str) -> set:
     return set(PLACEHOLDER_RE.findall(text))
@@ -77,3 +87,19 @@ def fill_template(text: str, values: dict, fields: list) -> str:
             continue
         out_lines.append(PLACEHOLDER_RE.sub(lambda m: values[m.group(1)], line))
     return "\n".join(out_lines)
+
+
+def merge_config_values(values: dict, *, signature: str) -> dict:
+    """The one place drop-parsed `values` and config-sourced constants (see
+    CONFIG_SOURCED_KEYS) combine into a single fill context — fill_template()
+    itself never needs to know or care whether a given {{key}} came from
+    this recipient's pasted drop or from config.yaml's `signature`; it just
+    fills whatever's in the dict it's handed. This is the one seam any
+    future config-sourced constant should be added through, rather than
+    scattering `{**values, "new_key": ...}` merges across call sites.
+
+    `values` is returned untouched (a new dict is built) — callers that
+    still need the original drop-only values afterward (e.g. slap.py reads
+    values.get("company", ...) again after this call, for the résumé
+    archive) are unaffected."""
+    return {**values, "signature": signature}

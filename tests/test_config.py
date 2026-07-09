@@ -11,6 +11,8 @@ sender:
   from_email: everythingforgenius@gmail.com
   from_name: Test Owner
 
+signature: "Test Owner\\nlinkedin.com/in/testowner"
+
 gmass:
   api_key_env: GMASS_API_KEY
 
@@ -81,11 +83,37 @@ def test_load_global_config_valid(tmp_path):
     }
     assert cfg.schedule.daily_cap == 500
     assert cfg.consumer_domains_file == "consumer_domains.txt"
+    assert cfg.signature == "Test Owner\nlinkedin.com/in/testowner"
 
 
 def test_load_global_config_missing_file(tmp_path):
     with pytest.raises(ConfigError, match="not found"):
         load_global_config(tmp_path / "config.yaml")
+
+
+# --- signature ------------------------------------------------------------
+
+def test_load_global_config_missing_signature_key_fails_loud(tmp_path):
+    bad = VALID_CONFIG_YAML.replace('signature: "Test Owner\\nlinkedin.com/in/testowner"\n', "")
+    path = write_global_config(tmp_path, bad)
+    with pytest.raises(ConfigError, match="signature"):
+        load_global_config(path)
+
+
+def test_load_global_config_empty_signature_is_allowed(tmp_path):
+    # Explicit, deliberate choice to send with no signature — the key must
+    # still be PRESENT, but an empty string is not a missing-config error.
+    text = VALID_CONFIG_YAML.replace('signature: "Test Owner\\nlinkedin.com/in/testowner"', 'signature: ""')
+    path = write_global_config(tmp_path, text)
+    cfg = load_global_config(path)
+    assert cfg.signature == ""
+
+
+def test_load_global_config_non_string_signature_fails_loud(tmp_path):
+    text = VALID_CONFIG_YAML.replace('signature: "Test Owner\\nlinkedin.com/in/testowner"', "signature: [1, 2]")
+    path = write_global_config(tmp_path, text)
+    with pytest.raises(ConfigError, match="must be a string"):
+        load_global_config(path)
 
 
 def test_load_global_config_missing_key_fails_loud(tmp_path):
@@ -222,6 +250,17 @@ def test_load_campaign_unknown_placeholder_fails_loud(tmp_path):
     campaigns_dir, _ = write_campaign(tmp_path, initial_txt=bad_initial)
     with pytest.raises(ConfigError, match="nonexistent_field"):
         load_campaign("coldpost", global_config, campaigns_dir)
+
+
+def test_load_campaign_allows_signature_placeholder_with_no_matching_field(tmp_path):
+    # {{signature}} is a config-sourced constant (CONFIG_SOURCED_KEYS), not a
+    # drop-parsed field — campaign.yaml never declares a "signature" field,
+    # and load_campaign() must not treat that as an unknown-placeholder error.
+    global_config = load_global_config(write_global_config(tmp_path))
+    initial_with_signature = "Subject: Hi\n\nWelcome, {{byebye}},\n{{signature}}\n"
+    campaigns_dir, _ = write_campaign(tmp_path, initial_txt=initial_with_signature)
+    campaign = load_campaign("coldpost", global_config, campaigns_dir)
+    assert "{{signature}}" in campaign.body_template
 
 
 def test_load_campaign_malformed_placeholder_fails_loud(tmp_path):

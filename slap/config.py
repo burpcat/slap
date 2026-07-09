@@ -12,7 +12,7 @@ from pathlib import Path
 
 import yaml
 
-from slap.templates import extract_placeholder_keys, find_malformed_placeholders
+from slap.templates import CONFIG_SOURCED_KEYS, extract_placeholder_keys, find_malformed_placeholders
 
 CONFIG_PATH = Path("config.yaml")
 CAMPAIGNS_DIR = Path("campaigns")
@@ -64,6 +64,12 @@ class GlobalConfig:
     schedule: ScheduleConfig
     consumer_domains_file: str
     path: Path
+    # Defaulted (unlike every field above) so the many existing tests that
+    # construct GlobalConfig directly for unrelated features (dashboard,
+    # doctor, cleanup, runner, launchd) don't need to care about this one —
+    # load_global_config() below is what actually enforces "must be present
+    # in config.yaml," not this dataclass's own constructor.
+    signature: str = ""
 
 
 @dataclass
@@ -99,6 +105,16 @@ def load_global_config(path: Path = CONFIG_PATH) -> GlobalConfig:
     from_email = _require(raw, "sender.from_email", path)
     from_name = _require(raw, "sender.from_name", path)
     api_key_env = _require(raw, "gmass.api_key_env", path)
+
+    # _require raises only when the KEY is absent — a key present but set to
+    # "" returns "" cleanly, exactly matching this feature's required
+    # behavior: missing entirely -> fail loud; present-but-empty -> allowed,
+    # renders with no signature, no warning. Every template's {{signature}}
+    # relies on this always being at least a string (never None) once
+    # loading succeeds.
+    signature = _require(raw, "signature", path)
+    if not isinstance(signature, str):
+        raise ConfigError(f"{path}: 'signature' must be a string — got {signature!r}")
 
     personas_raw = _require(raw, "personas", path)
     if not isinstance(personas_raw, dict) or not personas_raw:
@@ -159,6 +175,7 @@ def load_global_config(path: Path = CONFIG_PATH) -> GlobalConfig:
         schedule=schedule,
         consumer_domains_file=consumer_domains_file,
         path=path,
+        signature=signature,
     )
 
 
@@ -218,7 +235,7 @@ def load_campaign(name: str, global_config: GlobalConfig, campaigns_dir: Path = 
     _validate_stage_files(campaign_path, cadence)
     stage_bodies = _read_stage_bodies(campaign_path, cadence)
     _validate_placeholder_keys(
-        yaml_path, {f.key for f in fields}, subject_template, body_template, *stage_bodies
+        yaml_path, {f.key for f in fields} | CONFIG_SOURCED_KEYS, subject_template, body_template, *stage_bodies
     )
 
     return CampaignConfig(
@@ -286,5 +303,7 @@ def _validate_placeholder_keys(yaml_path: Path, known_keys: set, *texts: str) ->
     if unknown:
         raise ConfigError(
             f"{yaml_path}: template(s) reference undefined field key(s) {sorted(unknown)} "
-            f"— check campaign.yaml 'fields' vs {{{{...}}}} placeholders"
+            f"— check campaign.yaml 'fields' vs {{{{...}}}} placeholders (config-sourced "
+            f"constants like {sorted(CONFIG_SOURCED_KEYS)} are always allowed and need no "
+            f"matching field)"
         )

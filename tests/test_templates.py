@@ -3,7 +3,9 @@ SLAP_BUILD_PROMPT.md §13 B: first-colon split; one-space strip; optional
 empty -> line dropped; the 'Req ID: 6900' colon-in-value case.
 """
 from slap.config import CampaignField
-from slap.templates import fill_template, find_malformed_placeholders, parse_drop
+from slap.templates import (
+    CONFIG_SOURCED_KEYS, fill_template, find_malformed_placeholders, merge_config_values, parse_drop,
+)
 
 FIELDS = [
     CampaignField(key="email", label="Email"),
@@ -187,3 +189,56 @@ def test_fill_template_end_to_end_with_parse_drop():
     values = parse_drop(drop, FIELDS)
     filled = fill_template(text, values, FIELDS)
     assert filled == "Subject line unrelated\nHi Acme Corp team,\nBest,\njane@acme.com"
+
+
+# --- merge_config_values (email signature, post-launch feature) ------------
+
+def test_merge_config_values_adds_signature_alongside_drop_values():
+    values = {"email": "jane@acme.com", "company": "Acme"}
+    merged = merge_config_values(values, signature="Avinash\nlinkedin.com/in/avinash")
+    assert merged == {
+        "email": "jane@acme.com", "company": "Acme",
+        "signature": "Avinash\nlinkedin.com/in/avinash",
+    }
+
+
+def test_merge_config_values_does_not_mutate_the_original_values_dict():
+    values = {"email": "jane@acme.com"}
+    merge_config_values(values, signature="Avinash")
+    assert values == {"email": "jane@acme.com"}  # untouched — a new dict was returned
+
+
+def test_merge_config_values_signature_key_matches_config_sourced_keys():
+    # Anything merge_config_values() supplies must be exactly what
+    # slap.config.load_campaign()'s placeholder validation allows through
+    # without a matching campaign.yaml field — this pins the two in sync.
+    merged = merge_config_values({}, signature="x")
+    assert set(merged) == CONFIG_SOURCED_KEYS
+
+
+def test_fill_template_substitutes_signature_from_merged_values():
+    text = "{{byebye}},\n{{signature}}"
+    values = merge_config_values(
+        {"byebye": "Best"}, signature="Avinash Arutla\nhttps://www.linkedin.com/in/avinasharutla/"
+    )
+    filled = fill_template(text, values, fields=[])
+    assert filled == "Best,\nAvinash Arutla\nhttps://www.linkedin.com/in/avinasharutla/"
+
+
+def test_fill_template_empty_signature_renders_blank_line_not_dropped():
+    # signature is never declared as an "optional" campaign field (it isn't
+    # a campaign field at all), so an empty value renders as a blank line —
+    # it does NOT trigger the optional-field whole-line-drop behavior.
+    text = "{{byebye}},\n{{signature}}"
+    values = merge_config_values({"byebye": "Best"}, signature="")
+    filled = fill_template(text, values, fields=[])
+    assert filled == "Best,\n"
+
+
+def test_fill_template_adds_signature_to_a_template_with_no_prior_sign_off():
+    # The "addition" path (a stageN.txt that never had a sign-off at all),
+    # not just the "replacement" path.
+    text = "Just a quick follow-up, no news yet.\n\n{{signature}}"
+    values = merge_config_values({}, signature="Avinash Arutla\ngithub.com/burpcat")
+    filled = fill_template(text, values, fields=[])
+    assert filled == "Just a quick follow-up, no news yet.\n\nAvinash Arutla\ngithub.com/burpcat"

@@ -17,7 +17,7 @@ from slap.cleanup import DEFAULT_MIN_DAYS_IDLE, delete_eligible, find_cleanup_ca
 from slap.config import ConfigError, discover_campaigns, load_campaign, load_global_config
 from slap.latex import recipient_workdir, run_latex_loop
 from slap.queue import stage_recipient
-from slap.templates import fill_template, parse_drop
+from slap.templates import fill_template, merge_config_values, parse_drop
 from slap import archive, dashboard, doctor, domains, gmass, init, launchd, runner, tracking
 
 load_dotenv()
@@ -113,7 +113,8 @@ def cmd_send(args):
         if not recipient:
             display.error("No 'Email' value found in the drop — skipping this recipient.")
         else:
-            _prep_one_recipient(conn, campaign, consumer_domains, values, recipient, archive_dir)
+            _prep_one_recipient(conn, campaign, consumer_domains, values, recipient, archive_dir,
+                                signature=global_config.signature)
 
         if input("\nAdd another? [Y/n]: ").strip().lower() == "n":
             break
@@ -164,7 +165,8 @@ def _offer_resume_reuse(matches: list, *, read_line=input):
         display.warn(f"  Not understood — enter a number 0-{len(matches)}.")
 
 
-def _prep_one_recipient(conn, campaign, consumer_domains, values, recipient, archive_dir, *, read_line=input):
+def _prep_one_recipient(conn, campaign, consumer_domains, values, recipient, archive_dir, *,
+                         signature: str, read_line=input):
     if campaign.latex_enabled:
         tex_source = read_paste(f"\nPaste the LaTeX résumé source for {recipient}")
         workdir = recipient_workdir(campaign.name, recipient)
@@ -222,9 +224,16 @@ def _prep_one_recipient(conn, campaign, consumer_domains, values, recipient, arc
     # only reads them to print a display-only rendering — it never wraps,
     # mutates, or returns a styled version of these variables, so no ANSI
     # code can ever reach the template-filled message that gets staged/sent.
-    subject = fill_template(campaign.subject_template, values, campaign.fields)
-    body = fill_template(campaign.body_template, values, campaign.fields)
-    stage_bodies = [fill_template(s, values, campaign.fields) for s in campaign.stage_bodies]
+    #
+    # fill_values merges the config-sourced signature into the same fill
+    # context as the drop-parsed values (see slap.templates.
+    # merge_config_values) — `values` itself is left untouched, since the
+    # company/role/req_id lookups below (for the résumé archive) still read
+    # from it directly.
+    fill_values = merge_config_values(values, signature=signature)
+    subject = fill_template(campaign.subject_template, fill_values, campaign.fields)
+    body = fill_template(campaign.body_template, fill_values, campaign.fields)
+    stage_bodies = [fill_template(s, fill_values, campaign.fields) for s in campaign.stage_bodies]
 
     _warn_empty_fields(campaign, values)
     display.preview_panel(recipient, subject, body)

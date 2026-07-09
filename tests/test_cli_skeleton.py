@@ -735,3 +735,118 @@ def test_send_reuse_of_broken_archive_entry_fails_loud_for_that_recipient_only(t
 
     assert not (tmp_path / "workdir" / "coldpost" / recipient1 / "staged.json").exists()
     assert (tmp_path / "workdir" / "coldpost" / recipient2 / "staged.json").exists()
+
+
+# --- email signature moved into config.yaml (post-launch feature) ----------
+
+SIGNATURE_TEXT = "Avinash Arutla\nhttps://www.linkedin.com/in/avinasharutla/"
+
+
+def _setup_signature_campaign(tmp_path, *, config_signature=SIGNATURE_TEXT, signature_key_present=True):
+    config_text = (
+        (Path(__file__).resolve().parent.parent / "config.yaml.example")
+        .read_text()
+        .replace("<Owner Name>", "Test Owner")
+    )
+    if signature_key_present:
+        # Replace the whole example |- block (3 indented lines) with a
+        # single-line signature so the test's expected string is exact and
+        # simple to assert on, regardless of the example's own placeholder text.
+        lines = config_text.splitlines()
+        out, skip = [], False
+        for line in lines:
+            if line.strip().startswith("signature:"):
+                out.append(f'signature: "{config_signature}"'.replace("\n", "\\n"))
+                skip = True
+                continue
+            if skip and line.startswith("  "):
+                continue  # part of the old |- block, drop it
+            skip = False
+            out.append(line)
+        config_text = "\n".join(out) + "\n"
+    else:
+        # Strip the signature key (and its indented block) entirely.
+        lines = config_text.splitlines()
+        out, skip = [], False
+        for line in lines:
+            if line.strip().startswith("signature:"):
+                skip = True
+                continue
+            if skip and (line.startswith("  ") or not line.strip()):
+                continue
+            skip = False
+            out.append(line)
+        config_text = "\n".join(out) + "\n"
+    (tmp_path / "config.yaml").write_text(config_text)
+    (tmp_path / "consumer_domains.txt").write_text(
+        (Path(__file__).resolve().parent.parent / "consumer_domains.txt").read_text()
+    )
+
+    campaign = tmp_path / "campaigns" / "coldpost"
+    campaign.mkdir(parents=True)
+    (campaign / "campaign.yaml").write_text(
+        "persona: recruiter\n"
+        "latex: { enabled: false, attachment_name: r.pdf }\n"
+        "attachment_file: resume.pdf\n"
+        "fields:\n"
+        "  - { key: email,   label: Email }\n"
+        "  - { key: company, label: Company }\n"
+        "  - { key: byebye,  label: Signoff }\n"
+    )
+    (campaign / "resume.pdf").write_bytes(b"%PDF-fake")
+    # initial.txt: the "replace an existing hardcoded sign-off" path.
+    (campaign / "initial.txt").write_text(
+        "Subject: Hi {{company}}\n\nBody text about {{company}}.\n\n{{byebye}},\n{{signature}}\n"
+    )
+    # stage1.txt: the "add to a template with NO prior sign-off at all" path.
+    (campaign / "stage1.txt").write_text("Just checking in, no news yet.\n\n{{signature}}\n")
+    (campaign / "stage2.txt").write_text("Second follow-up.\n\n{{signature}}\n")
+    (campaign / "stage3.txt").write_text("Last one from me.\n\n{{signature}}\n")
+    return campaign
+
+
+def test_send_substitutes_configured_signature_in_initial_and_stage_files(tmp_path):
+    _setup_signature_campaign(tmp_path)
+    recipient = "jane@acme.com"
+    drop = f"Email: {recipient}\nCompany: Acme\nSignoff: Best\n"
+    scripted_stdin = f"{drop}\nEOF\ny\nn\n"  # drop, stage, no-more
+
+    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    manifest = json.loads((tmp_path / "workdir" / "coldpost" / recipient / "staged.json").read_text())
+    assert manifest["body"] == f"Body text about Acme.\n\nBest,\n{SIGNATURE_TEXT}"
+    # stage1/2/3 had NO sign-off at all before this feature -- confirms the
+    # ADDITION path, not just the replacement path.
+    assert manifest["stage_bodies"][0] == f"Just checking in, no news yet.\n\n{SIGNATURE_TEXT}"
+    assert manifest["stage_bodies"][1] == f"Second follow-up.\n\n{SIGNATURE_TEXT}"
+    assert manifest["stage_bodies"][2] == f"Last one from me.\n\n{SIGNATURE_TEXT}"
+
+
+def test_send_fails_loud_when_signature_missing_before_reading_stdin(tmp_path):
+    _setup_signature_campaign(tmp_path, signature_key_present=False)
+    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    # No `input=` at all -- if this didn't fail before ever reading stdin,
+    # the subprocess would hang waiting for a drop paste and the test would
+    # time out instead of returning promptly.
+    result = run("send", "coldpost", cwd=tmp_path, env=env)
+
+    assert result.returncode != 0
+    assert "signature" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_send_empty_signature_renders_blank_with_no_error(tmp_path):
+    _setup_signature_campaign(tmp_path, config_signature="")
+    recipient = "jane@acme.com"
+    drop = f"Email: {recipient}\nCompany: Acme\nSignoff: Best\n"
+    scripted_stdin = f"{drop}\nEOF\ny\nn\n"
+
+    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    manifest = json.loads((tmp_path / "workdir" / "coldpost" / recipient / "staged.json").read_text())
+    assert manifest["body"] == "Body text about Acme.\n\nBest,\n"
+    assert manifest["stage_bodies"][0] == "Just checking in, no news yet.\n\n"
