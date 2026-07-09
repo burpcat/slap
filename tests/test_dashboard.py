@@ -122,11 +122,11 @@ def test_sync_reports_records_a_block_that_bounces_alone_would_miss(conn):
     # only mocked "bounces" and left "blocks" returning [], it would pass
     # even with the bug still present — it must return a REAL item for
     # "blocks" and nothing for "bounces" to actually exercise the gap.
-    seed_sent_recipient(conn, recipient="broutray@redhat.com")
+    seed_sent_recipient(conn, recipient="blocked@acme.com")
     with patch("slap.dashboard.gmass.get_reports") as mock_get:
         def side_effect(api_key, cid, report_type):
             if report_type == "blocks":
-                return [{"emailAddress": "broutray@redhat.com", "blockReason": "554 rejected", "blockTime": "t1"}]
+                return [{"emailAddress": "blocked@acme.com", "blockReason": "554 rejected", "blockTime": "t1"}]
             return []  # bounces (and everything else) genuinely empty for this recipient
         mock_get.side_effect = side_effect
         result = sync_reports(conn, "fake-key")
@@ -714,9 +714,9 @@ def test_bounces_distinguishes_bounce_from_block_category(conn):
 
 def test_bounces_defaults_category_to_bounce_for_pre_existing_events_without_it(conn):
     # Backward compatibility: a bounce event recorded before `category`
-    # existed (e.g. the real, already-recorded gmccormick@expediagroup.com
-    # event this investigation started from) has no such meta key at all —
-    # must default to "bounce", never crash, never guess "block".
+    # existed (e.g. the real, already-recorded bounce this investigation
+    # started from) has no such meta key at all — must default to
+    # "bounce", never crash, never guess "block".
     append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0,
                  meta={"persona": "recruiter"})
     append_event(conn, type="bounce", recipient="a@x.com", campaign="c",
