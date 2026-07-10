@@ -139,7 +139,7 @@ dashboard, deliverability tips). Quick reference:
 | `python slap.py init` | Interactive installer — see Setup above. Safe to re-run any time. |
 | `python slap.py list` | Lists every auto-discovered campaign (persona, LaTeX on/off). |
 | `python slap.py send <campaign> [--now]` | Interactive prep: paste a drop, optionally compile/preview a LaTeX résumé, see domain-dedup warnings (and, for a static campaign, an offer to reuse an archived résumé) and a preview, then stage the send to the queue. `--now` also drains the queue immediately afterward instead of waiting for the scheduled runner. |
-| `python slap.py dashboard` | Starts the localhost dashboard at `http://127.0.0.1:5000` — today/week stats, engagement metrics, replies needing triage (tag as real/OOO/not-interested), bounces & blocks, pipeline, recent run history, and a link to the all-campaigns **Reach-outs** page (`/reachouts`, filterable, read-only). |
+| `python slap.py dashboard` | Starts the localhost dashboard at `http://127.0.0.1:5050` — today/week stats, engagement metrics, replies needing triage (tag as real/OOO/not-interested), bounces & blocks, pipeline, recent run history, and a link to the all-campaigns **Reach-outs** page (`/reachouts`, filterable, read-only). |
 | `python slap.py doctor` | Preflight checks — see Setup above. Safe to run any time. |
 | `python slap.py domains` | Regenerates and prints a read-only domain index from tracked events (who you've contacted, grouped by email domain) — for manual inspection, not itself a source of truth. |
 | `python slap.py rebuild` | Rebuilds the `recipients` cache table by replaying the full `events` log. Use this if the cache ever looks wrong — `events` is always the source of truth. |

@@ -88,7 +88,7 @@ you're about to introduce the class of bug this project is built to avoid.
    GMass's native stop-on-reply actually behaves this way has never been behaviorally
    confirmed** — see §11.
 4. **Monitor:**
-   - `python slap.py dashboard` → localhost page at `http://127.0.0.1:5000`, polls GMass
+   - `python slap.py dashboard` → localhost page at `http://127.0.0.1:5050`, polls GMass
      reports on open (replies/clicks/bounces/blocks), shows sends/clicks/replies/
      bounces-and-blocks + engagement + pipeline + today's runs. Owner tags replies
      (real / OOO / not-interested) here; OOO re-queues the next stage as a send-as-reply

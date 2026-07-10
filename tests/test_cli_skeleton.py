@@ -353,7 +353,7 @@ def test_plist_prints_a_valid_plist_for_this_repo(tmp_path):
 def test_dashboard_fails_loud_without_config(tmp_path):
     # Must fail during load_global_config, before ever reaching
     # dashboard.create_app()/app.run() (which would block the test forever
-    # serving on 127.0.0.1:5000).
+    # serving on 127.0.0.1:5050).
     result = run("dashboard", cwd=tmp_path)
     assert result.returncode != 0
     assert "config.yaml" in result.stderr

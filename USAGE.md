@@ -205,7 +205,7 @@ confirm it lands and looks right, then you're clear to send to real recipients.
 | `python slap.py init` | Interactive installer (config.yaml, .env, schedule, DB, launchd). Re-runnable any time. |
 | `python slap.py list` | Lists every auto-discovered campaign (persona, LaTeX on/off). |
 | `python slap.py send <campaign> [--now]` | The prep flow above. `--now` also drains immediately. |
-| `python slap.py dashboard` | Starts the localhost dashboard at `http://127.0.0.1:5000`, plus the filterable all-campaigns Reach-outs page at `/reachouts`. |
+| `python slap.py dashboard` | Starts the localhost dashboard at `http://127.0.0.1:5050`, plus the filterable all-campaigns Reach-outs page at `/reachouts`. |
 | `python slap.py doctor` | Preflight checks — sender fields, API key, DB, consumer domains file, every campaign's attachment/LaTeX toolchain, and (separately, never blocking) `RESUME_ARCHIVE_DIR`'s validity and any dangling symlinks in it. Safe to run any time; the core checks also run automatically before every `send` and every drain. |
 | `python slap.py domains` | Prints a read-only index of who you've contacted, grouped by email domain — for manual inspection. |
 | `python slap.py rebuild` | Rebuilds the `recipients` cache table by replaying the full `events` log from scratch. Use this if the cache ever looks wrong — `events` is always the source of truth, the cache is fully disposable. |
@@ -277,7 +277,7 @@ company, to reuse for the new recipient instead of the campaign's usual
 python slap.py dashboard
 ```
 
-Opens `http://127.0.0.1:5000`. Panels, top to bottom:
+Opens `http://127.0.0.1:5050`. Panels, top to bottom:
 
 - **Metrics** — today/this-week send counts (initial vs. follow-up split).
 - **Next drain** — when the runner is next scheduled to fire.
@@ -311,7 +311,7 @@ filterable)" below.
 ## Reach-outs (all campaigns, filterable)
 
 ```
-http://127.0.0.1:5000/reachouts
+http://127.0.0.1:5050/reachouts
 ```
 
 A separate, read-only page: one row per recipient across every campaign, filterable and

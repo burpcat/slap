@@ -313,8 +313,12 @@ def cmd_dashboard(args):
 
     tracking.connect().close()  # ensure the DB file + schema exist before serving
     app = dashboard.create_app(tracking.DB_PATH, global_config, consumer_domains, api_key)
-    display.success("Dashboard running at http://127.0.0.1:5000 — Ctrl-C to stop.")
-    app.run(host="127.0.0.1", port=5000)
+    # Not 5000: macOS's AirPlay Receiver (Control Center) listens there by
+    # default on every Mac since Monterey and silently intercepts requests
+    # with its own 403 page, making the dashboard look broken when it's
+    # actually running fine — a real, commonly-hit conflict, not a guess.
+    display.success("Dashboard running at http://127.0.0.1:5050 — Ctrl-C to stop.")
+    app.run(host="127.0.0.1", port=5050)
 
 
 def cmd_doctor(args):
