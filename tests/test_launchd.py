@@ -8,7 +8,7 @@ import plistlib
 import pytest
 
 from slap.config import GlobalConfig, ScheduleConfig
-from slap.launchd import LAUNCHD_WEEKDAY, LaunchdError, render_plist
+from slap.launchd import LAUNCHD_WEEKDAY, LaunchdError, render_plist, render_sync_plist
 
 
 def make_global_config(*, fire_window_start="09:00", active_days=None):
@@ -98,3 +98,58 @@ def test_render_plist_fails_loud_on_empty_active_days(tmp_path):
     gc.schedule.active_days = []
     with pytest.raises(LaunchdError, match="active_days is empty"):
         render_plist(gc, tmp_path, "/usr/bin/python3")
+
+
+# --- render_sync_plist (post-launch feature: Redis-backed dashboard cache) --
+# A plain fixed hourly interval, deliberately NOT the runner's calendar/
+# weekday-restricted shape — a separate function/plist, not a shared one
+# (see that function's own docstring for why).
+
+def test_render_sync_plist_is_valid_plist_xml(tmp_path):
+    xml = render_sync_plist(tmp_path, "/usr/bin/python3")
+    parsed = plistlib.loads(xml.encode())
+    assert parsed["Label"] == "com.slap.sync"
+
+
+def test_render_sync_plist_uses_start_interval_not_calendar_interval(tmp_path):
+    xml = render_sync_plist(tmp_path, "/usr/bin/python3")
+    parsed = plistlib.loads(xml.encode())
+    assert parsed["StartInterval"] == 3600
+    assert "StartCalendarInterval" not in parsed
+
+
+def test_render_sync_plist_default_interval_is_one_hour(tmp_path):
+    xml = render_sync_plist(tmp_path, "/usr/bin/python3")
+    parsed = plistlib.loads(xml.encode())
+    assert parsed["StartInterval"] == 3600
+
+
+def test_render_sync_plist_custom_interval(tmp_path):
+    xml = render_sync_plist(tmp_path, "/usr/bin/python3", interval_seconds=1800)
+    parsed = plistlib.loads(xml.encode())
+    assert parsed["StartInterval"] == 1800
+
+
+def test_render_sync_plist_program_arguments_invoke_sync_subcommand(tmp_path):
+    xml = render_sync_plist(tmp_path, "/some/venv/bin/python")
+    parsed = plistlib.loads(xml.encode())
+    args = parsed["ProgramArguments"]
+    assert args[0] == "/some/venv/bin/python"
+    assert args[1] == str((tmp_path / "slap.py").resolve())
+    assert args[2] == "sync"
+
+
+def test_render_sync_plist_working_directory_and_log_paths(tmp_path):
+    xml = render_sync_plist(tmp_path, "/usr/bin/python3")
+    parsed = plistlib.loads(xml.encode())
+    assert parsed["WorkingDirectory"] == str(tmp_path.resolve())
+    assert parsed["StandardOutPath"] == str((tmp_path / "sync.log").resolve())
+    assert parsed["StandardErrorPath"] == str((tmp_path / "sync.err.log").resolve())
+
+
+def test_render_sync_plist_and_render_plist_use_different_labels(tmp_path):
+    # Two independent jobs must never collide under launchd's own Label
+    # namespace (~/Library/LaunchAgents).
+    sync_xml = render_sync_plist(tmp_path, "/usr/bin/python3")
+    runner_xml = render_plist(make_global_config(), tmp_path, "/usr/bin/python3")
+    assert plistlib.loads(sync_xml.encode())["Label"] != plistlib.loads(runner_xml.encode())["Label"]

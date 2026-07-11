@@ -61,6 +61,11 @@
   last synced: {{ sync_result.synced_at | to_local }}
   &middot; +{{ sync_result.new_replies }} replies, +{{ sync_result.new_clicks }} clicks, +{{ sync_result.new_bounces }} bounces this sync
   &middot; <a href="/reachouts">All reach-outs &rarr;</a>
+  {% if cache_status == 'redis_unavailable' %}
+  &middot; <span class="badge warn">cache unavailable — showing live data</span>
+  {% elif cache_status == 'refresh_in_progress' %}
+  &middot; <span class="badge warn">refresh in progress — showing last known data</span>
+  {% endif %}
 </p>
 {% if sync_result.errors %}
 <div class="panel full" style="border-color: var(--critical);">
@@ -120,8 +125,8 @@
           {% for stage in [0, 1, 2, 3] %}
           <tr>
             <td>{{ 'initial' if stage == 0 else 'stage ' + stage|string }}</td>
-            <td class="num">{{ engagement.reply_by_stage.get(stage, 0) }}</td>
-            <td class="num">{{ engagement.click_by_stage.get(stage, 0) }}</td>
+            <td class="num">{{ engagement.reply_by_stage.get(stage|string, 0) }}</td>
+            <td class="num">{{ engagement.click_by_stage.get(stage|string, 0) }}</td>
           </tr>
           {% endfor %}
         </table>

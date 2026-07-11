@@ -60,6 +60,28 @@ regenerate + reload after changing `active_days` or `fire_window_start`** (see b
    launchctl load ~/Library/LaunchAgents/com.slap.runner.plist
    ```
 
+## The hourly cache-sync job (post-launch feature)
+
+`slap.py sync` refreshes the dashboard's Redis-backed cache of GMass reply/click/bounce
+data (see CONTROL_SHEET.md) — a separate, simpler launchd job from the runner above: a
+plain hourly interval, no active-days restriction, no fire-window randomization (there's
+no send-volume/deliverability reason to ever skip an hour of refreshing a read-only
+cache). Requires Redis running locally — `python slap.py doctor` reports whether it's
+reachable; this app never installs or starts Redis itself ("check, don't install").
+
+Install alongside the runner's own plist, same pattern:
+
+```
+python slap.py plist --job sync > ~/Library/LaunchAgents/com.slap.sync.plist
+launchctl load ~/Library/LaunchAgents/com.slap.sync.plist
+```
+
+Logs land at `sync.log`/`sync.err.log`. If Redis isn't running, `sync` fails loud (fast —
+a short connect timeout, not a hang) and the queue/dashboard are unaffected either way:
+the dashboard's on-open fallback still works without this job ever running at all, just
+by polling GMass live whenever the cache turns out to be stale — this job only exists to
+make that the *uncommon* case instead of the *every* case.
+
 ## How the timing works
 
 - Each `StartCalendarInterval` array entry fires at a **fixed anchor time** (the

@@ -31,3 +31,12 @@ schedule:
 
 tracking:
   consumer_domains_file: consumer_domains.txt
+
+# Optional — entirely omittable. Caches GMass reply/click/bounce data for
+# the dashboard, refreshed hourly by `slap.py sync` (see LAUNCHD.md) instead
+# of on every page load. If this block (or Redis itself) isn't there, the
+# dashboard just falls back to live polling on open, exactly like before —
+# `doctor` reports whether Redis is actually reachable, but never blocks a
+# send/drain over it either way.
+redis:
+  url: redis://localhost:6379/0

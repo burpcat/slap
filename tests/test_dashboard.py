@@ -2,6 +2,7 @@
 on-open poll writes new events; panels render from tracking data;
 reply-tag -> OOO -> re-queue fires a send-as-reply.
 """
+import dataclasses
 import json
 import threading
 import urllib.error
@@ -14,13 +15,60 @@ import pytest
 from werkzeug.serving import make_server
 
 from slap.config import GlobalConfig, ScheduleConfig
+from slap import gmass_cache
 from slap.dashboard import (
     _clicked_recipients, _recipient_drop_meta, actionable_replies, bounces, companies_contacted,
-    create_app, engagement_intelligence, filter_reachouts, needs_triage, next_drain, pipeline,
-    reachouts_rows, reply_tags, sync_reports, tag_reply, this_week, today_strip, todays_runs,
-    warm_but_silent,
+    compute_gmass_dependent_data, create_app, engagement_intelligence, filter_reachouts,
+    get_gmass_dependent_data, needs_triage, next_drain, pipeline, reachouts_rows, reply_tags,
+    sync_reports, tag_reply, this_week, today_strip, todays_runs, warm_but_silent,
 )
 from slap.tracking import append_event, connect
+
+import redis as redis_lib
+
+
+class FakeRedis:
+    """Minimal in-memory stand-in for redis.Redis, covering exactly the
+    operations slap.gmass_cache uses (get/set with nx+ex/delete/ping) —
+    mirrors this project's existing "mock the external service at the
+    boundary" convention (see test_gmass.py's mocked requests.post/get)
+    rather than requiring a real Redis server for tests."""
+    def __init__(self):
+        self._store = {}
+
+    def ping(self):
+        return True
+
+    def get(self, key):
+        return self._store.get(key)
+
+    def set(self, key, value, *, ex=None, nx=False):
+        if nx and key in self._store:
+            return None
+        self._store[key] = value
+        return True
+
+    def delete(self, key):
+        self._store.pop(key, None)
+
+
+class FakeRedisDown:
+    """Simulates Redis being completely unreachable — every operation
+    raises, exactly like redis-py does on a real connection failure."""
+    def _raise(self, *a, **k):
+        raise redis_lib.exceptions.ConnectionError("simulated: redis unreachable")
+
+    def ping(self):
+        self._raise()
+
+    def get(self, key):
+        self._raise()
+
+    def set(self, key, value, *, ex=None, nx=False):
+        self._raise()
+
+    def delete(self, key):
+        self._raise()
 
 
 @pytest.fixture
@@ -299,6 +347,180 @@ def _ts(day_offset, hour=10):
     return datetime(2026, 1, 15, hour, 0, tzinfo=timezone.utc) + timedelta(days=day_offset)
 
 
+# --- Redis-backed cache for the GMass-dependent widgets (post-launch) ------
+# Only engagement_intelligence/warm_but_silent/bounces/actionable_replies
+# depend on GMass report data — confirmed by reading slap/dashboard.py, not
+# assumed from names (see compute_gmass_dependent_data's own docstring).
+# today_strip/this_week/next_drain/todays_runs/pipeline/companies_contacted
+# are untouched by any of this — already covered by their own pre-existing
+# tests above/below, which still pass unmodified.
+
+def test_compute_gmass_dependent_data_matches_individual_widget_functions(conn):
+    seed_sent_recipient(conn)
+    append_event(conn, type="reply", recipient="jane@acme.com", campaign="c")
+    result = compute_gmass_dependent_data(conn, "fake-key", consumer_domains=set())
+
+    assert result["engagement"] == engagement_intelligence(conn)
+    assert result["warm_but_silent"] == warm_but_silent(conn)
+    assert result["bounces"] == bounces(conn)
+    live_replies = actionable_replies(conn, consumer_domains=set())
+    assert result["replies"] == [
+        {**r, "dedup_context": dataclasses.asdict(r["dedup_context"])} for r in live_replies
+    ]
+
+
+def test_compute_gmass_dependent_data_runs_the_real_sync_and_writes_events(conn):
+    # "The hourly job populates Redis and writes the same events the old
+    # on-open trigger would have" — proves this isn't a rewrite of
+    # sync_reports(), just a different trigger for the exact same function.
+    seed_sent_recipient(conn)
+    with patch("slap.dashboard.gmass.get_reports") as mock_get:
+        mock_get.side_effect = lambda api_key, cid, report_type: (
+            [{"replyId": "r1", "replyTime": "2026-01-01T00:00:00"}] if report_type == "replies" else []
+        )
+        compute_gmass_dependent_data(conn, "fake-key", consumer_domains=set())
+    events = [dict(r) for r in conn.execute("SELECT * FROM events WHERE type = 'reply'")]
+    assert len(events) == 1
+    assert json.loads(events[0]["meta"])["reply_id"] == "r1"
+
+
+def test_compute_gmass_dependent_data_is_json_serializable(conn):
+    seed_sent_recipient(conn)
+    append_event(conn, type="reply", recipient="jane@acme.com", campaign="c")
+    result = compute_gmass_dependent_data(conn, "fake-key", consumer_domains=set())
+    json.dumps(result)  # must not raise
+
+
+def test_engagement_reply_by_stage_survives_a_real_json_round_trip(conn):
+    # iron-audit BLOCKER regression test: engagement_intelligence()'s
+    # reply_by_stage/click_by_stage dicts used to be keyed by Python int,
+    # which JSON silently stringifies on any real round-trip — a fresh
+    # cache hit (the DOMINANT case, served ~59 minutes of every hour)
+    # rendered these panels as all-zero, every time, with no error at all.
+    # This does the SAME round-trip write_cache()/read_cache() do (not
+    # just json.dumps in isolation) and checks the actual values survive.
+    append_event(conn, type="queued", recipient="a@acme.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter"})
+    append_event(conn, type="sent", recipient="a@acme.com", campaign="c", stage=0, gmass_campaign_id="1")
+    append_event(conn, type="reply", recipient="a@acme.com", campaign="c", stage=0)
+    append_event(conn, type="click", recipient="a@acme.com", campaign="c", stage=0)
+
+    result = compute_gmass_dependent_data(conn, "fake-key", consumer_domains=set())
+    client = FakeRedis()
+    gmass_cache.write_cache(client, result)
+    round_tripped = gmass_cache.read_cache(client)
+
+    # The exact lookup dashboard.html now performs: an int loop variable,
+    # looked up via the |string filter.
+    for stage in (0, 1, 2, 3):
+        assert (round_tripped["engagement"]["reply_by_stage"].get(str(stage), 0)
+                == result["engagement"]["reply_by_stage"].get(str(stage), 0))
+    assert round_tripped["engagement"]["reply_by_stage"]["0"] == 1
+    assert round_tripped["engagement"]["click_by_stage"]["0"] == 1
+
+
+def test_flushing_cache_and_recomputing_produces_identical_results(conn):
+    # "Redis is a cache, never a new source of truth" — flushing it and
+    # letting the next refresh repopulate it must produce identical
+    # results, since SQLite's events table is the only real source.
+    seed_sent_recipient(conn)
+    append_event(conn, type="reply", recipient="jane@acme.com", campaign="c")
+    first = compute_gmass_dependent_data(conn, "fake-key", consumer_domains=set())
+    second = compute_gmass_dependent_data(conn, "fake-key", consumer_domains=set())
+    # cached_at/synced_at legitimately differ (each call stamps its own
+    # "now") — every other field must be byte-identical.
+    first.pop("cached_at"), second.pop("cached_at")
+    first["sync_result"].pop("synced_at"), second["sync_result"].pop("synced_at")
+    assert first == second
+
+
+# --- get_gmass_dependent_data: cache orchestration --------------------------
+
+def _fresh_cache_entry(**overrides):
+    entry = {
+        "cached_at": datetime.now(timezone.utc).isoformat(),
+        "sync_result": {"synced_at": "2026-01-01T00:00:00+00:00", "new_replies": 0,
+                        "new_clicks": 0, "new_bounces": 0, "errors": []},
+        "engagement": {"reply_rate_by_persona": {}, "reply_by_stage": {}, "click_by_stage": {},
+                       "time_to_first_reply": {"same_day": 0, "1_2_days": 0, "3_7_days": 0, "8_plus_days": 0},
+                       "has_data": False},
+        "warm_but_silent": [], "bounces": [], "replies": [],
+    }
+    entry.update(overrides)
+    return entry
+
+
+def test_get_gmass_dependent_data_fresh_cache_makes_zero_gmass_calls(conn):
+    client = FakeRedis()
+    gmass_cache.write_cache(client, _fresh_cache_entry(engagement={"has_data": True, "reply_rate_by_persona": {},
+                                                                    "reply_by_stage": {}, "click_by_stage": {},
+                                                                    "time_to_first_reply": {}}))
+    with patch("slap.dashboard.gmass.get_reports") as mock_get:
+        result = get_gmass_dependent_data(conn, "fake-key", set(), client)
+    mock_get.assert_not_called()
+    assert result["cache_status"] == "fresh"
+    assert result["engagement"]["has_data"] is True
+
+
+def test_get_gmass_dependent_data_stale_cache_triggers_refresh_via_refresh_with_lock(conn):
+    seed_sent_recipient(conn)
+    client = FakeRedis()
+    stale = _fresh_cache_entry()
+    stale["cached_at"] = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    gmass_cache.write_cache(client, stale)
+
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]) as mock_get:
+        result = get_gmass_dependent_data(conn, "fake-key", set(), client)
+    mock_get.assert_called()  # the SAME refresh path the hourly job uses, triggered synchronously
+    assert result["cache_status"] == "refreshed"
+    assert gmass_cache.is_fresh(gmass_cache.read_cache(client))  # cache now holds the fresh result
+
+
+def test_get_gmass_dependent_data_missing_cache_triggers_refresh(conn):
+    seed_sent_recipient(conn)
+    client = FakeRedis()
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]) as mock_get:
+        result = get_gmass_dependent_data(conn, "fake-key", set(), client)
+    mock_get.assert_called()
+    assert result["cache_status"] == "refreshed"
+
+
+def test_get_gmass_dependent_data_redis_unavailable_falls_back_to_live_poll(conn):
+    seed_sent_recipient(conn)
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]) as mock_get:
+        result = get_gmass_dependent_data(conn, "fake-key", set(), FakeRedisDown())
+    mock_get.assert_called()  # today's ORIGINAL behavior — a direct live poll
+    assert result["cache_status"] == "redis_unavailable"
+
+
+def test_get_gmass_dependent_data_lock_held_uses_stale_cached_data_without_a_second_refresh(conn):
+    client = FakeRedis()
+    stale = _fresh_cache_entry(bounces=[{"recipient": "stale@x.com"}])
+    stale["cached_at"] = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    gmass_cache.write_cache(client, stale)
+    gmass_cache.acquire_lock(client)  # simulates the hourly job already mid-refresh
+
+    with patch("slap.dashboard.gmass.get_reports") as mock_get:
+        result = get_gmass_dependent_data(conn, "fake-key", set(), client)
+    mock_get.assert_not_called()  # never a second, concurrent refresh
+    assert result["cache_status"] == "refresh_in_progress"
+    assert result["bounces"] == [{"recipient": "stale@x.com"}]  # served the last known data
+
+
+def test_get_gmass_dependent_data_lock_held_with_no_cache_yet_renders_honest_empty_state(conn):
+    client = FakeRedis()
+    gmass_cache.acquire_lock(client)  # e.g. the very first sync ever, racing a dashboard open
+
+    with patch("slap.dashboard.gmass.get_reports") as mock_get:
+        result = get_gmass_dependent_data(conn, "fake-key", set(), client)
+    mock_get.assert_not_called()
+    assert result["cache_status"] == "refresh_in_progress"
+    assert result["engagement"]["has_data"] is False
+    assert result["warm_but_silent"] == []
+    assert result["bounces"] == []
+    assert result["replies"] == []
+
+
 # --- today_strip / this_week -------------------------------------------
 
 def test_today_strip_counts_new_and_follow_up_sends(conn):
@@ -399,8 +621,12 @@ def test_reply_and_click_by_stage(conn):
     append_event(conn, type="reply", recipient="b@x.com", campaign="c", stage=1)
     append_event(conn, type="click", recipient="a@x.com", campaign="c", stage=0)
     result = engagement_intelligence(conn)
-    assert result["reply_by_stage"] == {0: 1, 1: 1}
-    assert result["click_by_stage"] == {0: 1}
+    # String keys, not int — iron-audit BLOCKER fix: this dict is cached via
+    # JSON (Redis), and JSON object keys are always strings. Keying it by
+    # int here (and looking it up by int in the template) meant a fresh
+    # cache hit silently rendered these panels as all-zero, every time.
+    assert result["reply_by_stage"] == {"0": 1, "1": 1}
+    assert result["click_by_stage"] == {"0": 1}
 
 
 def test_engagement_intelligence_has_data_false_when_nothing_happened_yet(conn):
@@ -845,7 +1071,8 @@ def app(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)  # today_strip() calls discover_campaigns() against cwd
     db_path = tmp_path / "test.db"
     connect(db_path).close()
-    return create_app(db_path, make_global_config(), consumer_domains=set(), api_key="fake-key")
+    return create_app(db_path, make_global_config(), consumer_domains=set(), api_key="fake-key",
+                       redis_client=FakeRedis())
 
 
 def test_create_app_index_renders(app):
@@ -855,6 +1082,59 @@ def test_create_app_index_renders(app):
     assert resp.status_code == 200
     assert b"slap dashboard" in resp.data
     assert b"Nothing needs triage." in resp.data
+
+
+def test_create_app_index_fresh_cache_makes_zero_gmass_calls(app):
+    gmass_cache.write_cache(app.redis_client, _fresh_cache_entry())
+    with patch("slap.dashboard.gmass.get_reports") as mock_get:
+        client = app.test_client()
+        resp = client.get("/")
+    assert resp.status_code == 200
+    mock_get.assert_not_called()
+
+
+def test_create_app_index_stale_cache_triggers_refresh(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    seed_sent_recipient(conn)
+    conn.close()
+    assert gmass_cache.read_cache(app.redis_client) is None  # nothing cached yet
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]) as mock_get:
+        client = app.test_client()
+        resp = client.get("/")
+    assert resp.status_code == 200
+    mock_get.assert_called()
+    assert gmass_cache.read_cache(app.redis_client) is not None  # cache now populated
+
+
+def test_create_app_index_redis_unavailable_shows_indicator(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    db_path = tmp_path / "test.db"
+    connect(db_path).close()
+    down_app = create_app(db_path, make_global_config(), consumer_domains=set(), api_key="fake-key",
+                           redis_client=FakeRedisDown())
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+        client = down_app.test_client()
+        resp = client.get("/")
+    assert resp.status_code == 200  # never breaks the dashboard outright
+    assert b"cache unavailable" in resp.data
+
+
+def test_create_app_reply_tag_invalidates_cache(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="queued", recipient="carol@x.com", campaign="c", stage=0,
+                 meta={"persona": "founder"})
+    append_event(conn, type="sent", recipient="carol@x.com", campaign="c", stage=0, gmass_campaign_id="1")
+    append_event(conn, type="reply", recipient="carol@x.com", campaign="c", stage=0)
+    conn.close()
+    gmass_cache.write_cache(app.redis_client, _fresh_cache_entry())
+
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+        client = app.test_client()
+        resp = client.post("/reply/carol@x.com/tag", data={"tag": "real"})
+    assert resp.status_code == 302
+    # The owner's own tagging action must be reflected on the very next
+    # load, not sit invisible in a stale cache for up to an hour.
+    assert gmass_cache.read_cache(app.redis_client) is None
 
 
 def test_create_app_index_survives_repeated_requests(app):
@@ -1029,7 +1309,8 @@ def test_dashboard_survives_real_concurrent_request_threads(tmp_path, monkeypatc
     monkeypatch.chdir(tmp_path)
     db_path = tmp_path / "test.db"
     connect(db_path).close()
-    app = create_app(db_path, make_global_config(), consumer_domains=set(), api_key="fake-key")
+    app = create_app(db_path, make_global_config(), consumer_domains=set(), api_key="fake-key",
+                      redis_client=FakeRedis())
 
     with patch("slap.dashboard.gmass.get_reports", return_value=[]):
         server = make_server("127.0.0.1", 0, app, threaded=True)

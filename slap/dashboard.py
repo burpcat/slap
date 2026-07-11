@@ -33,6 +33,7 @@ real/ooo/not_interested.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
@@ -41,7 +42,7 @@ from pathlib import Path
 import requests
 from flask import Flask, g, redirect, request, render_template, url_for
 
-from slap import domains, gmass
+from slap import domains, gmass, gmass_cache
 from slap.config import discover_campaigns
 from slap.domains import check_recipient
 from slap.queue import due_for_ooo_resend, due_recipients, tag_ooo as _tag_ooo
@@ -318,10 +319,21 @@ def this_week(conn, *, today: date = None) -> dict:
 
 
 def _count_by_stage(conn, event_type: str) -> dict:
+    """Keyed by STRING stage number, not int — an iron-audit BLOCKER fix.
+    engagement_intelligence()'s output is cached in Redis via JSON, and
+    JSON object keys are always strings; a dict keyed by Python ints
+    (`{0: 5}`) silently comes back as `{"0": 5}` after a round-trip, and
+    `{"0": 5}.get(0, 0)` (an int lookup, what the template used to do)
+    returns 0 — a real, deterministic, SILENT bug that zeroed out these two
+    panels on every cache hit (the DOMINANT case — a fresh cache is served
+    for ~59 of every 60 minutes). Returning string keys here directly,
+    matching the template's now-also-fixed string lookup, means the live
+    and JSON-round-tripped versions of this dict are IDENTICAL from the
+    start — no discrepancy to accidentally reintroduce later."""
     rows = conn.execute(
         "SELECT stage, COUNT(*) AS c FROM events WHERE type = ? GROUP BY stage", (event_type,)
     ).fetchall()
-    return {r["stage"]: r["c"] for r in rows}
+    return {str(r["stage"]): r["c"] for r in rows}
 
 
 def _reply_rate_by_persona(conn) -> dict:
@@ -852,6 +864,122 @@ def filter_reachouts(rows: list, filters: dict) -> list:
     return result
 
 
+# --- Redis-backed cache for the GMass-dependent widgets (post-launch) ------
+#
+# Only these four widgets depend on GMass report data at all (confirmed by
+# reading this module, not assumed from names): engagement_intelligence(),
+# warm_but_silent(), bounces(), actionable_replies(). Every other widget
+# (today_strip/this_week, next_drain, todays_runs, pipeline,
+# companies_contacted) is already a pure SQLite read that never called
+# GMass either before or after this feature — create_app()'s "/" route
+# keeps computing them directly, every load, completely untouched.
+#
+# "Metrics" (today_strip/this_week) is a genuine edge case worth naming
+# explicitly: replies_today/clicks_today count reply/click EVENTS, which
+# ARE populated by sync_reports() — so their freshness does depend on when
+# a sync last ran, same as the four cached widgets. But today_strip()/
+# this_week() don't call GMass themselves (they only read `events`), and
+# this dependency already existed before this feature (their numbers were
+# always only as fresh as the last sync_reports() call, on-open or
+# otherwise) — so nothing about this feature changes their behavior one
+# way or the other. Left uncached, computed fresh from SQLite every load,
+# same as every other genuinely local-only widget.
+
+def compute_gmass_dependent_data(conn, api_key: str, consumer_domains: set) -> dict:
+    """The one place that computes everything the dashboard's four GMass-
+    dependent widgets need: runs the EXISTING sync_reports() (completely
+    unchanged — polls GMass, writes new click/reply/bounce/block events),
+    then computes engagement_intelligence()/warm_but_silent()/bounces()/
+    actionable_replies() fresh from the now-updated SQLite. Both the hourly
+    `slap.py sync` job and the dashboard's on-open fallback call this exact
+    function via gmass_cache.refresh_with_lock() — never two independent
+    implementations of "go get fresh GMass data."
+
+    Fully JSON-serializable (no datetime/dataclass objects) so it can be
+    written straight into Redis. Renders identically whether it's used
+    live or read back from a JSON round-trip: a Jinja template's `.attr`
+    access on a plain dict falls back to item access, so
+    `{{ r.dedup_context.hard_warning }}` works the same either way
+    (verified directly, not assumed)."""
+    sync_result = sync_reports(conn, api_key)
+    replies = actionable_replies(conn, consumer_domains)
+    return {
+        "cached_at": datetime.now(timezone.utc).isoformat(),
+        "sync_result": {
+            "synced_at": sync_result["synced_at"].isoformat(),
+            "new_replies": sync_result["new_replies"],
+            "new_clicks": sync_result["new_clicks"],
+            "new_bounces": sync_result["new_bounces"],
+            "errors": sync_result["errors"],
+        },
+        "engagement": engagement_intelligence(conn),
+        "warm_but_silent": warm_but_silent(conn),
+        "bounces": bounces(conn),
+        "replies": [{**r, "dedup_context": dataclasses.asdict(r["dedup_context"])} for r in replies],
+    }
+
+
+def _empty_gmass_data() -> dict:
+    """Honest empty state for a narrow bootstrap edge case (see
+    get_gmass_dependent_data): no cache has EVER been written yet, and
+    another process already holds the refresh lock. Matches this
+    dashboard's existing philosophy of an honest empty widget over a
+    guessed/fabricated one — for exactly one page load, until the
+    in-progress refresh completes and populates the cache for real."""
+    return {
+        "cached_at": None,
+        "sync_result": {"synced_at": None, "new_replies": 0, "new_clicks": 0, "new_bounces": 0, "errors": []},
+        "engagement": {
+            "reply_rate_by_persona": {}, "reply_by_stage": {}, "click_by_stage": {},
+            "time_to_first_reply": {"same_day": 0, "1_2_days": 0, "3_7_days": 0, "8_plus_days": 0},
+            "has_data": False,
+        },
+        "warm_but_silent": [],
+        "bounces": [],
+        "replies": [],
+    }
+
+
+def get_gmass_dependent_data(conn, api_key: str, consumer_domains: set, redis_client) -> dict:
+    """Orchestrates the dashboard's four GMass-dependent widgets against the
+    Redis cache refreshed hourly by `slap.py sync` (slap/gmass_cache.py).
+
+    - Fresh cache hit: zero GMass calls, zero SQLite recomputation for
+      these four widgets — returns the cached blob directly.
+    - Stale or missing cache: triggers gmass_cache.refresh_with_lock() with
+      the SAME compute function the hourly job uses — "an early manual run
+      of the hourly job," not a second code path.
+    - Another refresh already in progress (the hourly job, or a concurrent
+      dashboard load, won the lock first): never runs a second refresh —
+      renders the last cached data if there is any, or an honest empty
+      state for the rare case there isn't yet.
+    - Redis unreachable at read time: skips the cache/lock dance entirely
+      and falls back to this dashboard's ORIGINAL behavior (a direct live
+      poll) — flagged via `cache_status` so the page can show a visible
+      indicator instead of silently pretending the cache is working.
+
+    Every returned dict carries `cache_status` ('fresh' | 'refreshed' |
+    'refresh_in_progress' | 'redis_unavailable') for the template."""
+    def do_refresh():
+        return compute_gmass_dependent_data(conn, api_key, consumer_domains)
+
+    try:
+        cached = gmass_cache.read_cache(redis_client)
+    except gmass_cache.RedisUnavailable:
+        return {**do_refresh(), "cache_status": "redis_unavailable"}
+
+    if cached is not None and gmass_cache.is_fresh(cached):
+        return {**cached, "cache_status": "fresh"}
+
+    refreshed = gmass_cache.refresh_with_lock(redis_client, do_refresh)
+    if refreshed is not None:
+        return {**refreshed, "cache_status": "refreshed"}
+
+    if cached is not None:
+        return {**cached, "cache_status": "refresh_in_progress"}
+    return {**_empty_gmass_data(), "cache_status": "refresh_in_progress"}
+
+
 def _to_local(value) -> str:
     """UTC (a datetime, or an ISO string as stored in `events`) -> local
     display string. Convert to local only at dashboard display (§5)."""
@@ -864,9 +992,15 @@ def _to_local(value) -> str:
     return value.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str) -> Flask:
-    """§8: reads SQLite, polls GMass reports on open, renders read-only
-    panels except the single write action (reply tagging).
+def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str, *,
+                redis_client=None) -> Flask:
+    """§8: reads SQLite, renders read-only panels except the single write
+    action (reply tagging). The four GMass-dependent widgets (engagement
+    intelligence, warm-but-silent, bounces, replies-needing-triage) are
+    served from the Redis cache slap.py's `sync` command refreshes hourly,
+    with an on-open fallback if that cache is stale/missing/unreachable —
+    see get_gmass_dependent_data's own docstring. Every other panel is an
+    unchanged, direct SQLite read, exactly as before this feature.
 
     Takes a `db_path`, not an open connection: Flask's dev server (and any
     real WSGI server) dispatches each request on its own thread, and
@@ -876,9 +1010,20 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
     request and then raises `sqlite3.ProgrammingError` on every request
     handled by a different thread. Each request instead lazily opens its
     own connection (cached on Flask's per-request `g`) and closes it via
-    `teardown_appcontext`, the standard Flask SQLite pattern."""
+    `teardown_appcontext`, the standard Flask SQLite pattern.
+
+    `redis_client` defaults to None and is resolved to a real client (built
+    from `global_config.redis_url`) inside this function's own body, not as
+    a bound default parameter — unlike a sqlite3 connection, ONE redis.Redis
+    client is the correct, thread-safe, connection-pooling way to use it
+    across every request (see slap.gmass_cache.redis_client_from_url), so
+    it's built once here rather than per-request like get_conn() above."""
     app = Flask(__name__, template_folder=TEMPLATE_FOLDER)
     app.jinja_env.filters["to_local"] = _to_local
+    redis_client = redis_client if redis_client is not None else gmass_cache.redis_client_from_url(
+        global_config.redis_url
+    )
+    app.redis_client = redis_client  # exposed as a plain attribute so tests can inspect/seed cache state
 
     def get_conn():
         if "db_conn" not in g:
@@ -895,18 +1040,19 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
     @app.route("/")
     def index():
         conn = get_conn()
-        sync_result = sync_reports(conn, api_key)
+        gmass_data = get_gmass_dependent_data(conn, api_key, consumer_domains, redis_client)
         return render_template(
             "dashboard.html",
-            sync_result=sync_result,
+            sync_result=gmass_data["sync_result"],
+            engagement=gmass_data["engagement"],
+            replies=gmass_data["replies"],
+            warm_but_silent=gmass_data["warm_but_silent"],
+            bounces=gmass_data["bounces"],
+            cache_status=gmass_data["cache_status"],
             today=today_strip(conn, global_config),
             week=this_week(conn),
-            engagement=engagement_intelligence(conn),
-            replies=actionable_replies(conn, consumer_domains),
             pipeline=pipeline(conn, global_config),
             runs=todays_runs(conn),
-            warm_but_silent=warm_but_silent(conn),
-            bounces=bounces(conn),
             companies=companies_contacted(conn, consumer_domains),
             next_drain=next_drain(conn, global_config),
         )
@@ -952,6 +1098,13 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
             # BEFORE any local event, precisely so a failure here can never
             # leave a false "handled" local pause with no real suppression).
             return f"could not mark {recipient} OOO — GMass suppression call failed, nothing was recorded: {e}", 502
+        # Any successful tag can change actionable_replies()'s output (all
+        # three tags resolve needs_triage()) — invalidate rather than let
+        # the owner's own action sit invisible in a stale cache for up to
+        # an hour. Forces the next dashboard load to take the same
+        # stale/missing-cache fallback path as any other cache miss, never
+        # a separate "partial update" mechanism.
+        gmass_cache.invalidate(redis_client)
         redirect_to = request.form.get("redirect_to", "index")
         return redirect(url_for("reachouts" if redirect_to == "reachouts" else "index"))
 

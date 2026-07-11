@@ -123,6 +123,38 @@ def test_load_global_config_missing_key_fails_loud(tmp_path):
         load_global_config(path)
 
 
+# --- redis (post-launch feature: dashboard GMass-data cache) ---------------
+# Genuinely optional, unlike every other key above: no _require(), and
+# VALID_CONFIG_YAML itself has no `redis:` block at all — every other test
+# in this file already proves loading still succeeds without one.
+
+def test_load_global_config_redis_url_defaults_when_block_absent(tmp_path):
+    path = write_global_config(tmp_path)  # VALID_CONFIG_YAML has no redis: block
+    cfg = load_global_config(path)
+    assert cfg.redis_url == "redis://localhost:6379/0"
+
+
+def test_load_global_config_redis_url_custom_value(tmp_path):
+    text = VALID_CONFIG_YAML + "\nredis:\n  url: redis://example.internal:6380/2\n"
+    path = write_global_config(tmp_path, text)
+    cfg = load_global_config(path)
+    assert cfg.redis_url == "redis://example.internal:6380/2"
+
+
+def test_load_global_config_redis_block_not_a_mapping_fails_loud(tmp_path):
+    text = VALID_CONFIG_YAML + "\nredis: \"oops\"\n"
+    path = write_global_config(tmp_path, text)
+    with pytest.raises(ConfigError, match="redis"):
+        load_global_config(path)
+
+
+def test_load_global_config_redis_url_non_string_fails_loud(tmp_path):
+    text = VALID_CONFIG_YAML + "\nredis:\n  url: 6380\n"
+    path = write_global_config(tmp_path, text)
+    with pytest.raises(ConfigError, match="redis.url must be a string"):
+        load_global_config(path)
+
+
 def test_load_global_config_invalid_yaml_fails_loud(tmp_path):
     path = tmp_path / "config.yaml"
     path.write_text("sender: [this is not\n  a valid: mapping")

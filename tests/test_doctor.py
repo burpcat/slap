@@ -7,10 +7,12 @@ from unittest.mock import patch
 
 import pytest
 
+from slap import gmass_cache
 from slap.config import CampaignConfig, CampaignField, GlobalConfig, ScheduleConfig
 from slap.doctor import (
     DEFAULT_CONSUMER_DOMAINS, check_api_key, check_attachment, check_consumer_domains,
-    check_db, check_resume_archive, check_sender_fields, run_campaign_checks, run_global_checks,
+    check_db, check_redis, check_resume_archive, check_sender_fields, print_report,
+    run_campaign_checks, run_global_checks,
 )
 from slap.tracking import connect
 
@@ -227,6 +229,43 @@ def test_check_resume_archive_fails_when_a_symlink_is_broken(tmp_path, monkeypat
 
     assert not result.ok
     assert "acme-swe-2026-07-08.pdf" in result.detail
+
+
+# --- Redis (post-launch feature: dashboard GMass-data cache) ----------------
+# "Check, don't install" (CLAUDE.md): this only verifies Redis is reachable
+# via PING, never installs/starts it. Unlike every other check here, an
+# unreachable Redis is deliberately NOT gated into print_report()'s overall
+# pass/fail (see that function's own docstring) — there's no config knob
+# that turns the cache "off" the way an unset RESUME_ARCHIVE_DIR means
+# archiving is off, so an owner who's simply never set up Redis shouldn't
+# see a permanent, unfixable FAIL on every doctor/init run for an entirely
+# optional, gracefully-degrading feature.
+
+def test_check_redis_passes_when_reachable(tmp_path, monkeypatch):
+    monkeypatch.setattr(gmass_cache, "ping", lambda client: None)
+    result = check_redis(make_global_config(tmp_path))
+    assert result.ok
+
+
+def test_check_redis_fails_when_unreachable(tmp_path, monkeypatch):
+    def raise_unavailable(client):
+        raise gmass_cache.RedisUnavailable("connection refused")
+    monkeypatch.setattr(gmass_cache, "ping", raise_unavailable)
+    result = check_redis(make_global_config(tmp_path))
+    assert not result.ok
+    assert "unreachable" in result.detail
+
+
+def test_print_report_not_gated_by_unreachable_redis(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # discover_campaigns() reads cwd-relative campaigns/ (none here)
+    monkeypatch.setenv("GMASS_API_KEY", "real-key")
+
+    def raise_unavailable(client):
+        raise gmass_cache.RedisUnavailable("connection refused")
+    monkeypatch.setattr(gmass_cache, "ping", raise_unavailable)
+
+    gc = make_global_config(tmp_path, consumer_domains_file=str(tmp_path / "consumer_domains.txt"))
+    assert print_report(gc) is True  # Redis unreachable must not drag the overall result down
 
 
 def test_run_global_checks_never_includes_resume_archive(tmp_path, monkeypatch):

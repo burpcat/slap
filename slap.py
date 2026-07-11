@@ -18,7 +18,7 @@ from slap.config import ConfigError, discover_campaigns, load_campaign, load_glo
 from slap.latex import recipient_workdir, run_latex_loop
 from slap.queue import stage_recipient
 from slap.templates import fill_template, merge_config_values, parse_drop
-from slap import archive, dashboard, doctor, domains, gmass, init, launchd, runner, tracking
+from slap import archive, dashboard, doctor, domains, gmass, gmass_cache, init, launchd, runner, tracking
 
 load_dotenv()
 
@@ -276,13 +276,62 @@ def cmd_runner(args):
     _print_drain_result(result)
 
 
+def cmd_sync(args):
+    """The hourly background refresh of the dashboard's Redis-backed GMass-
+    data cache (post-launch feature, slap/gmass_cache.py) — invoked by
+    launchd (see `slap.py plist --job sync` / LAUNCHD.md), same as `runner`
+    is for drains. Always ATTEMPTS a refresh (unlike the dashboard's own
+    on-open fallback, which only refreshes when the cache is actually
+    stale) — that's the entire point of a scheduled job — but still goes
+    through the SAME shared lock as that fallback, so the two can never
+    both run a refresh at once."""
+    try:
+        global_config = load_global_config()
+        consumer_domains = domains.load_consumer_domains(Path(global_config.consumer_domains_file))
+    except (ConfigError, domains.DomainsError) as e:
+        display.fail(f"slap: {e}")
+        sys.exit(1)
+
+    api_key = os.environ.get(global_config.api_key_env, "").strip()
+    if not api_key:
+        display.fail(f"slap: {global_config.api_key_env} is not set — sync needs it to poll GMass. "
+                     f"See .env.example.")
+        sys.exit(1)
+
+    conn = tracking.connect()
+    redis_client = gmass_cache.redis_client_from_url(global_config.redis_url)
+
+    def do_refresh():
+        return dashboard.compute_gmass_dependent_data(conn, api_key, consumer_domains)
+
+    try:
+        result = gmass_cache.refresh_with_lock(redis_client, do_refresh)
+    except gmass_cache.RedisUnavailable as e:
+        display.fail(f"slap: Redis unreachable at {global_config.redis_url} ({e}) — "
+                     f"run `slap.py doctor` for details.")
+        sys.exit(1)
+
+    if result is None:
+        display.success("Another refresh was already in progress — skipped, nothing to do.")
+        return
+
+    sr = result["sync_result"]
+    display.success(f"Synced: +{sr['new_replies']} replies, +{sr['new_clicks']} clicks, "
+                     f"+{sr['new_bounces']} bounces. Cache updated.")
+    for err in sr["errors"]:
+        display.error(f"  sync error: {err}")
+
+
 def cmd_plist(args):
     try:
         global_config = load_global_config()
     except ConfigError as e:
         display.fail(f"slap: {e}")
         sys.exit(1)
-    print(launchd.render_plist(global_config, Path.cwd(), sys.executable), end="")
+    if args.job == "sync":
+        print(launchd.render_sync_plist(Path.cwd(), sys.executable), end="")
+    else:
+        print(launchd.render_plist(global_config, Path.cwd(), sys.executable), end="")
 
 
 def _print_drain_result(result):
@@ -428,8 +477,15 @@ def build_parser():
         "runner", help="Unattended drain — invoked by launchd, see LAUNCHD.md"
     ).set_defaults(func=cmd_runner)
     sub.add_parser(
-        "plist", help="Print the launchd .plist for the unattended runner, see LAUNCHD.md"
-    ).set_defaults(func=cmd_plist)
+        "sync", help="Hourly GMass-data cache refresh — invoked by launchd, see LAUNCHD.md"
+    ).set_defaults(func=cmd_sync)
+
+    p_plist = sub.add_parser(
+        "plist", help="Print the launchd .plist for the unattended runner (or --job sync), see LAUNCHD.md"
+    )
+    p_plist.add_argument("--job", choices=["runner", "sync"], default="runner",
+                          help="Which job's plist to print (default: runner)")
+    p_plist.set_defaults(func=cmd_plist)
 
     p_cleanup = sub.add_parser(
         "cleanup", help="Delete stale compiled PDFs for done/dead/no-reply recipients (dry run by default)"

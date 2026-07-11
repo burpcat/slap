@@ -56,6 +56,17 @@ import requests
 
 BASE_URL = "https://api.gmass.co/api"
 
+# Every real HTTP call this module makes uses this timeout — an iron-audit
+# BLOCKER fix found while building the dashboard's Redis-backed cache
+# (slap/gmass_cache.py): NOT ONE call here ever had a timeout before this,
+# meaning a single hung/slow GMass response could block a caller
+# indefinitely. That's exactly what caused a real, owner-hit incident (the
+# dashboard "just kept buffering" — see CONTROL_SHEET.md) and directly
+# undermines the new cache's own safety margin (a refresh's lock TTL is
+# only a meaningful upper bound if each individual call it makes is itself
+# bounded). 20s is generous for a real GMass response but still finite.
+DEFAULT_TIMEOUT = 20
+
 REPORT_TYPES = {"replies", "clicks", "bounces", "opens", "recipients", "unsubscribes", "blocks"}
 
 # GMass's per-stage field names use English ordinal words, not digits.
@@ -131,7 +142,8 @@ def create_draft(api_key: str, *, recipient: str, subject: str, message: str,
             "contentType": ctype,
             "base64Content": base64.b64encode(fbytes).decode(),
         }]
-    resp = requests.post(f"{BASE_URL}/campaigndrafts", headers=_headers(api_key), json=body)
+    resp = requests.post(f"{BASE_URL}/campaigndrafts", headers=_headers(api_key), json=body,
+                          timeout=DEFAULT_TIMEOUT)
     data = _parse(resp, "campaigndrafts")
     draft_id = data.get("campaignDraftId") or data.get("id")
     if not draft_id:
@@ -145,7 +157,7 @@ def send_campaign(api_key: str, draft_id, *, campaign_settings: dict) -> dict:
     `{campaignDraftId: ...}` form returns 400). Returns
     {"campaign_id": ..., "raw": <full response body>}."""
     resp = requests.post(f"{BASE_URL}/campaigns/{draft_id}", headers=_headers(api_key),
-                          json=campaign_settings)
+                          json=campaign_settings, timeout=DEFAULT_TIMEOUT)
     data = _parse(resp, "campaigns")
     campaign_id = data.get("campaignId") or data.get("id")
     if not campaign_id:
@@ -209,7 +221,7 @@ def unsubscribe_recipient(api_key: str, email: str) -> dict:
     Returns the parsed `unsubscribe` object ({emailAddress, unsubscribeTime,
     sender})."""
     resp = requests.post(f"{BASE_URL}/unsubscribes", headers=_headers(api_key),
-                          json={"emailAddress": email})
+                          json={"emailAddress": email}, timeout=DEFAULT_TIMEOUT)
     return _parse(resp, "unsubscribes")
 
 
@@ -221,7 +233,8 @@ def get_reports(api_key: str, campaign_id, report_type: str) -> list:
     schema)."""
     if report_type not in REPORT_TYPES:
         raise GMassError(f"unknown report type {report_type!r} — must be one of {sorted(REPORT_TYPES)}")
-    resp = requests.get(f"{BASE_URL}/reports/{campaign_id}/{report_type}", headers=_headers(api_key))
+    resp = requests.get(f"{BASE_URL}/reports/{campaign_id}/{report_type}", headers=_headers(api_key),
+                        timeout=DEFAULT_TIMEOUT)
     data = _parse(resp, f"reports/{report_type}")
     return data.get("data", [])
 

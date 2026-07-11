@@ -37,7 +37,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from slap import archive, tracking
+from slap import archive, gmass_cache, tracking
 from slap.config import CampaignConfig, GlobalConfig
 
 DEFAULT_CONSUMER_DOMAINS = [
@@ -136,6 +136,37 @@ def check_resume_archive() -> CheckResult:
     return CheckResult(archive.ENV_VAR, True, str(archive_dir))
 
 
+def check_redis(global_config: GlobalConfig) -> CheckResult:
+    """Is Redis reachable (PING)? Deliberately NOT folded into
+    run_global_checks(): the dashboard's GMass-data cache (slap/
+    gmass_cache.py) is designed to gracefully degrade to a live poll
+    whenever Redis is unreachable, so a Redis outage must never be able to
+    block a send or a drain — the same reasoning as check_resume_archive()
+    above, wired into print_report() only, NOT run_global_checks().
+
+    That's where the similarity to check_resume_archive() ends, though —
+    print_report()'s own docstring explains the one place this check is
+    treated DIFFERENTLY from every other check here, including archive:
+    its `ok` does not gate print_report()'s own returned bool. An
+    iron-audit caught an earlier version of this docstring overstating the
+    similarity as "the exact same isolation" — it isn't; see that
+    function's docstring for the actual, precise distinction. "Check,
+    don't install" (CLAUDE.md): this only verifies; it never starts or
+    installs Redis itself."""
+    try:
+        client = gmass_cache.redis_client_from_url(global_config.redis_url)
+        gmass_cache.ping(client)
+        return CheckResult("Redis", True, global_config.redis_url)
+    except gmass_cache.RedisUnavailable as e:
+        return CheckResult(
+            "Redis", False,
+            f"unreachable at {global_config.redis_url} ({e}) — the dashboard's GMass-data cache "
+            f"will fall back to live polling without it, but `slap.py sync` (the hourly refresh "
+            f"job) needs it running. Install/start it, e.g. `brew install redis && brew services "
+            f"start redis` on macOS — never auto-installed by this app."
+        )
+
+
 def _print_check(result: CheckResult, *, indent: str = "") -> None:
     from slap import display
     if result.ok:
@@ -149,7 +180,23 @@ def print_report(global_config: GlobalConfig) -> bool:
     """Prints the full doctor report (global checks + every discovered
     campaign's checks) — shared by the standalone `doctor` command and
     `init`'s finish step, so there's exactly one place that defines what
-    the report looks like. Returns True if everything passed."""
+    the report looks like. Returns True if everything REQUIRED passed.
+
+    Redis is deliberately the one exception to "every printed FAIL drags
+    down the overall result": check_redis() below still prints a genuine,
+    visible FAIL (with install instructions) when unreachable — never
+    silently hidden — but does NOT affect this function's returned bool or
+    `doctor`'s exit code. Unlike every other check here, there is no config
+    knob that turns Redis caching "off" the way an unset RESUME_ARCHIVE_DIR
+    means archiving is off — `redis_url` always has a default value — so an
+    owner who has simply never set up Redis would otherwise see a
+    permanent, unfixable-without-installing-something FAIL on every single
+    `doctor`/`init` run for a feature that's designed to be entirely
+    optional (the dashboard already falls back to live polling without
+    it). Loud and visible, per the task's own "fail loud" instruction; just
+    not gating, matching the same "warn, don't block" reasoning already
+    applied to check_resume_archive()'s own isolation from
+    run_global_checks()."""
     from slap import display
     from slap.config import ConfigError, discover_campaigns, load_campaign
 
@@ -161,6 +208,8 @@ def print_report(global_config: GlobalConfig) -> bool:
     archive_result = check_resume_archive()
     _print_check(archive_result)
     ok = ok and archive_result.ok
+
+    _print_check(check_redis(global_config))  # visible, but never gates doctor's pass/fail — see docstring
 
     names = discover_campaigns()
     if not names:

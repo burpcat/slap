@@ -18,7 +18,8 @@ from datetime import date
 from pathlib import Path
 
 SLAP_PY = Path(__file__).resolve().parent.parent / "slap.py"
-ALL_COMMANDS = ["list", "send", "dashboard", "doctor", "domains", "rebuild", "runner", "cleanup", "plist", "init"]
+ALL_COMMANDS = ["list", "send", "dashboard", "doctor", "domains", "rebuild", "runner", "sync",
+                "cleanup", "plist", "init"]
 
 
 def run(*args, cwd=None, env=None, input=None):
@@ -325,10 +326,78 @@ def test_runner_skips_draining_on_an_inactive_day(tmp_path):
     assert not (tmp_path / "slap.db").exists()
 
 
+def test_sync_fails_loud_without_config(tmp_path):
+    # Must fail during load_global_config, before ever reaching Redis/GMass.
+    result = run("sync", cwd=tmp_path)
+    assert result.returncode != 0
+    assert "config.yaml" in result.stderr
+    assert not (tmp_path / "slap.db").exists()
+
+
+def test_sync_fails_loud_without_api_key(tmp_path):
+    # config.yaml + consumer_domains.txt both present so the ONLY missing
+    # thing is the API key (mirrors test_dashboard_fails_loud_without_api_key).
+    (tmp_path / "config.yaml").write_text(
+        (Path(__file__).resolve().parent.parent / "config.yaml.example")
+        .read_text()
+        .replace("<Owner Name>", "Test Owner")
+    )
+    (tmp_path / "consumer_domains.txt").write_text(
+        (Path(__file__).resolve().parent.parent / "consumer_domains.txt").read_text()
+    )
+    # Explicitly blank, not deleted — see test_dashboard_fails_loud_without_api_key's
+    # own comment: load_dotenv()'s override=False would silently repopulate a
+    # deleted key from the real repo-root .env, but never overwrites a key
+    # that's already present, even as an empty string.
+    env = {**os.environ, "GMASS_API_KEY": ""}
+    result = run("sync", cwd=tmp_path, env=env)
+    assert result.returncode != 0
+    assert "GMASS_API_KEY" in result.stderr
+
+
+def test_sync_fails_loud_when_redis_unreachable(tmp_path):
+    # No real Redis server in this test environment — a genuinely
+    # unreachable address (nothing listens on this port) proves the whole
+    # point of this feature's short connect timeout: fails fast, not a
+    # hang. Real GMass polling is never reached either way (Redis is
+    # checked/locked before compute_gmass_dependent_data runs).
+    config_text = (
+        (Path(__file__).resolve().parent.parent / "config.yaml.example")
+        .read_text()
+        .replace("<Owner Name>", "Test Owner")
+        + "\nredis:\n  url: redis://127.0.0.1:16399/0\n"
+    )
+    (tmp_path / "config.yaml").write_text(config_text)
+    (tmp_path / "consumer_domains.txt").write_text(
+        (Path(__file__).resolve().parent.parent / "consumer_domains.txt").read_text()
+    )
+    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    result = run("sync", cwd=tmp_path, env=env)
+    assert result.returncode != 0
+    assert "Redis unreachable" in result.stderr
+
+
 def test_plist_fails_loud_without_config(tmp_path):
     result = run("plist", cwd=tmp_path)
     assert result.returncode != 0
     assert "config.yaml" in result.stderr
+
+
+def test_plist_job_sync_prints_a_valid_sync_plist(tmp_path):
+    (tmp_path / "config.yaml").write_text(
+        (Path(__file__).resolve().parent.parent / "config.yaml.example")
+        .read_text()
+        .replace("<Owner Name>", "Test Owner")
+    )
+    result = run("plist", "--job", "sync", cwd=tmp_path)
+    assert result.returncode == 0
+    assert "com.slap.sync" in result.stdout
+    assert "<key>StartInterval</key>" in result.stdout
+    assert "<key>StartCalendarInterval</key>" not in result.stdout
+
+    import plistlib
+    parsed = plistlib.loads(result.stdout.encode())
+    assert parsed["ProgramArguments"][-1] == "sync"
 
 
 def test_plist_prints_a_valid_plist_for_this_repo(tmp_path):

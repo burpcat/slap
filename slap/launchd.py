@@ -88,3 +88,48 @@ def render_plist(global_config: GlobalConfig, repo_root: Path, python_executable
 </dict>
 </plist>
 """
+
+
+def render_sync_plist(repo_root: Path, python_executable: str, *,
+                       label: str = "com.slap.sync", interval_seconds: int = 3600) -> str:
+    """Renders the launchd plist for `slap.py sync` — the hourly background
+    refresh of the dashboard's Redis-backed GMass-data cache (post-launch
+    feature, slap/gmass_cache.py). Deliberately a SEPARATE plist/function
+    from render_plist() above, not a shared one: this job's cadence is a
+    plain fixed interval ("every hour"), not a calendar-anchored,
+    day-of-week-restricted one like the runner's, so `StartInterval`
+    (launchd's own idiomatic mechanism for "every N seconds," a single
+    integer) is the right fit here — trying to force both jobs' genuinely
+    different scheduling shapes through one function/one plist key would
+    be more contorted than two small, focused ones. No `active_days`
+    restriction either: unlike the outreach runner (which the owner may
+    deliberately want to skip on weekends), refreshing a read-only cache
+    has no send-volume/deliverability reason to ever pause."""
+    repo_root = Path(repo_root).resolve()
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{python_executable}</string>
+        <string>{repo_root / "slap.py"}</string>
+        <string>sync</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>{repo_root}</string>
+
+    <key>StartInterval</key>
+    <integer>{interval_seconds}</integer>
+
+    <key>StandardOutPath</key>
+    <string>{repo_root / "sync.log"}</string>
+    <key>StandardErrorPath</key>
+    <string>{repo_root / "sync.err.log"}</string>
+</dict>
+</plist>
+"""

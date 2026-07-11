@@ -12,8 +12,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from slap.gmass import (
-    GMassError, build_campaign_settings, build_reply_settings, create_draft, get_reports, send_campaign,
-    unsubscribe_recipient, _plain_text_to_html,
+    DEFAULT_TIMEOUT, GMassError, build_campaign_settings, build_reply_settings, create_draft,
+    get_reports, send_campaign, unsubscribe_recipient, _plain_text_to_html,
 )
 
 
@@ -268,3 +268,38 @@ def test_build_reply_settings_overrides():
     settings = build_reply_settings(1, open_tracking=True, create_drafts=True)
     assert settings["openTracking"] is True
     assert settings["createDrafts"] is True
+
+
+# --- timeouts (iron-audit BLOCKER fix) --------------------------------------
+# NOT ONE real HTTP call in this module ever had a timeout before this fix —
+# a single hung/slow GMass response could block a caller indefinitely (the
+# exact class of bug that once hung the dashboard, and directly undermines
+# the Redis cache's refresh-lock TTL as a meaningful upper bound). Every
+# real requests.post/.get call must pass timeout=DEFAULT_TIMEOUT.
+
+@patch("slap.gmass.requests.post")
+def test_create_draft_passes_timeout(mock_post):
+    mock_post.return_value = _response(200, {"campaignDraftId": "r-1"})
+    create_draft("key", recipient="a@x.com", subject="Hi", message="Body")
+    assert mock_post.call_args.kwargs["timeout"] == DEFAULT_TIMEOUT
+
+
+@patch("slap.gmass.requests.post")
+def test_send_campaign_passes_timeout(mock_post):
+    mock_post.return_value = _response(200, {"campaignId": 1})
+    send_campaign("key", "draft-1", campaign_settings={})
+    assert mock_post.call_args.kwargs["timeout"] == DEFAULT_TIMEOUT
+
+
+@patch("slap.gmass.requests.get")
+def test_get_reports_passes_timeout(mock_get):
+    mock_get.return_value = _response(200, {"data": []})
+    get_reports("key", 1, "replies")
+    assert mock_get.call_args.kwargs["timeout"] == DEFAULT_TIMEOUT
+
+
+@patch("slap.gmass.requests.post")
+def test_unsubscribe_recipient_passes_timeout(mock_post):
+    mock_post.return_value = _response(200, {"emailAddress": "a@x.com"})
+    unsubscribe_recipient("key", "a@x.com")
+    assert mock_post.call_args.kwargs["timeout"] == DEFAULT_TIMEOUT

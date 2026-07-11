@@ -70,6 +70,13 @@ class GlobalConfig:
     # load_global_config() below is what actually enforces "must be present
     # in config.yaml," not this dataclass's own constructor.
     signature: str = ""
+    # Also defaulted, but for a different reason than signature: this one is
+    # genuinely OPTIONAL, not "required but allowed to be empty." The whole
+    # Redis-cache feature is designed to gracefully degrade when Redis isn't
+    # configured/running at all (see slap/gmass_cache.py), so there's no
+    # fail-loud enforcement for this key anywhere — an owner who never adds
+    # a `redis:` block to config.yaml just gets this sensible local default.
+    redis_url: str = "redis://localhost:6379/0"
 
 
 @dataclass
@@ -167,6 +174,18 @@ def load_global_config(path: Path = CONFIG_PATH) -> GlobalConfig:
 
     consumer_domains_file = _require(raw, "tracking.consumer_domains_file", path)
 
+    # Optional block, unlike everything else above — no _require(). Absent
+    # `redis:` entirely, or absent `redis.url` within it, both just fall
+    # back to the dataclass default (see GlobalConfig.redis_url's own
+    # comment for why this one is genuinely optional, not required-but-
+    # allowed-to-be-empty like `signature`).
+    redis_raw = raw.get("redis") or {}
+    if not isinstance(redis_raw, dict):
+        raise ConfigError(f"{path}: 'redis' must be a mapping — got {redis_raw!r}")
+    redis_url = redis_raw.get("url", "redis://localhost:6379/0")
+    if not isinstance(redis_url, str):
+        raise ConfigError(f"{path}: redis.url must be a string — got {redis_url!r}")
+
     return GlobalConfig(
         from_email=from_email,
         from_name=from_name,
@@ -176,6 +195,7 @@ def load_global_config(path: Path = CONFIG_PATH) -> GlobalConfig:
         consumer_domains_file=consumer_domains_file,
         path=path,
         signature=signature,
+        redis_url=redis_url,
     )
 
 
