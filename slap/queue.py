@@ -58,7 +58,8 @@ def stage_recipient(conn, *, campaign: str, recipient: str, persona: str, cadenc
                      subject: str, body: str, stage_bodies: list,
                      attachment_path: Path, attachment_name: str, latex_enabled: bool,
                      company: str = "", role: str = "", req_id: str = "", archive_dir: Path = None,
-                     when: date = None, workdir_root: Path = WORKDIR_ROOT) -> Path:
+                     when: date = None, workdir_root: Path = WORKDIR_ROOT,
+                     field_values: dict = None) -> Path:
     """Write the queued event + staged manifest for one recipient (does not
     send). Returns the recipient's workdir.
 
@@ -93,7 +94,18 @@ def stage_recipient(conn, *, campaign: str, recipient: str, persona: str, cadenc
     company and req_id-present at all, since nothing else in the schema
     tracks them. Additive and backward-compatible: a `queued` event written
     before this change simply lacks these keys, and every reader treats a
-    missing key as blank/unknown, never a guessed value."""
+    missing key as blank/unknown, never a guessed value.
+
+    `field_values` (post-launch, slap.reload): the raw, pre-fill drop-parsed
+    dict (parse_drop()'s return value — every campaign field, not just
+    company/role/req_id) — stored so slap.reload.scan() can re-render this
+    recipient's subject/body/stage_bodies against a LATER-edited template
+    file without ever needing the owner to re-paste the original drop.
+    Optional (defaults to None) purely for backward compatibility with
+    existing callers/tests written before this field existed; a manifest
+    written with `field_values=None` simply can't be reloaded later (see
+    slap.reload.scan's own handling of that case — a distinct, actionable
+    failure reason, not a crash)."""
     workdir = recipient_workdir(campaign, recipient, root=workdir_root)
 
     if latex_enabled:
@@ -110,6 +122,7 @@ def stage_recipient(conn, *, campaign: str, recipient: str, persona: str, cadenc
         "campaign": campaign, "recipient": recipient, "persona": persona, "cadence": cadence,
         "subject": subject, "body": body, "stage_bodies": stage_bodies,
         "attachment_name": attachment_name, "attachment_source": attachment_source,
+        "field_values": field_values,
     }
     (workdir / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 

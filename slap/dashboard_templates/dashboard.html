@@ -61,6 +61,9 @@
   last synced: {{ sync_result.synced_at | to_local }}
   &middot; +{{ sync_result.new_replies }} replies, +{{ sync_result.new_clicks }} clicks, +{{ sync_result.new_bounces }} bounces this sync
   &middot; <a href="/reachouts">All reach-outs &rarr;</a>
+  {% if template_failures_count %}
+  &middot; <a href="/template-failures">Template Failures ({{ template_failures_count }}) &rarr;</a>
+  {% endif %}
   {% if cache_status == 'redis_unavailable' %}
   &middot; <span class="badge warn">cache unavailable — showing live data</span>
   {% elif cache_status == 'refresh_in_progress' %}

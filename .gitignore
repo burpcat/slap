@@ -20,6 +20,9 @@ slap.db-journal
 slap.db-wal
 slap.db-shm
 
+# template-reload's failure report (real recipient emails, runtime data)
+template_reload_failures.json
+
 # LaTeX compile workdirs (runtime staging, not source)
 workdir/
 

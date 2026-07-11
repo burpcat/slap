@@ -192,6 +192,28 @@ the next scheduled runner fire:
 python slap.py send my-campaign --now
 ```
 
+### Editing a template after staging
+
+`send` freezes the rendered subject/body/stage text into the queue the moment you stage a
+recipient (step 5 above) — editing `initial.txt`/`stageN.txt` afterward does nothing to
+recipients already staged. Run `python slap.py template-reload` to re-render every
+not-yet-sent recipient, across every campaign, against whatever the template files
+currently say. It shows a summary (how many recipients would change, across which
+campaigns, with sample diffs) and asks to confirm before writing anything.
+
+This only ever works for recipients who haven't sent at all yet. The moment a recipient's
+initial send actually fires, GMass has already locked in every follow-up stage's wording
+for that campaign — there's no API call that can change it afterward, regardless of any
+later local template edit. A recipient who's already had an initial send go out is simply
+never touched by `template-reload`.
+
+Two things can make one recipient un-reloadable without affecting anyone else in the same
+run: they were staged before this feature existed (no raw drop values were kept for them
+yet — re-stage them to fix this going forward), or the edited template now references a
+field their stored drop doesn't have a value for. Either way they're left exactly as
+staged and show up in the dashboard's **Template Failures** tab (only linked from the nav
+when there's at least one).
+
 **Before you ever point this at a real lead**, do exactly one real test send using the
 `local+testmass1@domain` address `init` printed at the end of setup (a plus-tagged alias
 of your own `sender.from_email` — Gmail delivers it straight to your own inbox). Run
@@ -212,6 +234,7 @@ confirm it lands and looks right, then you're clear to send to real recipients.
 | `python slap.py cleanup [--confirm] [--min-days-idle N]` | Deletes stale *compiled* résumé PDFs (LaTeX campaigns only) for recipients who are done/dead/never-replied and idle 15+ days by default — except a PDF still referenced by a live `RESUME_ARCHIVE_DIR` symlink, which is kept and reported separately. Dry run unless you pass `--confirm`. Never touches the `.tex` source. |
 | `python slap.py runner` | The unattended drain — asks the DB what's queued and due, and sends it. Meant to be fired by **launchd** (see Scheduler below), not run by hand day-to-day. |
 | `python slap.py plist` | Prints the launchd `.plist` for `runner`, generated fresh from your current `config.yaml`. |
+| `python slap.py template-reload` | Re-renders every not-yet-sent recipient across every campaign against whatever `initial.txt`/`stageN.txt` currently say — use this after editing a template you've already staged sends against. Shows a summary and sample diffs, asks to confirm before writing anything. Only ever touches recipients who haven't sent at all yet (see "Editing a template after staging" below); everyone else is untouched by definition. |
 
 Typical day-to-day flow: `send` a few recipients through the interactive prep loop →
 either `--now` or let the scheduled `runner` pick them up → check `dashboard`
@@ -306,7 +329,10 @@ Opens `http://127.0.0.1:5050`. Panels, top to bottom:
   counts) — a drain that found nothing queued is omitted as noise.
 
 There's also an **"All reach-outs →"** link at the top — see "Reach-outs (all campaigns,
-filterable)" below.
+filterable)" below — and, only when the most recent `template-reload` run left at least
+one recipient un-reloaded, a **"Template Failures →"** link (`/template-failures`)
+listing who, in which campaign, and why (see "Editing a template after staging" above).
+It disappears again once a later `template-reload` run comes back clean.
 
 ## Reach-outs (all campaigns, filterable)
 

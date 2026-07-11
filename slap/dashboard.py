@@ -42,7 +42,7 @@ from pathlib import Path
 import requests
 from flask import Flask, g, redirect, request, render_template, url_for
 
-from slap import domains, gmass, gmass_cache
+from slap import domains, gmass, gmass_cache, reload
 from slap.config import discover_campaigns
 from slap.domains import check_recipient
 from slap.queue import (
@@ -746,6 +746,15 @@ def _recipient_drop_meta(conn) -> dict:
     return result
 
 
+def template_failures() -> list:
+    """The Template Failures tab's data: whatever slap.reload's most recent
+    `template-reload` run recorded as failed and still unresolved. A plain
+    local JSON read (see slap.reload's module docstring for why failures
+    live there, not in the events table) — no GMass call, no DB read at all,
+    so this can never be stale in the way the GMass-dependent widgets can."""
+    return reload.load_failures()
+
+
 def reachouts_rows(conn) -> list:
     """One row per recipient (the `recipients` cache's own natural grain —
     a recipient's single current row already reflects whichever campaign
@@ -1090,6 +1099,14 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
             runs=todays_runs(conn),
             companies=companies_contacted(conn, consumer_domains),
             next_drain=next_drain(conn, global_config),
+            # Deliberately different from this dashboard's usual "show an
+            # honest empty state" default (see reachouts_rows/reply_tags for
+            # that default elsewhere): the Template Failures nav link itself
+            # is owner-requested to disappear entirely at zero, not render a
+            # "0 failures" link — the /template-failures route below still
+            # shows a real empty-state page for anyone who navigates there
+            # directly regardless of this count.
+            template_failures_count=len(template_failures()),
         )
 
     @app.route("/reachouts")
@@ -1106,6 +1123,15 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
         # needed here either.
         rows = reachouts_rows(get_conn())
         return render_template("reachouts.html", rows=rows, total_count=len(rows))
+
+    @app.route("/template-failures")
+    def template_failures_page():
+        # Always registered regardless of whether any failures currently
+        # exist — direct navigation must show a real page (an honest "no
+        # failures" empty state), never a 404, even though the nav link to
+        # it (index() above) only appears when template_failures_count > 0.
+        failures = template_failures()
+        return render_template("template_failures.html", failures=failures, total_count=len(failures))
 
     @app.route("/reply/<string:recipient>/tag", methods=["POST"])
     def reply_tag(recipient):

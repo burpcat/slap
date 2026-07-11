@@ -20,8 +20,9 @@ from slap.dashboard import (
     _clicked_recipients, _recipient_drop_meta, actionable_replies, bounces, companies_contacted,
     compute_gmass_dependent_data, create_app, engagement_intelligence, filter_reachouts,
     get_gmass_dependent_data, needs_triage, next_drain, pipeline, reachouts_rows, reply_tags,
-    sync_reports, tag_reply, this_week, today_strip, todays_runs, warm_but_silent,
+    sync_reports, tag_reply, template_failures, this_week, today_strip, todays_runs, warm_but_silent,
 )
+from slap.reload import ReloadFailure, write_failures
 from slap.tracking import append_event, connect
 
 import redis as redis_lib
@@ -1824,3 +1825,87 @@ def test_create_app_reachouts_never_calls_gmass(app, tmp_path):
 
     assert resp.status_code == 200
     mock_get_reports.assert_not_called()
+
+
+# --- Template Failures tab (slap.reload) ------------------------------------
+
+def _make_failure(recipient="jane@acme.com", campaign="coldpost", reason="template now references "
+                   "field(s) this recipient has no stored value for: special_note",
+                   missing_fields=None):
+    return ReloadFailure(
+        recipient=recipient, campaign=campaign, reason=reason,
+        missing_fields=missing_fields if missing_fields is not None else ["special_note"],
+        attempted_at="2026-07-10T12:00:00+00:00",
+    )
+
+
+def test_template_failures_helper_reads_written_report(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert template_failures() == []
+    write_failures([_make_failure()])
+    result = template_failures()
+    assert len(result) == 1
+    assert result[0]["recipient"] == "jane@acme.com"
+
+
+def test_create_app_index_no_nav_link_when_no_template_failures(app):
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+        client = app.test_client()
+        resp = client.get("/")
+    assert resp.status_code == 200
+    assert b"Template Failures" not in resp.data
+
+
+def test_create_app_index_shows_nav_link_when_template_failures_exist(app, tmp_path):
+    write_failures([_make_failure()], path=tmp_path / "template_reload_failures.json")
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+        client = app.test_client()
+        resp = client.get("/")
+    assert resp.status_code == 200
+    assert b"Template Failures (1)" in resp.data
+    assert b'href="/template-failures"' in resp.data
+
+
+def test_create_app_index_nav_link_disappears_once_resolved(app, tmp_path):
+    failures_path = tmp_path / "template_reload_failures.json"
+    write_failures([_make_failure()], path=failures_path)
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+        client = app.test_client()
+        assert b"Template Failures" in client.get("/").data
+
+    # A later `template-reload` run that found nothing wrong fully overwrites
+    # the report -- the nav link must vanish on the very next page load, with
+    # no separate "mark resolved" step.
+    write_failures([], path=failures_path)
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+        resp = client.get("/")
+    assert b"Template Failures" not in resp.data
+
+
+def test_create_app_template_failures_page_empty_state(app):
+    client = app.test_client()
+    resp = client.get("/template-failures")
+    assert resp.status_code == 200
+    assert b"No template-reload failures" in resp.data
+
+
+def test_create_app_template_failures_page_lists_entries(app, tmp_path):
+    write_failures(
+        [_make_failure(recipient="jane@acme.com", campaign="coldpost", missing_fields=["special_note"])],
+        path=tmp_path / "template_reload_failures.json",
+    )
+    client = app.test_client()
+    resp = client.get("/template-failures")
+    assert resp.status_code == 200
+    assert b"jane@acme.com" in resp.data
+    assert b"coldpost" in resp.data
+    assert b"special_note" in resp.data
+
+
+def test_create_app_template_failures_page_reachable_directly_with_zero_failures(app):
+    # Direct navigation must work even though the index() nav link never
+    # points here when there's nothing to show -- no 404, no error.
+    client = app.test_client()
+    resp = client.get("/template-failures")
+    assert resp.status_code == 200
+    assert b"No template-reload failures" in resp.data
