@@ -73,6 +73,31 @@ def test_env_value_round_trip(tmp_path):
     assert init._read_env_value(path, "GMASS_API_KEY") == "secret123"
 
 
+# --- step_preflight ---------------------------------------------------------
+
+def test_step_preflight_reports_redis_missing(monkeypatch, capsys):
+    monkeypatch.setattr(init.shutil, "which", lambda name: None)
+    init.step_preflight()
+    out = capsys.readouterr().out
+    assert "redis-server: MISSING" in out
+    assert "brew install redis" in out
+
+
+def test_step_preflight_reports_redis_found(monkeypatch, capsys):
+    monkeypatch.setattr(init.shutil, "which", lambda name: f"/usr/bin/{name}")
+    init.step_preflight()
+    out = capsys.readouterr().out
+    assert "redis-server: OK" in out
+
+
+def test_step_preflight_never_blocks_on_missing_redis(monkeypatch):
+    # "Check, don't install" (CLAUDE.md): preflight only reports, it must
+    # never raise or halt the installer just because an optional dependency
+    # (Redis, needed only for the hourly dashboard cache) is absent.
+    monkeypatch.setattr(init.shutil, "which", lambda name: None)
+    init.step_preflight()  # must not raise
+
+
 # --- step_sender -----------------------------------------------------------
 
 def test_step_sender_scaffolds_and_writes_fields(tmp_path, monkeypatch):
@@ -310,6 +335,8 @@ def test_step_launchd_prints_plist_on_macos(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "com.slap.runner" in out
     assert "launchctl load" in out
+    assert "--job sync" in out
+    assert "com.slap.sync" in out
 
 
 # --- full run_init() integration ------------------------------------------

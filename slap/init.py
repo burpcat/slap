@@ -234,6 +234,11 @@ def step_preflight() -> None:
          "",
          "not found — only required for latex campaigns (the compile-loop editor step). "
          "In VS Code: Cmd+Shift+P -> 'Shell Command: Install code command in PATH'"),
+        ("redis-server", shutil.which("redis-server") is not None,
+         "",
+         "not found — only required for the optional hourly dashboard cache (`slap.py sync`, "
+         "see LAUNCHD.md). The dashboard falls back to live polling without it. "
+         "Install: brew install redis && brew services start redis"),
     ]
     for name, ok, ok_detail, fail_detail in checks:
         if ok:
@@ -412,7 +417,12 @@ def step_launchd(global_config) -> None:
         f"  launchd runs with a bare environment — slap.py runner loads .env itself via "
         f"python-dotenv, so GMASS_API_KEY does not need to be in launchd's own environment.\n\n"
         f"  One-time wake-test procedure: see LAUNCHD.md's 'One-time manual test checklist' — "
-        f"this behavior can only be verified on real hardware."
+        f"this behavior can only be verified on real hardware.\n\n"
+        f"  Optional: hourly dashboard cache refresh (needs Redis running — see the preflight "
+        f"check above). Install as a second LaunchAgent:\n"
+        f"    python slap.py plist --job sync > {Path.home() / 'Library' / 'LaunchAgents' / 'com.slap.sync.plist'}\n"
+        f"    launchctl load {Path.home() / 'Library' / 'LaunchAgents' / 'com.slap.sync.plist'}\n"
+        f"  See LAUNCHD.md's 'The hourly cache-sync job' section for details."
     )
 
 
