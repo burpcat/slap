@@ -1546,6 +1546,117 @@ def test_reachouts_rows_reply_tag_none_when_never_replied(conn):
     assert reachouts_rows(conn)[0]["reply_tag"] is None
 
 
+# --- reachouts_rows: OOO status/resume-date (investigation + fix) ------------
+#
+# Investigation finding: status and reply_tag ALREADY correctly reflect an
+# unconditional Mark-OOO with zero prior reply — both _apply_event_to_cache's
+# ooo_tagged handler and reply_tags()'s resolution rule key off the
+# ooo_tagged event itself, never a prior reply. The real, confirmed gap was
+# that the actual resume date was never surfaced on the row at all.
+# Reuses the module's existing _fake_unsubscribe() helper (defined above,
+# near tag_reply's other tests) rather than a second, redundant fake.
+
+def test_reachouts_rows_ooo_with_zero_prior_reply_shows_status_and_resume_date(conn):
+    # The exact case the task calls out as possibly falling through a gap:
+    # marking OOO with no prior reply/engagement whatsoever.
+    _stage_and_send(conn, recipient="cold@company.com", campaign="c", persona="recruiter")
+    tag_reply(conn, "cold@company.com", "ooo", resume_date=date(2026, 8, 15),
+              api_key="fake", unsubscribe_fn=_fake_unsubscribe)
+
+    row = reachouts_rows(conn)[0]
+    assert row["status"] == "ooo_requeued"
+    assert row["reply_tag"] == "ooo"
+    assert row["ooo_resume_date"] == "2026-08-15"
+
+
+def test_reachouts_rows_ooo_resume_date_none_for_a_normal_recipient(conn):
+    _stage_and_send(conn, recipient="normal@x.com", campaign="c", persona="recruiter")
+    assert reachouts_rows(conn)[0]["ooo_resume_date"] is None
+
+
+def test_reachouts_rows_ooo_resume_date_none_for_legacy_ooo_tagged_without_a_resume_date(conn):
+    # A pre-resume_date-feature ooo_tagged event (no resume_date in its meta)
+    # has no genuine specific date to show — _pending_ooo_resume_date treats
+    # it as date.min ("immediately due"), which must not be rendered as a
+    # fabricated date.
+    _stage_and_send(conn, recipient="legacy@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="ooo_tagged", recipient="legacy@x.com", campaign="c", meta={})
+
+    row = reachouts_rows(conn)[0]
+    assert row["status"] == "ooo_requeued"
+    assert row["ooo_resume_date"] is None
+
+
+def test_reachouts_rows_status_and_resume_date_revert_after_resume_fires(conn):
+    # Task recommendation 3: once the resume date passes and the sequence
+    # continues normally, the row should reflect the recipient's current
+    # normal status, not a stale OOO badge -- this is already the existing
+    # behavior (requeued's _apply_event_to_cache handler flips status back),
+    # pinned here as a regression test.
+    _stage_and_send(conn, recipient="cold@company.com", campaign="c", persona="recruiter")
+    tag_reply(conn, "cold@company.com", "ooo", resume_date=date(2026, 7, 1),
+              api_key="fake", unsubscribe_fn=_fake_unsubscribe)
+    assert reachouts_rows(conn)[0]["status"] == "ooo_requeued"
+
+    # Simulate the runner's OOO resend actually firing (cadence exhausted --
+    # a single-stage persona has no next_resume_date).
+    append_event(conn, type="requeued", recipient="cold@company.com", campaign="c", stage=1,
+                 gmass_campaign_id="2", gmass_draft_id="d2", meta=None)
+
+    row = reachouts_rows(conn)[0]
+    assert row["status"] == "active"
+    assert row["ooo_resume_date"] is None
+    # reply_tag is a known, pre-existing exception: reply_tags() only
+    # updates on a later reply/ooo_tagged/reply_reviewed event, and
+    # `requeued` isn't one of those, so it stays 'ooo' -- exactly why status,
+    # not reply_tag, is the dimension wired up as the "currently OOO" filter.
+    assert row["reply_tag"] == "ooo"
+
+
+def test_reachouts_rows_ooo_resume_date_none_mid_multi_stage_continuation(conn):
+    # A pending next_resume_date for a LATER stage (status already back to
+    # 'active' between resends) is just the persona's normal inter-stage gap
+    # -- not "still OOO" -- so it must not render an OOO resume date either.
+    _stage_and_send(conn, recipient="cold@company.com", campaign="c", persona="recruiter")
+    tag_reply(conn, "cold@company.com", "ooo", resume_date=date(2026, 7, 1),
+              api_key="fake", unsubscribe_fn=_fake_unsubscribe)
+    append_event(conn, type="requeued", recipient="cold@company.com", campaign="c", stage=1,
+                 gmass_campaign_id="2", gmass_draft_id="d2",
+                 meta={"next_resume_date": "2026-07-10"})
+
+    row = reachouts_rows(conn)[0]
+    assert row["status"] == "active"
+    assert row["ooo_resume_date"] is None
+
+
+def test_reachouts_rows_ooo_via_widget_and_via_reachouts_render_identically(conn):
+    # Parity requirement: both OOO entry points -- the original reply-tag
+    # widget (dashboard.html, gated on a detected reply) and the Reach-outs
+    # row's unconditional "Mark OOO" action -- hit the same route and call
+    # the same tag_reply()/_tag_ooo() function (see tag_reply's own
+    # docstring), so for recipients in the same underlying state, tagging
+    # OOO must produce identical rows regardless of which entry point is
+    # conceptually behind the call. Both recipients here have a prior reply
+    # (the widget's own gating precondition), isolating "does the entry
+    # point matter" from "does having replied matter" (already covered by
+    # the zero-prior-reply test above).
+    ts = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+    _stage_and_send(conn, recipient="widget@x.com", campaign="c", persona="recruiter", timestamp=ts)
+    append_event(conn, type="reply", recipient="widget@x.com", campaign="c", timestamp=ts)
+    tag_reply(conn, "widget@x.com", "ooo", resume_date=date(2026, 8, 15),
+              api_key="fake", unsubscribe_fn=_fake_unsubscribe)
+
+    _stage_and_send(conn, recipient="direct@x.com", campaign="c", persona="recruiter", timestamp=ts)
+    append_event(conn, type="reply", recipient="direct@x.com", campaign="c", timestamp=ts)
+    tag_reply(conn, "direct@x.com", "ooo", resume_date=date(2026, 8, 15),
+              api_key="fake", unsubscribe_fn=_fake_unsubscribe)
+
+    rows = {r["recipient"]: r for r in reachouts_rows(conn)}
+    widget_row = {k: v for k, v in rows["widget@x.com"].items() if k != "recipient"}
+    direct_row = {k: v for k, v in rows["direct@x.com"].items() if k != "recipient"}
+    assert widget_row == direct_row
+
+
 # --- filter_reachouts (pure function — no DB needed) --------------------------
 
 def _row(**overrides):
@@ -1553,7 +1664,7 @@ def _row(**overrides):
         "recipient": "jane@acme.com", "campaign": "coldpost-recruiter", "persona": "recruiter",
         "status": "active", "engagement": "none", "reply_tag": None, "domain": "acme.com",
         "company": "Acme", "req_id_present": False, "date": "2026-06-15T00:00:00+00:00",
-        "date_local": "2026-06-15",
+        "date_local": "2026-06-15", "ooo_resume_date": None,
     }
     base.update(overrides)
     return base
@@ -1580,6 +1691,20 @@ def test_filter_reachouts_by_status():
     rows = [_row(recipient="a@x.com", status="bounced"), _row(recipient="b@x.com", status="active")]
     result = filter_reachouts(rows, {"status": "bounced"})
     assert [r["recipient"] for r in result] == ["a@x.com"]
+
+
+def test_filter_reachouts_by_status_filters_down_to_currently_ooo():
+    # "Make it filterable" requirement: status is the dimension wired up for
+    # "who's currently OOO" (see reachouts_rows()'s docstring for why status,
+    # not reply_tag) -- reachouts.html's Status filter already dynamically
+    # lists every live status value with no template change needed, so this
+    # pins that filter_reachouts() itself already supports it correctly.
+    rows = [
+        _row(recipient="ooo@x.com", status="ooo_requeued", ooo_resume_date="2026-08-15"),
+        _row(recipient="active@x.com", status="active"),
+    ]
+    result = filter_reachouts(rows, {"status": "ooo_requeued"})
+    assert [r["recipient"] for r in result] == ["ooo@x.com"]
 
 
 def test_filter_reachouts_by_engagement():
@@ -1662,6 +1787,30 @@ def test_create_app_reachouts_renders_rows_across_campaigns(app, tmp_path):
     assert b"jane@acme.com" in resp.data
     assert b"bob@widgets.com" in resp.data
     assert b"2 of 2 reach-outs shown" in resp.data
+
+
+def test_create_app_reachouts_renders_ooo_status_and_resume_date(app, tmp_path):
+    # End-to-end: mark a recipient OOO with zero prior reply via the real
+    # /reply/<recipient>/tag route (the Reach-outs row's own "Mark OOO"
+    # form), then confirm the rendered /reachouts page actually shows both
+    # the OOO status and the resume date -- not just that reachouts_rows()
+    # computes the right dict.
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="queued", recipient="cold@company.com", campaign="c", stage=0,
+                 meta={"persona": "founder"})
+    append_event(conn, type="sent", recipient="cold@company.com", campaign="c", stage=0, gmass_campaign_id="1")
+    conn.close()
+
+    with patch("slap.dashboard.gmass.unsubscribe_recipient", return_value=_fake_unsubscribe(None, None)):
+        client = app.test_client()
+        client.post("/reply/cold@company.com/tag",
+                     data={"tag": "ooo", "resume_date": "2026-08-15", "redirect_to": "reachouts"})
+        with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+            resp = client.get("/reachouts")
+
+    assert resp.status_code == 200
+    assert b"ooo_requeued" in resp.data
+    assert b"2026-08-15" in resp.data
 
 
 def test_create_app_reachouts_never_calls_gmass(app, tmp_path):

@@ -45,7 +45,9 @@ from flask import Flask, g, redirect, request, render_template, url_for
 from slap import domains, gmass, gmass_cache
 from slap.config import discover_campaigns
 from slap.domains import check_recipient
-from slap.queue import due_for_ooo_resend, due_recipients, tag_ooo as _tag_ooo
+from slap.queue import (
+    _pending_ooo_resume_date, due_for_ooo_resend, due_recipients, tag_ooo as _tag_ooo,
+)
 from slap.runner import cap_headroom
 from slap.tracking import append_event
 
@@ -776,6 +778,32 @@ def reachouts_rows(conn) -> list:
     - company / req_id_present: _recipient_drop_meta() — only reliable for
       recipients staged after that capture shipped; blank/False for older
       ones, never guessed.
+    - ooo_resume_date: ONLY set while status == 'ooo_requeued' — investigated
+      before building (see CONTROL_SHEET.md): status and reply_tag already
+      correctly reflect an unconditional Mark-OOO with zero prior reply (both
+      derive from the same `ooo_tagged` event regardless of any `reply`
+      event's existence), so the actual gap was that the resume date itself
+      was never surfaced anywhere. Reuses slap.queue._pending_ooo_resume_date
+      — the exact same "what's the next OOO-driven due date for this
+      recipient's current campaign" logic due_for_ooo_resend() already relies
+      on — rather than re-deriving it from event meta a second time here.
+      Gated on status=='ooo_requeued' rather than "pending is not None"
+      because a mid-multi-stage continuation (status back to 'active'
+      between resends, pending still non-None per that function's own
+      docstring) is functionally indistinguishable from a normal active
+      recipient's next scheduled stage — see slap.runner._send_ooo_resend's
+      `next_resume_date` (just the persona's normal inter-stage gap from the
+      day that resend fired), so surfacing it as "still OOO" here would be
+      misleading. A pre-resume_date-feature `ooo_tagged` event (or any other
+      reason the helper returns date.min/None) has no genuine specific date
+      to show — left None rather than rendering a fabricated date.min.
+      Deliberately NOT sourced from reply_tag: reply_tags() only updates on a
+      later reply/ooo_tagged/reply_reviewed event, so once a recipient
+      actually resumes (a `requeued` event, not one of those three types)
+      their reply_tag stays 'ooo' forever — status is the dimension that
+      self-corrects back to normal, which is also why it's the one wired up
+      as the "currently OOO" filter (see reachouts.html; already dynamically
+      lists every live status value with no template change needed).
     """
     clicked = _clicked_recipients(conn)
     tags = reply_tags(conn)
@@ -796,8 +824,14 @@ def reachouts_rows(conn) -> list:
         if row["first_sent_at"] is None and status == "active":
             status = "queued"
 
+        ooo_resume_date = None
+        if status == "ooo_requeued":
+            pending = _pending_ooo_resume_date(conn, recipient, row["campaign"])
+            if pending is not None and pending != date.min:
+                ooo_resume_date = pending.isoformat()
+
         meta = drop_meta.get(recipient, {"company": "", "role": "", "req_id": ""})
-        date = row["first_sent_at"] or row["last_event_at"]
+        row_date = row["first_sent_at"] or row["last_event_at"]
 
         result.append({
             "recipient": recipient,
@@ -809,7 +843,8 @@ def reachouts_rows(conn) -> list:
             "domain": domains.domain_of(recipient),
             "company": meta["company"],
             "req_id_present": bool(meta["req_id"]),
-            "date": date,
+            "date": row_date,
+            "ooo_resume_date": ooo_resume_date,
             # Precomputed LOCAL calendar date (YYYY-MM-DD), reusing the same
             # _local_date() conversion todays_runs()/companies_contacted()
             # already use — so the client-side date-range filter (reachouts.
@@ -817,7 +852,7 @@ def reachouts_rows(conn) -> list:
             # <input type=date> value without redoing timezone math in JS
             # (and without ever risking it disagreeing with this function's
             # own, Python-tested date_start/date_end filtering).
-            "date_local": _local_date(date).isoformat() if date else None,
+            "date_local": _local_date(row_date).isoformat() if row_date else None,
         })
     return result
 

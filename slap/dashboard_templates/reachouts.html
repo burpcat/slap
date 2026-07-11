@@ -170,7 +170,7 @@
       <td>{{ r.company if r.company else '—' }}</td>
       <td>{{ r.campaign or '—' }}</td>
       <td>{{ r.persona or '—' }}</td>
-      <td>{{ r.status or '—' }}</td>
+      <td>{{ r.status or '—' }}{% if r.ooo_resume_date %} <span class="muted">(resumes {{ r.ooo_resume_date }})</span>{% endif %}</td>
       <td>{{ {'replied': 'Replied', 'clicked': 'Clicked, no reply', 'none': 'No engagement yet'}[r.engagement] }}</td>
       <td>{{ r.reply_tag or '—' }}</td>
       <td>{{ r.domain }}</td>
