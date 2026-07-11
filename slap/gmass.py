@@ -246,7 +246,15 @@ def build_campaign_settings(cadence: list, stage_bodies: list, *, open_tracking:
     stageNDays/stageNCampaignText/stageNAction triple per persona cadence
     stage, using GMass's English-ordinal field names. Does not cover the OOO
     send-as-reply shape (sendAsReply/campaignIdToReplyTo) — that's a
-    distinct, simpler payload built by step 10's re-queue path."""
+    distinct, simpler payload built by step 10's re-queue path.
+
+    This one call is the entire reason `slap.py template-reload` (post-
+    launch, see `slap.reload`'s module docstring) can only ever touch a
+    recipient with nothing sent at all: every stage's wording gets flattened
+    into `stageNCampaignText` fields on THIS call, sent exactly once at
+    initial send (`slap.runner._send_one`) — there is no second call anyone
+    could make later to update stage 2/3's text after the fact. Confirmed
+    against this function before `template-reload` was built, not assumed."""
     if len(cadence) != len(stage_bodies):
         raise GMassError(
             f"cadence has {len(cadence)} stage(s) but {len(stage_bodies)} stage bodies given"

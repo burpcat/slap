@@ -49,6 +49,22 @@ CONTROL_SHEET.md, revisit when steps 6/9/10 wire in real callers):
   latest reply-lifecycle event (`reply`/`ooo_tagged`/`reply_reviewed`) is
   still `reply`, the same "any later closing event resolves it" pattern as
   `due_for_ooo_resend()`.
+- `template-reload` (post-launch, `slap.reload`) deliberately did NOT get a
+  new event type for its per-recipient failure reports, unlike every event
+  type documented above. The difference: those all needed to affect the
+  `recipients` cache (a real state transition) or be replayable truth. A
+  reload failure is neither — it's a disposable diagnostic about the CURRENT
+  attempt only, explicitly superseded wholesale by the next attempt (see
+  `slap.reload`'s own module docstring for "unresolved failures from the
+  most recent run"). More importantly, this table's `type` column has a SQL
+  CHECK constraint (below) baked into every already-existing, populated
+  `slap.db` at table-creation time — adding a literal value to it needs a
+  full table rebuild, not an `ALTER TABLE`, a live-data-migration risk this
+  diagnostic-only feature has no reason to take on (the exact same
+  reasoning `slap.dashboard._sync_blocks()` already applied once, reusing
+  `bounce` + a `meta["category"]` discriminator instead of a new `block`
+  type). `slap.reload` instead writes a small JSON file, fully overwritten
+  on every run.
 """
 from __future__ import annotations
 
@@ -149,7 +165,23 @@ def latest_open_draft_id(conn: sqlite3.Connection, recipient: str):
     orphan/duplicate draft (§3 idempotency). `requeued` (step 10's OOO
     resend completion marker) closes an open draft exactly like `sent`
     does — without it, a SECOND OOO cycle would see the FIRST cycle's
-    already-`requeued` draft_created and wrongly treat it as still open."""
+    already-`requeued` draft_created and wrongly treat it as still open.
+
+    Second caller (post-launch): `slap.reload._reload_one` calls this for a
+    different reason than `slap.runner._send_one` does. The runner uses a
+    non-None result to REUSE an existing draft instead of creating a
+    duplicate; `slap.reload` uses it purely as a READ — a non-None result
+    means this recipient's initial subject/body are already committed to a
+    real GMass draft (from a create_draft that succeeded before a later
+    send_campaign failed), so `slap.reload` refuses to rewrite their staged
+    manifest at all. Editing it locally at that point would silently
+    split-brain the initial send (the next drain reuses the STALE draft
+    content unchanged, per this function's whole purpose) against a
+    follow-up cadence rebuilt from the newly-edited manifest. Note this is
+    recipient-scoped, not campaign-scoped — a recipient re-staged into a new
+    campaign while an old campaign's draft is still open will (correctly,
+    if conservatively) still be refused a reload for the new campaign too;
+    it can never be the reverse (a real open draft going undetected)."""
     rows = conn.execute(
         "SELECT type, gmass_draft_id FROM events WHERE recipient = ? "
         "AND type IN ('draft_created', 'sent', 'requeued') ORDER BY id DESC",

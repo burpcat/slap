@@ -36,10 +36,11 @@ independently reviewed against a written spec and a fixed set of design invarian
 moving to the next. Several real bugs were caught this way rather than in later
 integration — see "Notable bugs found," below.
 
-**Testing.** 238 fast tests (a few milliseconds total) plus 7 tests marked `slow`
-(real `xelatex` subprocess compiles, and one test that spins up a real threaded HTTP
-server) kept out of the default run for dev-loop speed. No test suite makes a real GMass
-API call — that's what the standalone, hand-run Phase-0 probes are for. Every bug found
+**Testing.** 595 fast tests (a few seconds total, grown well past the original 13-stage
+build via the post-launch features documented in `SLAP_PROJECT_CONTEXT.md`) plus 8 tests
+marked `slow` (real `xelatex` subprocess compiles, and one test that spins up a real
+threaded HTTP server) kept out of the default run for dev-loop speed. No test suite makes
+a real GMass API call — that's what the standalone, hand-run Phase-0 probes are for. Every bug found
 during development was turned into a regression test *and verified by deliberately
 reverting the fix and confirming the new test actually fails* before restoring it — not
 just "the fix makes the test pass," but "the test fails without the fix."
@@ -108,6 +109,24 @@ unattended runner's own retry-then-give-up-loud path, so a transient environment
 degrades to a visible, dashboard-surfaced failure with the queue left completely intact —
 never a silent skip, never a crash that loses track of what happened.
 
+**Template reload — a diagnostic feature that deliberately stays out of the event log.**
+A post-launch command (`template-reload`) re-renders a recipient's staged (not-yet-sent)
+email content against a campaign template edited after they were staged — previously a
+silent no-op, since the staged text was frozen at stage time. Two things were verified
+against the real code, not assumed, before building it: that a recipient's whole
+follow-up cadence is flattened into a single API call at initial send (so this can only
+ever touch recipients with nothing sent at all — reusing the runner's existing "queued,
+not yet sent" query outright rather than writing a similar one), and that the raw
+per-recipient field values needed to re-fill an edited template weren't being persisted
+anywhere, which they now are. Its per-recipient failure reports (e.g. "this campaign's
+config is currently broken," "the edited template needs a field this recipient never
+had") are written to a small, disposable JSON file — not a new event type — since the
+event log's `type` column has a real SQL constraint that can't be widened without
+migrating every existing owner's database, and a diagnostic-only report about the most
+recent attempt was never going to need append-only replay anyway. Same one-recipient
+(and, here, one-campaign) blast radius as everywhere else in the app: one broken
+campaign's config, or one recipient's field mismatch, never blocks reloading anyone else.
+
 ## Future expansions / known limitations
 
 Found during development (mostly via structured self-audits run after every build
@@ -170,3 +189,31 @@ stage) and deliberately deferred rather than silently left undocumented:
   (or in a fresh checkout, seeding) a file into the actual repository. Caught by tracing
   through exactly what path each check would resolve to before trusting a passing test
   suite, not by the test failing (it didn't — that was the point).
+- **A silent split-brain hazard in `template-reload`, caught by a structured audit before
+  shipping, not by any test.** The feature's whole premise is "only touch recipients with
+  nothing sent at all" — but "no `sent` event yet" turned out not to be the same
+  precondition as "nothing has happened yet for this recipient." A recipient whose GMass
+  draft-creation call had already succeeded, with a real send attempt still in flight
+  (the follow-up API call hadn't fired or had failed), has their initial subject/body
+  already committed to that open draft — a later drain reuses it as-is, by design, for
+  exactly the retry-safety reason the two-call send is idempotent in the first place.
+  Reloading that recipient's local content anyway would have silently produced a real
+  email whose initial send used the STALE pre-edit wording while its follow-up stages
+  used the newly-edited one, with no error or warning anywhere. Every test written for the
+  feature exercised the intended "nothing sent, nothing drafted" case; none constructed
+  the "drafted but not sent" intermediate state, because nothing prompted anyone to think
+  of it as different. Fixed by checking for an open draft first and refusing to reload
+  that recipient at all, then — following this project's standing practice — verified by
+  reverting the fix and confirming the new regression test actually failed without it,
+  not just that it passed with it.
+- **A second batch-write path that lacked the per-recipient failure isolation every other
+  batch operation in this app already has.** The function that actually writes reloaded
+  content back to a recipient's staged file had no exception boundary of its own — every
+  *other* per-recipient step in the same feature (and in the drain loop it mirrors) does.
+  A single recipient's write failing between preview and confirm (e.g. their staged file
+  disappearing) would have raised an unhandled exception and aborted writing every other,
+  already-verified recipient in the same batch — not a safety bug (nothing gets
+  double-sent), but a real violation of the one-recipient-blast-radius guarantee this
+  project treats as load-bearing everywhere else. Also caught by audit, not by a test that
+  happened to exercise it; fixed the same way, with a regression test confirmed to fail
+  without the fix before being trusted.

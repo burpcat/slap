@@ -162,6 +162,18 @@ def _send_one(conn, api_key: str, row: dict, *, workdir_root: Path = WORKDIR_ROO
         manifest = load_manifest(workdir)
         attachment_name = manifest["attachment_name"]
         cadence = manifest["cadence"]
+        # cadence/stage_bodies/subject/body are ALL read fresh from
+        # staged.json right here, at drain time — never cached from an
+        # earlier point in this function's own lifetime. This is precisely
+        # what makes `slap.py template-reload` (post-launch, slap/reload.py)
+        # effective at all: if it overwrites a recipient's staged subject/
+        # body/stage_bodies BEFORE this drain runs, this read picks up the
+        # new content with zero changes needed here. It's also exactly why
+        # that feature refuses to touch a recipient with an OPEN draft (see
+        # slap.tracking.latest_open_draft_id) — this same manifest is read
+        # again on retry, but the actual DRAFT (created below) is NOT
+        # recreated on a retry, so only stage_bodies/cadence would pick up a
+        # local edit while the initial subject/body would not.
         stage_bodies = manifest["stage_bodies"]
         subject = manifest["subject"]
         body = manifest["body"]

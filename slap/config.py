@@ -19,7 +19,16 @@ CAMPAIGNS_DIR = Path("campaigns")
 
 
 class ConfigError(Exception):
-    """Raised on any fail-loud config/campaign validation failure."""
+    """Raised on any fail-loud config/campaign validation failure.
+
+    Every OTHER caller in this app treats a `ConfigError` from `load_campaign()`
+    as fatal for the whole command (e.g. `slap.py`'s `cmd_send`/`cmd_list`
+    catch it once at the top level and exit/skip-with-a-message). `slap.reload.
+    scan()` (post-launch) is the one exception: it catches `ConfigError` PER
+    CAMPAIGN, caches the error, and reports it as a failure only for that
+    campaign's own recipients — a batch operation spanning every campaign at
+    once can't let one broken campaign.yaml abort reloading every other,
+    unrelated campaign's recipients too."""
 
 
 def _require(mapping: dict, dotted_key: str, ctx: object) -> object:

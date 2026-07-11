@@ -159,7 +159,20 @@ def due_recipients(conn) -> list:
     fixes (a confirmed proceed-anyway send that vanished: never sent, never
     failed, never counted as still queued). `send_failed` does not count as
     closing a queued cycle — a failed attempt stays due for retry on the
-    next drain."""
+    next drain.
+
+    Second caller (post-launch): `slap.reload.scan()` uses this EXACT query,
+    unmodified, as its own "which recipients have nothing sent at all yet"
+    eligibility set — not a coincidence, the "queued, no later sent event"
+    definition here is precisely "this recipient's staged content has never
+    been locked into a real GMass send" (see `slap.reload`'s module
+    docstring for why that's the one hard limit on what it can safely
+    re-render). Reusing this query instead of re-deriving a similar-but-
+    subtly-different one is what makes `slap.reload` immune to the exact
+    first_sent_at pitfall this docstring already fixed for the runner —
+    a recipient re-staged into a new campaign is correctly still eligible
+    for reload against that new campaign's templates, not silently
+    excluded forever."""
     rows = conn.execute(
         """
         SELECT r.* FROM recipients r
