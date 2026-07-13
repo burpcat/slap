@@ -1007,6 +1007,57 @@ def test_bounces_defaults_category_to_bounce_for_pre_existing_events_without_it(
     assert result[0]["category"] == "bounce"
 
 
+def test_bounces_surfaces_the_actual_reason_text_for_a_bounce(conn):
+    # Previously: the widget only ever showed a generic "Bounced" label,
+    # even though the real reason text was already captured in
+    # meta.bounce_reason at sync time -- never read back out for display.
+    append_event(conn, type="queued", recipient="bounced@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter"})
+    append_event(conn, type="bounce", recipient="bounced@x.com", campaign="c",
+                 meta={"bounce_reason": "mailbox full", "bounce_time": "t1", "category": "bounce"})
+    result = bounces(conn)
+    assert result[0]["reason"] == "mailbox full"
+
+
+def test_bounces_surfaces_the_actual_reason_text_for_a_block(conn):
+    append_event(conn, type="queued", recipient="blocked@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter"})
+    append_event(conn, type="bounce", recipient="blocked@x.com", campaign="c",
+                 meta={"bounce_reason": "rejected due to security policies", "bounce_time": "t2",
+                       "category": "block"})
+    result = bounces(conn)
+    assert result[0]["reason"] == "rejected due to security policies"
+
+
+def test_bounces_invalid_address_shows_real_reason_not_a_generic_label(conn):
+    # A real, GMass-shaped hard-bounce diagnostic for a non-existent
+    # recipient -- must show up verbatim, not collapse to a bare "bounced"
+    # with no detail on WHY.
+    real_reason = (
+        "Final-Recipient: rfc822; akshat@truefoundry.com\n"
+        "Action: failed\nStatus: 5.1.1\n"
+        "Diagnostic-Code: smtp; 550-5.1.1 The email account that you tried to reach "
+        "does not exist."
+    )
+    append_event(conn, type="queued", recipient="akshat@truefoundry.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter"})
+    append_event(conn, type="bounce", recipient="akshat@truefoundry.com", campaign="c",
+                 meta={"bounce_reason": real_reason, "bounce_time": "t3", "category": "bounce"})
+    result = bounces(conn)
+    assert result[0]["reason"] == real_reason
+    assert result[0]["reason"] != "bounced"
+    assert "does not exist" in result[0]["reason"]
+
+
+def test_bounces_reason_blank_not_none_when_gmass_gave_no_reason_text(conn):
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter"})
+    append_event(conn, type="bounce", recipient="a@x.com", campaign="c",
+                 meta={"bounce_reason": None, "bounce_time": "t1", "category": "bounce"})
+    result = bounces(conn)
+    assert result[0]["reason"] == ""
+
+
 def test_companies_contacted_counts_distinct_non_consumer_domains(conn):
     append_event(conn, type="queued", recipient="a@acme.com", campaign="c", stage=0, meta={"persona": "recruiter"})
     append_event(conn, type="sent", recipient="a@acme.com", campaign="c", stage=0, timestamp=_ts(0))
@@ -1083,6 +1134,25 @@ def test_create_app_index_renders(app):
     assert resp.status_code == 200
     assert b"slap dashboard" in resp.data
     assert b"Nothing needs triage." in resp.data
+
+
+def test_create_app_index_bounces_widget_shows_real_reason_text(app, tmp_path):
+    # Previously: the Bounces & Blocks widget only ever showed a generic
+    # "Bounced"/"Blocked" label, even though the real reason text was
+    # already captured in meta.bounce_reason -- never rendered anywhere.
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="queued", recipient="dead@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter"})
+    append_event(conn, type="bounce", recipient="dead@x.com", campaign="c",
+                 meta={"bounce_reason": "mailbox full", "bounce_time": "t1", "category": "bounce"})
+    conn.close()
+
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+        client = app.test_client()
+        resp = client.get("/")
+
+    assert resp.status_code == 200
+    assert b"mailbox full" in resp.data
 
 
 def test_create_app_index_fresh_cache_makes_zero_gmass_calls(app):
@@ -1575,6 +1645,22 @@ def test_reachouts_rows_ooo_resume_date_none_for_a_normal_recipient(conn):
     assert reachouts_rows(conn)[0]["ooo_resume_date"] is None
 
 
+def test_reachouts_rows_bounce_reason_shown_for_a_bounced_recipient(conn):
+    # Previously: this page showed a bare "bounced" status with no detail
+    # on why -- same gap the Bounces & Blocks widget had.
+    _stage_and_send(conn, recipient="dead@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="bounce", recipient="dead@x.com", campaign="c",
+                 meta={"bounce_reason": "mailbox full", "bounce_time": "t1", "category": "bounce"})
+    row = reachouts_rows(conn)[0]
+    assert row["status"] == "bounced"
+    assert row["bounce_reason"] == "mailbox full"
+
+
+def test_reachouts_rows_bounce_reason_none_for_a_normal_recipient(conn):
+    _stage_and_send(conn, recipient="normal@x.com", campaign="c", persona="recruiter")
+    assert reachouts_rows(conn)[0]["bounce_reason"] is None
+
+
 def test_reachouts_rows_ooo_resume_date_none_for_legacy_ooo_tagged_without_a_resume_date(conn):
     # A pre-resume_date-feature ooo_tagged event (no resume_date in its meta)
     # has no genuine specific date to show — _pending_ooo_resume_date treats
@@ -1788,6 +1874,21 @@ def test_create_app_reachouts_renders_rows_across_campaigns(app, tmp_path):
     assert b"jane@acme.com" in resp.data
     assert b"bob@widgets.com" in resp.data
     assert b"2 of 2 reach-outs shown" in resp.data
+
+
+def test_create_app_reachouts_renders_bounce_reason_text(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    _stage_and_send(conn, recipient="dead@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="bounce", recipient="dead@x.com", campaign="c",
+                 meta={"bounce_reason": "mailbox full", "bounce_time": "t1", "category": "bounce"})
+    conn.close()
+
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+        client = app.test_client()
+        resp = client.get("/reachouts")
+
+    assert resp.status_code == 200
+    assert b"mailbox full" in resp.data
 
 
 def test_create_app_reachouts_renders_ooo_status_and_resume_date(app, tmp_path):

@@ -587,22 +587,22 @@ def warm_but_silent(conn) -> list:
     return sorted(by_recipient.values(), key=lambda e: e["recipient"])
 
 
-def _latest_bounce_category(conn, recipient: str) -> str:
-    """This recipient's most recent bounce-lifecycle event's category
-    ("bounce" or "block") — matches the same latest-event-wins convention
-    every other "current state" derivation in this app already uses (e.g.
-    reply_tags(), needs_triage()). A pre-existing event recorded before
-    `category` existed (see _sync_bounces()) simply has no such key —
-    defaults to "bounce", never guessed as "block" (the only category that
-    predates this field is real bounces; blocks were never recorded at all
-    until _sync_blocks() shipped, so there's no ambiguity to resolve)."""
+def _latest_bounce_meta(conn, recipient: str) -> dict:
+    """This recipient's most recent bounce-lifecycle event's full `meta`
+    dict (`category` + `bounce_reason`/`bounce_time`) — matches the same
+    latest-event-wins convention every other "current state" derivation in
+    this app already uses (e.g. reply_tags(), needs_triage()). One query
+    backs both the category badge and the reason text below (bounces()/
+    reachouts_rows()) rather than querying twice for data already fetched
+    once. A pre-existing event recorded before `category`/`bounce_reason`
+    existed simply lacks those keys — callers default them, never guess."""
     row = conn.execute(
         "SELECT meta FROM events WHERE recipient = ? AND type = 'bounce' ORDER BY id DESC LIMIT 1",
         (recipient,),
     ).fetchone()
     if row is None or not row["meta"]:
-        return "bounce"
-    return json.loads(row["meta"]).get("category", "bounce")
+        return {}
+    return json.loads(row["meta"])
 
 
 def bounces(conn) -> list:
@@ -612,12 +612,26 @@ def bounces(conn) -> list:
     visibility. GMass reports bounces and blocks as two separate categories
     (see module docstring) — both are surfaced here, distinguished by
     `category` per row, rather than blended into one indistinguishable
-    list."""
+    list. `reason` is GMass's own `bounceReason`/`blockReason` text
+    (already captured in `meta.bounce_reason` at sync time — see
+    _sync_bounces()/_sync_blocks() — but previously never read back out
+    for display, so every row just showed a generic "Bounced"/"Blocked"
+    label with no detail on WHY). Defaults to "" (never guessed) for a
+    pre-existing event recorded before `bounce_reason` existed, or one
+    GMass itself returned with no reason text at all."""
     rows = conn.execute(
         "SELECT recipient, campaign, last_event_at FROM recipients "
         "WHERE status = 'bounced' ORDER BY last_event_at DESC"
     ).fetchall()
-    return [{**dict(r), "category": _latest_bounce_category(conn, r["recipient"])} for r in rows]
+    result = []
+    for r in rows:
+        meta = _latest_bounce_meta(conn, r["recipient"])
+        result.append({
+            **dict(r),
+            "category": meta.get("category", "bounce"),
+            "reason": meta.get("bounce_reason") or "",
+        })
+    return result
 
 
 def companies_contacted(conn, consumer_domains: set, *, today: date = None) -> dict:
@@ -813,6 +827,12 @@ def reachouts_rows(conn) -> list:
       self-corrects back to normal, which is also why it's the one wired up
       as the "currently OOO" filter (see reachouts.html; already dynamically
       lists every live status value with no template change needed).
+    - bounce_reason: ONLY set while status == 'bounced' — same "gate the
+      per-recipient lookup query on the status that actually implies it"
+      pattern ooo_resume_date above already established. GMass's own
+      bounceReason/blockReason text (see bounces()'s identical use of
+      _latest_bounce_meta()) — this page previously showed a bare "bounced"
+      status with no detail on why, same gap the Bounces & Blocks widget had.
     """
     clicked = _clicked_recipients(conn)
     tags = reply_tags(conn)
@@ -839,6 +859,10 @@ def reachouts_rows(conn) -> list:
             if pending is not None and pending != date.min:
                 ooo_resume_date = pending.isoformat()
 
+        bounce_reason = None
+        if status == "bounced":
+            bounce_reason = _latest_bounce_meta(conn, recipient).get("bounce_reason") or None
+
         meta = drop_meta.get(recipient, {"company": "", "role": "", "req_id": ""})
         row_date = row["first_sent_at"] or row["last_event_at"]
 
@@ -854,6 +878,7 @@ def reachouts_rows(conn) -> list:
             "req_id_present": bool(meta["req_id"]),
             "date": row_date,
             "ooo_resume_date": ooo_resume_date,
+            "bounce_reason": bounce_reason,
             # Precomputed LOCAL calendar date (YYYY-MM-DD), reusing the same
             # _local_date() conversion todays_runs()/companies_contacted()
             # already use — so the client-side date-range filter (reachouts.

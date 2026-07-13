@@ -37,6 +37,7 @@
   th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--hairline); }
   th { color: var(--text-secondary); font-weight: 500; }
   td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.reason { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .badge { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 11px; }
   .badge.critical { background: var(--critical); color: white; }
   .badge.warn { background: var(--warning); color: var(--text-primary); }
@@ -206,12 +207,13 @@
     <h2>Bounces &amp; blocks</h2>
     {% if bounces %}
     <table>
-      <tr><th>Recipient</th><th>Campaign</th><th>Type</th><th>Last event</th></tr>
+      <tr><th>Recipient</th><th>Campaign</th><th>Type</th><th>Reason</th><th>Last event</th></tr>
       {% for b in bounces %}
       <tr>
         <td>{{ b.recipient }}</td>
         <td>{{ b.campaign }}</td>
         <td>{% if b.category == 'block' %}<span class="badge warn">Blocked</span>{% else %}Bounced{% endif %}</td>
+        <td class="reason" title="{{ b.reason }}">{{ b.reason | truncate(60) if b.reason else '—' }}</td>
         <td>{{ b.last_event_at | to_local }}</td>
       </tr>
       {% endfor %}
