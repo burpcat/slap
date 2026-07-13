@@ -5,6 +5,7 @@ reply-tag -> OOO -> re-queue fires a send-as-reply.
 import dataclasses
 import json
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -73,8 +74,34 @@ class FakeRedisDown:
 
 
 @pytest.fixture
-def conn(tmp_path):
-    return connect(tmp_path / "test.db")
+def db_path(tmp_path):
+    return tmp_path / "test.db"
+
+
+@pytest.fixture
+def conn(db_path):
+    return connect(db_path)
+
+
+class _ImmediateThread:
+    """threading.Thread stand-in that runs its target synchronously on
+    .start(), so tests can assert on a spawned background GMass refresh's
+    effects deterministically instead of racing a real daemon thread (and
+    so a patched gmass.get_reports doesn't get called for real once the
+    `with patch(...)` scope that covered the triggering request has already
+    exited)."""
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+        self._target = target
+        self._args = args
+        self._kwargs = kwargs or {}
+
+    def start(self):
+        self._target(*self._args, **self._kwargs)
+
+
+@pytest.fixture
+def sync_background_thread(monkeypatch):
+    monkeypatch.setattr("slap.dashboard.threading.Thread", _ImmediateThread)
 
 
 def make_global_config(*, daily_cap=500, drain_retries=3):
@@ -451,19 +478,19 @@ def _fresh_cache_entry(**overrides):
     return entry
 
 
-def test_get_gmass_dependent_data_fresh_cache_makes_zero_gmass_calls(conn):
+def test_get_gmass_dependent_data_fresh_cache_makes_zero_gmass_calls(conn, db_path):
     client = FakeRedis()
     gmass_cache.write_cache(client, _fresh_cache_entry(engagement={"has_data": True, "reply_rate_by_persona": {},
                                                                     "reply_by_stage": {}, "click_by_stage": {},
                                                                     "time_to_first_reply": {}}))
     with patch("slap.dashboard.gmass.get_reports") as mock_get:
-        result = get_gmass_dependent_data(conn, "fake-key", set(), client)
+        result = get_gmass_dependent_data("fake-key", set(), client, db_path)
     mock_get.assert_not_called()
     assert result["cache_status"] == "fresh"
     assert result["engagement"]["has_data"] is True
 
 
-def test_get_gmass_dependent_data_stale_cache_triggers_refresh_via_refresh_with_lock(conn):
+def test_get_gmass_dependent_data_stale_cache_spawns_background_refresh(conn, db_path, sync_background_thread):
     seed_sent_recipient(conn)
     client = FakeRedis()
     stale = _fresh_cache_entry()
@@ -471,30 +498,41 @@ def test_get_gmass_dependent_data_stale_cache_triggers_refresh_via_refresh_with_
     gmass_cache.write_cache(client, stale)
 
     with patch("slap.dashboard.gmass.get_reports", return_value=[]) as mock_get:
-        result = get_gmass_dependent_data(conn, "fake-key", set(), client)
-    mock_get.assert_called()  # the SAME refresh path the hourly job uses, triggered synchronously
-    assert result["cache_status"] == "refreshed"
-    assert gmass_cache.is_fresh(gmass_cache.read_cache(client))  # cache now holds the fresh result
+        result = get_gmass_dependent_data("fake-key", set(), client, db_path)
+    mock_get.assert_called()  # the SAME refresh path the hourly job uses, run on a (synchronous, in this test) thread
+    assert result["cache_status"] == "stale_refreshing"
+    assert result["bounces"] == []  # returned the STALE snapshot immediately — never waits on the refresh
+    assert gmass_cache.is_fresh(gmass_cache.read_cache(client))  # but the background refresh already wrote fresh data
 
 
-def test_get_gmass_dependent_data_missing_cache_triggers_refresh(conn):
+def test_get_gmass_dependent_data_missing_cache_spawns_background_refresh(conn, db_path, sync_background_thread):
     seed_sent_recipient(conn)
     client = FakeRedis()
     with patch("slap.dashboard.gmass.get_reports", return_value=[]) as mock_get:
-        result = get_gmass_dependent_data(conn, "fake-key", set(), client)
+        result = get_gmass_dependent_data("fake-key", set(), client, db_path)
     mock_get.assert_called()
-    assert result["cache_status"] == "refreshed"
+    assert result["cache_status"] == "stale_refreshing"
+    assert gmass_cache.is_fresh(gmass_cache.read_cache(client))
 
 
-def test_get_gmass_dependent_data_redis_unavailable_falls_back_to_live_poll(conn):
+def test_get_gmass_dependent_data_redis_unavailable_never_auto_refreshes(conn, db_path):
+    # Priority-0 fix: Redis unreachable means acquire_lock() is impossible
+    # too, so there's no safe way to coordinate an auto-triggered refresh —
+    # a version that called the live poll directly here let concurrent
+    # requests during a Redis outage fire multiple unlocked, simultaneous
+    # GMass sweeps. Must render the honest empty state and do nothing else.
     seed_sent_recipient(conn)
     with patch("slap.dashboard.gmass.get_reports", return_value=[]) as mock_get:
-        result = get_gmass_dependent_data(conn, "fake-key", set(), FakeRedisDown())
-    mock_get.assert_called()  # today's ORIGINAL behavior — a direct live poll
+        result = get_gmass_dependent_data("fake-key", set(), FakeRedisDown(), db_path)
+    mock_get.assert_not_called()
     assert result["cache_status"] == "redis_unavailable"
+    assert result["engagement"]["has_data"] is False
+    assert result["bounces"] == []
 
 
-def test_get_gmass_dependent_data_lock_held_uses_stale_cached_data_without_a_second_refresh(conn):
+def test_get_gmass_dependent_data_lock_held_uses_stale_cached_data_without_a_second_refresh(
+    conn, db_path, sync_background_thread,
+):
     client = FakeRedis()
     stale = _fresh_cache_entry(bounces=[{"recipient": "stale@x.com"}])
     stale["cached_at"] = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
@@ -502,20 +540,22 @@ def test_get_gmass_dependent_data_lock_held_uses_stale_cached_data_without_a_sec
     gmass_cache.acquire_lock(client)  # simulates the hourly job already mid-refresh
 
     with patch("slap.dashboard.gmass.get_reports") as mock_get:
-        result = get_gmass_dependent_data(conn, "fake-key", set(), client)
+        result = get_gmass_dependent_data("fake-key", set(), client, db_path)
     mock_get.assert_not_called()  # never a second, concurrent refresh
-    assert result["cache_status"] == "refresh_in_progress"
+    assert result["cache_status"] == "stale_refreshing"
     assert result["bounces"] == [{"recipient": "stale@x.com"}]  # served the last known data
 
 
-def test_get_gmass_dependent_data_lock_held_with_no_cache_yet_renders_honest_empty_state(conn):
+def test_get_gmass_dependent_data_lock_held_with_no_cache_yet_renders_honest_empty_state(
+    conn, db_path, sync_background_thread,
+):
     client = FakeRedis()
     gmass_cache.acquire_lock(client)  # e.g. the very first sync ever, racing a dashboard open
 
     with patch("slap.dashboard.gmass.get_reports") as mock_get:
-        result = get_gmass_dependent_data(conn, "fake-key", set(), client)
+        result = get_gmass_dependent_data("fake-key", set(), client, db_path)
     mock_get.assert_not_called()
-    assert result["cache_status"] == "refresh_in_progress"
+    assert result["cache_status"] == "stale_refreshing"
     assert result["engagement"]["has_data"] is False
     assert result["warm_but_silent"] == []
     assert result["bounces"] == []
@@ -1121,6 +1161,13 @@ def test_next_drain_reports_window_and_queue_depth(conn):
 @pytest.fixture
 def app(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)  # today_strip() calls discover_campaigns() against cwd
+    # get_gmass_dependent_data's background GMass refresh runs synchronously
+    # in tests (see _ImmediateThread) — every other assertion in this file
+    # expects a request's effect on GMass-dependent data to be visible
+    # immediately afterward, not racing a real daemon thread. The one test
+    # that needs a REAL thread (concurrent-request-threads regression,
+    # below) builds its own app directly rather than using this fixture.
+    monkeypatch.setattr("slap.dashboard.threading.Thread", _ImmediateThread)
     db_path = tmp_path / "test.db"
     connect(db_path).close()
     return create_app(db_path, make_global_config(), consumer_domains=set(), api_key="fake-key",
@@ -1149,10 +1196,16 @@ def test_create_app_index_bounces_widget_shows_real_reason_text(app, tmp_path):
 
     with patch("slap.dashboard.gmass.get_reports", return_value=[]):
         client = app.test_client()
-        resp = client.get("/")
+        # First load: no cache yet, so it renders the empty state immediately
+        # while a background refresh (synchronous in this test — see the
+        # `app` fixture) computes the real data and writes it to the cache.
+        first = client.get("/")
+        # Second load: reads that now-fresh cache directly.
+        second = client.get("/")
 
-    assert resp.status_code == 200
-    assert b"mailbox full" in resp.data
+    assert first.status_code == second.status_code == 200
+    assert b"mailbox full" not in first.data
+    assert b"mailbox full" in second.data
 
 
 def test_create_app_index_fresh_cache_makes_zero_gmass_calls(app):
@@ -1183,11 +1236,45 @@ def test_create_app_index_redis_unavailable_shows_indicator(tmp_path, monkeypatc
     connect(db_path).close()
     down_app = create_app(db_path, make_global_config(), consumer_domains=set(), api_key="fake-key",
                            redis_client=FakeRedisDown())
-    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]) as mock_get:
         client = down_app.test_client()
         resp = client.get("/")
     assert resp.status_code == 200  # never breaks the dashboard outright
     assert b"cache unavailable" in resp.data
+    mock_get.assert_not_called()  # Priority-0 fix: no auto-triggered live poll while Redis is down
+
+
+def test_create_app_gmass_refresh_spawns_background_refresh_and_redirects(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    seed_sent_recipient(conn)
+    conn.close()
+
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]) as mock_get:
+        client = app.test_client()
+        resp = client.post("/gmass/refresh")
+    assert resp.status_code == 302
+    assert resp.headers["Location"] == "/"
+    mock_get.assert_called()  # the background refresh ran (synchronously, in this test — see the `app` fixture)
+    assert gmass_cache.is_fresh(gmass_cache.read_cache(app.redis_client))
+
+
+def test_create_app_gmass_refresh_redis_unavailable_does_not_spawn(tmp_path, monkeypatch):
+    # Same Priority-0 invariant as get_gmass_dependent_data's own
+    # redis_unavailable branch: no lock is possible while Redis is down, so
+    # this manual escalation must not fall back to an uncoordinated live
+    # poll either — it should just redirect back, a no-op.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("slap.dashboard.threading.Thread", _ImmediateThread)
+    db_path = tmp_path / "test.db"
+    connect(db_path).close()
+    down_app = create_app(db_path, make_global_config(), consumer_domains=set(), api_key="fake-key",
+                           redis_client=FakeRedisDown())
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]) as mock_get:
+        client = down_app.test_client()
+        resp = client.post("/gmass/refresh")
+    assert resp.status_code == 302
+    assert resp.headers["Location"] == "/"
+    mock_get.assert_not_called()
 
 
 def test_create_app_reply_tag_invalidates_cache(app, tmp_path):
@@ -1231,6 +1318,14 @@ def test_create_app_reply_tag_real_resolves_triage_and_redirects(app, tmp_path):
         resp = client.post("/reply/carol@x.com/tag", data={"tag": "real"})
         assert resp.status_code == 302
 
+        # First load after the tag: cache was invalidated, so this renders
+        # the empty state immediately while a background refresh (synchronous
+        # in this test) recomputes actionable_replies() against the
+        # now-resolved DB state and writes it to the cache.
+        client.get("/")
+        # Second load: reads that freshly-recomputed cache — "Nothing needs
+        # triage." here reflects the real resolved state, not just an empty
+        # cache coincidentally rendering the same text.
         follow = client.get("/")
     assert b"Nothing needs triage." in follow.data
 
@@ -1400,6 +1495,25 @@ def test_dashboard_survives_real_concurrent_request_threads(tmp_path, monkeypatc
         finally:
             server.shutdown()
             thread.join()
+
+        # None of the 5 concurrent requests had a cache to read, so each one
+        # spawned its own REAL background refresh thread (unlike every other
+        # test in this file, which patches threading.Thread to run
+        # synchronously) — each opening its own tracking.connect(db_path)
+        # inside _background_refresh, the whole point of not reusing
+        # g.db_conn. Prove at least one of them actually completed and wrote
+        # to the cache, rather than silently swallowing a cross-thread
+        # sqlite3 error and leaving display.error as the only (easy to miss)
+        # trace. Bounded poll since these are daemon threads with no handle
+        # to join here.
+        deadline = time.monotonic() + 5
+        cached = None
+        while time.monotonic() < deadline:
+            cached = gmass_cache.read_cache(app.redis_client)
+            if cached is not None:
+                break
+            time.sleep(0.05)
+        assert cached is not None, "no background refresh completed within 5s — possible swallowed cross-thread error"
 
 
 # --- Reach-outs: all-campaigns, filterable, read-only recipient table ------

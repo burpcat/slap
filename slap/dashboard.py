@@ -36,13 +36,14 @@ from __future__ import annotations
 import dataclasses
 import json
 import sqlite3
+import threading
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
 from flask import Flask, g, redirect, request, render_template, url_for
 
-from slap import domains, gmass, gmass_cache, reload
+from slap import display, domains, gmass, gmass_cache, reload, tracking
 from slap.config import discover_campaigns
 from slap.domains import check_recipient
 from slap.queue import (
@@ -1009,44 +1010,88 @@ def _empty_gmass_data() -> dict:
     }
 
 
-def get_gmass_dependent_data(conn, api_key: str, consumer_domains: set, redis_client) -> dict:
+def _background_refresh(db_path: Path, api_key: str, consumer_domains: set, redis_client) -> None:
+    """Runs the SAME refresh_with_lock()/compute_gmass_dependent_data() path
+    the hourly `slap.py sync` job uses, but on a daemon thread spawned from
+    a dashboard request — see get_gmass_dependent_data's docstring for why
+    the request itself no longer waits on this.
+
+    Opens its OWN sqlite connection rather than reusing the request's
+    `g.db_conn`: sqlite3 connections default to `check_same_thread=True`
+    (unusable from this thread), and even setting that aside,
+    `teardown_appcontext` closes the request's connection as soon as that
+    request's response finishes sending — almost certainly before a
+    multi-second-to-multi-minute GMass sweep completes. `tracking.connect()`
+    (not a bare `sqlite3.connect()`) mirrors exactly what `slap.py`'s
+    `cmd_sync` already does with its own independent connection — reusing
+    an existing pattern, not inventing one.
+
+    Exceptions are caught and printed rather than left to crash silently on
+    a background thread with no other visible failure surface — the
+    request path that used to run this synchronously would have surfaced a
+    failure as a loud request error; this preserves that visibility."""
+    conn = tracking.connect(db_path)
+    try:
+        def do_refresh():
+            return compute_gmass_dependent_data(conn, api_key, consumer_domains)
+        gmass_cache.refresh_with_lock(redis_client, do_refresh)
+    except Exception as e:
+        display.error(f"slap dashboard: background GMass refresh failed: {e}")
+    finally:
+        conn.close()
+
+
+def _spawn_background_refresh(db_path: Path, api_key: str, consumer_domains: set, redis_client) -> None:
+    threading.Thread(
+        target=_background_refresh, args=(db_path, api_key, consumer_domains, redis_client), daemon=True,
+    ).start()
+
+
+def get_gmass_dependent_data(api_key: str, consumer_domains: set, redis_client, db_path: Path) -> dict:
     """Orchestrates the dashboard's four GMass-dependent widgets against the
     Redis cache refreshed hourly by `slap.py sync` (slap/gmass_cache.py).
+    Never blocks the request on a live GMass poll — a stale/missing/absent
+    cache renders whatever's available immediately and heals itself on a
+    background thread, never in the request's own critical path.
 
     - Fresh cache hit: zero GMass calls, zero SQLite recomputation for
       these four widgets — returns the cached blob directly.
-    - Stale or missing cache: triggers gmass_cache.refresh_with_lock() with
-      the SAME compute function the hourly job uses — "an early manual run
-      of the hourly job," not a second code path.
-    - Another refresh already in progress (the hourly job, or a concurrent
-      dashboard load, won the lock first): never runs a second refresh —
-      renders the last cached data if there is any, or an honest empty
-      state for the rare case there isn't yet.
-    - Redis unreachable at read time: skips the cache/lock dance entirely
-      and falls back to this dashboard's ORIGINAL behavior (a direct live
-      poll) — flagged via `cache_status` so the page can show a visible
-      indicator instead of silently pretending the cache is working.
+    - Stale or missing cache: spawns a background refresh via
+      gmass_cache.refresh_with_lock() (the SAME shared, fenced lock both
+      `slap.py sync` and this path have always used — safe even if several
+      requests land in the stale window and each spawns its own attempt,
+      since only one actually runs the sweep) and immediately renders the
+      last-known cached data (or an honest empty state if there's none
+      yet), tagged so the template can show a "may be stale, refreshing"
+      indicator. The request never waits to find out whether ITS spawned
+      thread won the lock or another one already had — that distinction
+      no longer matters once nothing blocks on the outcome either way.
+    - Redis unreachable at read time: does NOT auto-trigger anything — a
+      refresh lock is itself a Redis operation, so there is no way to
+      coordinate concurrent attempts while Redis is down. An earlier
+      version of this function called the live-poll refresh directly in
+      this branch, which meant a Redis outage with more than one
+      concurrent dashboard load could fire multiple simultaneous,
+      *uncoordinated* GMass sweeps — worse than the stale-cache case, which
+      can only ever have one attempt actually run per refresh window.
+      Renders an honest empty state instead; self-heals via the manual
+      "Refresh now" action once Redis is back, or the next hourly tick.
 
-    Every returned dict carries `cache_status` ('fresh' | 'refreshed' |
-    'refresh_in_progress' | 'redis_unavailable') for the template."""
-    def do_refresh():
-        return compute_gmass_dependent_data(conn, api_key, consumer_domains)
-
+    Every returned dict carries `cache_status` ('fresh' | 'stale_refreshing'
+    | 'redis_unavailable') for the template."""
     try:
         cached = gmass_cache.read_cache(redis_client)
     except gmass_cache.RedisUnavailable:
-        return {**do_refresh(), "cache_status": "redis_unavailable"}
+        return {**_empty_gmass_data(), "cache_status": "redis_unavailable"}
 
     if cached is not None and gmass_cache.is_fresh(cached):
         return {**cached, "cache_status": "fresh"}
 
-    refreshed = gmass_cache.refresh_with_lock(redis_client, do_refresh)
-    if refreshed is not None:
-        return {**refreshed, "cache_status": "refreshed"}
+    _spawn_background_refresh(db_path, api_key, consumer_domains, redis_client)
 
     if cached is not None:
-        return {**cached, "cache_status": "refresh_in_progress"}
-    return {**_empty_gmass_data(), "cache_status": "refresh_in_progress"}
+        return {**cached, "cache_status": "stale_refreshing"}
+    return {**_empty_gmass_data(), "cache_status": "stale_refreshing"}
 
 
 def _to_local(value) -> str:
@@ -1109,7 +1154,7 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
     @app.route("/")
     def index():
         conn = get_conn()
-        gmass_data = get_gmass_dependent_data(conn, api_key, consumer_domains, redis_client)
+        gmass_data = get_gmass_dependent_data(api_key, consumer_domains, redis_client, db_path)
         return render_template(
             "dashboard.html",
             sync_result=gmass_data["sync_result"],
@@ -1133,6 +1178,21 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
             # directly regardless of this count.
             template_failures_count=len(template_failures()),
         )
+
+    @app.route("/gmass/refresh", methods=["POST"])
+    def gmass_refresh():
+        # Manual escalation of get_gmass_dependent_data's own background
+        # refresh — e.g. right after tagging a reply, since invalidate()
+        # already clears the cache for that action but the auto-refresh
+        # otherwise only fires on the NEXT page load. Redirects immediately
+        # either way rather than waiting on the sweep, same as the
+        # auto-triggered path never blocks the request that spawned it.
+        try:
+            gmass_cache.ping(redis_client)
+        except gmass_cache.RedisUnavailable:
+            return redirect(url_for("index"))
+        _spawn_background_refresh(db_path, api_key, consumer_domains, redis_client)
+        return redirect(url_for("index"))
 
     @app.route("/reachouts")
     def reachouts():

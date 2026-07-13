@@ -110,6 +110,16 @@ CREATE TABLE IF NOT EXISTS recipients (
     last_event_at TEXT,
     replied_at TEXT
 );
+
+-- events is append-only and grows forever by design (§5) — these cover the
+-- (recipient, type) and bare-type lookups the dashboard/reachouts queries
+-- and queue.due_for_ooo_resend()'s per-recipient loop already do, so their
+-- cost stays near-flat as history accumulates instead of scaling with total
+-- table size. Applied via executescript() on every connect() — idempotent,
+-- no separate migration step.
+CREATE INDEX IF NOT EXISTS idx_events_recipient_type ON events(recipient, type);
+CREATE INDEX IF NOT EXISTS idx_events_type ON events(type);
+CREATE INDEX IF NOT EXISTS idx_recipients_status ON recipients(status);
 """
 
 
