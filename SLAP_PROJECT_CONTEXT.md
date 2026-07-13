@@ -420,6 +420,26 @@ deliberately NOT applied to `drain()` itself or to `send --now` — an explicit 
 action should never be silently skipped by a scheduling preference. The real
 `config.yaml` currently sets `active_days` to all 7 days (unrestricted).
 
+**`active_days` has ZERO effect on GMass's own native follow-up firing — confirmed by a
+real investigation, not a guess, after the owner saw Sunday activity and expected
+weekends to be excluded (2026-07-12).** `is_active_day()`/`active_days` only ever gates
+whether SLAP's own local `runner` drains NEW, locally-initiated sends on a given day.
+GMass fires stage 2/3 of an already-launched campaign entirely server-side, on the
+`stageNDays` gaps baked in at initial send — SLAP has no scheduler of its own for that
+(§5, "Follow-ups are GMass's job") and, critically, **never writes any local event when
+a native follow-up fires** (only the initial `sent` event is ever recorded). The actual
+July 12 event log confirms this exactly: the only two events that day are
+`run_started`/`run_completed` with `sent: 0` (a genuine no-op — SLAP itself sent
+nothing), while 11 recipients initially sent the prior business day (Friday July 10)
+had their persona's 2-day first stage land right on that Sunday — GMass fired those,
+invisibly to SLAP. `active_days` being unrestricted (all 7 days, above) made this doubly
+inevitable but isn't even the deciding factor — even a fully weekday-restricted
+`active_days` would not have paused those follow-ups, since they were never subject to
+it. See CONTROL_SHEET.md's dedicated write-up for the full investigation. If pausing
+follow-ups over weekends is ever wanted, `active_days` cannot do it — that would need a
+real design decision (GMass-side controls, if any exist, or accepting the current
+behavior), not something this investigation decided unilaterally.
+
 ---
 
 ## 6. Real GMass API facts (probe-verified — these OVERRIDE the build brief's assumptions)
@@ -513,6 +533,14 @@ behaviorally *unproven*, and that remains the case).
   feature that treats "not yet sent" as "safe to rewrite locally" needs the same
   `slap.tracking.latest_open_draft_id()` check `template-reload` added, or it'll silently
   split-brain the initial email against whatever gets rebuilt from the edited local state.
+- **`active_days`/weekend-pausing only ever covers SLAP's own local initial sends —
+  GMass's native follow-up firing (stage 2/3) is completely outside its scope and leaves
+  no local event trail at all.** Caused a real, confirmed-not-a-bug false alarm (owner
+  saw Sunday activity, expected weekends excluded — see §5's dedicated entry and
+  CONTROL_SHEET.md for the full investigation). Don't assume "the owner configured
+  weekday-only `active_days`" means no mail goes out on a weekend; it only means SLAP
+  itself won't INITIATE a new send that day. An already-launched campaign's follow-ups
+  keep firing on GMass's own clock regardless.
 
 ---
 
