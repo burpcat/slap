@@ -282,7 +282,10 @@ treats a missing key as blank/unknown, never fabricates one):
   — GMass's `/blocks` report items are mapped into the SAME `bounce_reason`/`bounce_time`
   keys (not a parallel `block_reason`/`block_time` pair), with `category` as the only
   discriminator. Events recorded before this field existed simply lack `category` and are
-  treated as `"bounce"` by default (`_latest_bounce_category()`).
+  treated as `"bounce"` by default (`_latest_bounce_meta()`, which also backs the reason-
+  text surfacing described below — `_latest_bounce_category()` doesn't exist anymore,
+  replaced when that shipped). `bounce_reason` itself was captured from day one but sat
+  unused until a later fix actually displayed it — see "Bounce/block reason text" below.
 - `reply_reviewed`: `{"tag": "real" | "ooo" | "not_interested"}` — the precedent the
   bounce/block `category` discriminator above deliberately copied.
 - `ooo_tagged`/`requeued`/`draft_created`/`run_*`: no meaningful meta beyond the
@@ -358,6 +361,26 @@ block. Fixed by adding `_sync_blocks()` (mirrors `_sync_bounces()`), writing
 `bounce` event type rather than adding a new one, for the live-migration reason explained
 in the schema section above. The dashboard's "Bounces" widget is now "Bounces & blocks"
 with a Type column.
+
+**Bounce/block reason text — shipped, not still missing.** GMass's own `bounceReason`/
+`blockReason` text was captured into `meta.bounce_reason` from the moment the fix above
+shipped, but sat there completely unused — the Bounces & Blocks widget and the Reachouts
+page both only ever showed a bare "Bounced"/"Blocked" label, no detail on WHY, until a
+later pass actually surfaced it. Confirmed missing (not just cut off or on some other
+view) before building anything. `_latest_bounce_meta(conn, recipient)` (replaced
+`_latest_bounce_category()`, same single query, now returns the whole parsed meta dict
+instead of just `category`) backs both call sites: `bounces()` adds a `reason` field
+(`meta.get("bounce_reason") or ""`, never `None`, matching this app's "blank when
+unknown, never fabricated" convention), and `reachouts_rows()` adds `bounce_reason`,
+gated on `status == "bounced"` — the exact same "only compute the per-recipient lookup
+when the status actually implies it" pattern `ooo_resume_date` already established for
+`status == "ooo_requeued"`. Real GMass bounce/block reason text can be a genuinely huge
+multi-paragraph DSN blob (embedded DKIM signatures and all) — both templates truncate the
+visible cell but keep the full text reachable via a native `title` tooltip, rather than
+either overflowing the table or silently dropping detail to keep it short. Generic across
+every reason (a mailbox-full soft bounce, a spam-policy block, an invalid-recipient hard
+bounce all render their own real text) — verified specifically against a realistic
+invalid-address 5.1.1 diagnostic string, not just asserted to work in the abstract.
 
 **OOO re-queue:** GMass usually filters auto-responders itself, so this is a safety net.
 Tagging a reply "OOO" fires that recipient's next stage as a send-as-reply
@@ -567,6 +590,9 @@ don't assume a feature landed just because a task once existed for it):
   every real campaign template updated to use `{{signature}}` (§5).
 - **Bounces vs. blocks fix** — both report categories now polled and distinguished in the
   dashboard (§5).
+- **Bounce/block reason text** — GMass's real reason text now shown (truncated, full text
+  in a tooltip) in both the Bounces & Blocks widget and Reachouts, not just a bare
+  "Bounced"/"Blocked" label (§5).
 - **Distribution tooling**: `slap.py init` (9-step interactive installer), the
   config-driven owner test-guard (probes now guard to whoever's `config.yaml` says, not
   one hardcoded address), and `slap-dist` (a separate public repo,
