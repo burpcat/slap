@@ -227,7 +227,7 @@ confirm it lands and looks right, then you're clear to send to real recipients.
 | `python slap.py init` | Interactive installer (config.yaml, .env, schedule, DB, launchd). Re-runnable any time. |
 | `python slap.py list` | Lists every auto-discovered campaign (persona, LaTeX on/off). |
 | `python slap.py send <campaign> [--now]` | The prep flow above. `--now` also drains immediately. |
-| `python slap.py dashboard` | Starts the localhost dashboard at `http://127.0.0.1:5050`, plus the filterable all-campaigns Reach-outs page at `/reachouts`. |
+| `python slap.py dashboard` | Starts the localhost dashboard at `http://127.0.0.1:5050`, plus the filterable all-campaigns Reach-outs page at `/reachouts` (no longer read-only — see below). |
 | `python slap.py doctor` | Preflight checks — sender fields, API key, DB, consumer domains file, every campaign's attachment/LaTeX toolchain, and (separately, never blocking) `RESUME_ARCHIVE_DIR`'s validity and any dangling symlinks in it. Safe to run any time; the core checks also run automatically before every `send` and every drain. |
 | `python slap.py domains` | Prints a read-only index of who you've contacted, grouped by email domain — for manual inspection. |
 | `python slap.py rebuild` | Rebuilds the `recipients` cache table by replaying the full `events` log from scratch. Use this if the cache ever looks wrong — `events` is always the source of truth, the cache is fully disposable. |
@@ -235,6 +235,7 @@ confirm it lands and looks right, then you're clear to send to real recipients.
 | `python slap.py runner` | The unattended drain — asks the DB what's queued and due, and sends it. Meant to be fired by **launchd** (see Scheduler below), not run by hand day-to-day. |
 | `python slap.py plist` | Prints the launchd `.plist` for `runner`, generated fresh from your current `config.yaml`. |
 | `python slap.py template-reload` | Re-renders every not-yet-sent recipient across every campaign against whatever `initial.txt`/`stageN.txt` currently say — use this after editing a template you've already staged sends against. Shows a summary and sample diffs, asks to confirm before writing anything. Only ever touches recipients who haven't sent at all yet (see "Editing a template after staging" below); everyone else is untouched by definition. |
+| `python slap.py bounced` | Walks through every bounced/blocked recipient one at a time: paste a corrected email address (blank to skip), see any dedup warning (informational only, never blocking), confirm, and it resends the *entire* sequence from stage 1 to the corrected address as a brand-new recipient. Recovers the original subject/body/attachment automatically — you never re-paste the drop. If the compiled résumé was already cleaned up (LaTeX campaigns only) and the résumé archive has candidate(s) for that company, you'll get the same numbered reuse picker `send` offers; nothing is ever auto-picked. The exact same action is also available per-row on the Reach-outs page (see below). |
 
 Typical day-to-day flow: `send` a few recipients through the interactive prep loop →
 either `--now` or let the scheduled `runner` pick them up → check `dashboard`
@@ -308,21 +309,31 @@ Opens `http://127.0.0.1:5050`. Panels, top to bottom:
   time-to-first-reply distribution.
 - **Warm but silent — clicked, no reply** — the highest-value signal on the whole
   dashboard: someone opened a tracked link but hasn't replied yet. The message landed and
-  was read; it's just unanswered. Worth a manual nudge.
+  was read; it's just unanswered. Worth a manual nudge. Shows the actual link(s) clicked
+  (not just which stage), and each row has a **Hide** action for once you've seen it and
+  don't need it cluttering the list — a hidden row comes back on its own if that recipient
+  clicks again later (new engagement is worth re-surfacing), or you can click
+  "show hidden (N)" at the top of the panel to see and unhide everything you've dismissed.
 - **Replies needing triage** — every reply that hasn't been tagged yet, with prior-contact
   domain context. Tag each one:
   - **real** — a genuine reply. Pure bookkeeping; no further action from slap.
-  - **OOO** — an out-of-office auto-reply. This is the one tag with real consequences:
+  - **OOO** — an out-of-office auto-reply. This is one of two tags with real consequences:
     it queues slap's own resend of the recipient's *next* stage, sent as a threaded reply
     (`sendAsReply`) on the normal runner cadence — deterministic threading, not reliant on
     GMass's own conversation auto-detection. (GMass usually filters real auto-responders
     itself; this is a manual safety net for the ones that slip through.)
-  - **not interested** — pure bookkeeping; stops the row from showing as needing triage.
+  - **not interested** — the other tag with a real consequence: it unsubscribes the
+    recipient account-wide from GMass's own follow-up sends, the same way OOO does. This
+    is permanent and covers every campaign they're ever in, not just the current one —
+    you'll get the same confirmation prompt OOO already has before it fires.
 - **Bounces & blocks** — every delivery failure GMass reports back, tagged **Bounced** or
-  **Blocked**. GMass tracks these as two separate categories (different report endpoints,
-  different reasons) — both are shown here rather than one blended into the other, so a
-  recipient whose mail got blocked by a spam filter doesn't look identical to one whose
-  address just doesn't exist.
+  **Blocked**, with the real reason text GMass gave (e.g. "550 no such user" or "rejected
+  due to security policies"), not just the generic label. GMass tracks these as two
+  separate categories (different report endpoints, different reasons) — both are shown
+  here rather than one blended into the other, so a recipient whose mail got blocked by a
+  spam filter doesn't look identical to one whose address just doesn't exist. To actually
+  fix a bounced address, use `./slap.py bounced` or the matching action on the Reach-outs
+  page (below) rather than anything here — this panel is read-only.
 - **Companies contacted** — a rollup by company domain.
 - **Pipeline** — who's mid-sequence at which stage, and what's scheduled to fire today/tomorrow.
 - **Today's runs** — each drain that actually did something today (fired, sent, failed
@@ -340,10 +351,35 @@ It disappears again once a later `template-reload` run comes back clean.
 http://127.0.0.1:5050/reachouts
 ```
 
-A separate, read-only page: one row per recipient across every campaign, filterable and
-sortable, for when you want to slice "everyone I've contacted" by whatever you care about
-that day instead of hunting through per-campaign panels. No reply-tagging here — that
-stays on the main dashboard.
+One row per recipient across every campaign, filterable and sortable, for when you want to
+slice "everyone I've contacted" by whatever you care about that day instead of hunting
+through per-campaign panels. Never makes a GMass call on its own — everything here is
+already-synced local data.
+
+**Status column is a single colored chip**, not three separate columns. Bounced (red)
+beats replied (green) beats clicked (orange) beats no-engagement (no color) — a dead
+address is the most urgent fact regardless of any earlier engagement that recipient had,
+which the chip's label still won't hide (e.g. a genuinely bounced address that had
+replied earlier still shows red, not green). The label itself carries the specific state:
+`Bounced — <reason>` / `Blocked`, `OOO — resumes <date>`, `Not interested`, `Replied`,
+`Clicked (N)` for N distinct links, or the plain status otherwise. A row with more to
+show gets a small **▸ detail** toggle next to the chip — click it to expand the clicked
+links (with stage and time), and, for a bounced row, whether it's already been corrected
+to another address (see below).
+
+**Not read-only anymore** — every row's Actions column offers, as applicable:
+
+- **Mark OOO** — always available, same as before, no reply needed first.
+- **Real / OOO / Not interested** — only on rows that have actually replied. Identical
+  buttons, identical route, identical consequences to the main dashboard's triage widget
+  (above) — this is just a second place to reach the same action, not a separate feature.
+- **Resend to corrected address** — only on bounced rows. Type in the corrected email and
+  submit; this does exactly what `./slap.py bounced` does (same underlying function),
+  just from the browser. Any dedup warning shows as a banner after submitting, but never
+  blocks the resend — you've already made an explicit correction by typing an address.
+  Once a bounced row has been corrected, its detail (▸) shows who it was corrected to and
+  that recipient's current status — the resend action stays available regardless, since a
+  corrected address can itself bounce and need fixing again.
 
 Filter controls (all combine with AND — narrowing by campaign AND status AND date range,
 for instance, not any of them):
@@ -365,6 +401,10 @@ reads local data already synced.
 
 **Company and Req ID columns can show blank** for recipients staged before this page's
 underlying data capture existed — never guessed, just genuinely unknown for older sends.
+
+**OOO-paused rows render faded** (reduced opacity) for as long as `status` is
+`ooo_requeued` — which is until the actual resend fires, not necessarily the moment the
+resume date passes (there can be up to one drain cycle's lag between the two).
 
 ## Scheduler (launchd)
 

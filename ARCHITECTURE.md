@@ -36,7 +36,7 @@ independently reviewed against a written spec and a fixed set of design invarian
 moving to the next. Several real bugs were caught this way rather than in later
 integration — see "Notable bugs found," below.
 
-**Testing.** 595 fast tests (a few seconds total, grown well past the original 13-stage
+**Testing.** 683 fast tests (a few seconds total, grown well past the original 13-stage
 build via the post-launch features documented in `SLAP_PROJECT_CONTEXT.md`) plus 8 tests
 marked `slow` (real `xelatex` subprocess compiles, and one test that spins up a real
 threaded HTTP server) kept out of the default run for dev-loop speed. No test suite makes
@@ -126,6 +126,34 @@ migrating every existing owner's database, and a diagnostic-only report about th
 recent attempt was never going to need append-only replay anyway. Same one-recipient
 (and, here, one-campaign) blast radius as everywhere else in the app: one broken
 campaign's config, or one recipient's field mismatch, never blocks reloading anyone else.
+
+**Bounce remediation reuses the staging pipeline, not a new one.** Fixing a bounced
+address ("resend to the corrected email") turned on the same question template-reload
+did — is the original per-recipient content actually recoverable after the fact? Here,
+yes unconditionally: the per-recipient manifest and its drop-derived metadata are never
+deleted by anything in the app (the cleanup command only ever reclaims the compiled PDF
+itself). So `resend_bounced()` is a thin recovery + re-stage layer on top of the existing
+`stage_recipient()` — the corrected address becomes a brand-new recipient row (never a
+mutation of the bounced one, preserving append-only history), traceable back to the
+original bounce via one more additive key in the same `queued`-event `meta` bag every
+other per-recipient field already rides in. The one genuinely new piece of judgment is
+attachment recovery for a LaTeX campaign whose compiled PDF has since been cleaned up:
+rather than silently picking the "best" résumé-archive match, the function refuses to
+guess and surfaces every candidate to whichever caller can actually ask a human (the CLI
+prompts; the dashboard route fails loud) — the same principle the original résumé-reuse
+feature already established, just enforced one level stricter (no auto-pick even at
+exactly one match).
+
+**A UI-only dismissal doesn't fit the event-sourced model, and isn't forced to.** Hiding
+a Warm-but-silent row is a dashboard display preference, not a fact about the recipient's
+outreach history — it doesn't belong in the append-only event log, and it isn't
+derivable from that log either, so it's a third, deliberately separate small table
+alongside `events`/`recipients` rather than a forced fit into either. The one piece of
+business logic layered on top (a hide auto-resurfaces once a newer click lands) reads the
+click event's own recorded timestamp directly rather than any already-aggregated,
+deduplicated view of click data — a real bug, caught during review rather than by a test
+that happened to exercise it, came from initially wiring this through a dedup that
+existed for a different, display-oriented purpose (see "Notable bugs found," below).
 
 ## Future expansions / known limitations
 
@@ -217,3 +245,27 @@ stage) and deliberately deferred rather than silently left undocumented:
   project treats as load-bearing everywhere else. Also caught by audit, not by a test that
   happened to exercise it; fixed the same way, with a regression test confirmed to fail
   without the fix before being trusted.
+- **A hide/unhide resurface rule silently wired through the wrong aggregation, caught by
+  review before it shipped.** The Warm-but-silent "hide" feature's resurface-on-new-click
+  rule was first written against the same click-detail helper the widget itself renders
+  from — which deduplicates by link, keeping only the *earliest* time each distinct link
+  was clicked (the right behavior for "what did they click and when," the wrong one for
+  "has anything new happened since I hid this"). A recipient who re-clicked a link they'd
+  already clicked before being hidden would generate a real, later click event that this
+  view simply discarded, so the row would never resurface — silently defeating the whole
+  point of the feature for exactly the case (a repeat visit) most likely to mean genuine
+  renewed interest. No test caught it because every test for the feature, understandably,
+  only exercised a first click on a NEW link. Fixed by reading the click event's own
+  recorded timestamp directly instead of any pre-aggregated view built for a different
+  purpose, then adding the repeat-click case as its own regression test.
+- **The same one-recipient-blast-radius gap as the `template-reload` bug above, in a
+  different feature.** The bounce-remediation résumé-archive fallback's one genuinely
+  fallible step (validating and copying a chosen archive entry) had no exception boundary
+  of its own — a broken pick (dangling symlink, empty file) would have raised an
+  unhandled exception straight out of the CLI's per-recipient loop, aborting remediation
+  for every other bounced recipient still waiting in the same session, and returned a bare
+  500 instead of a clean error from the dashboard route. Same root cause as the earlier
+  `template-reload` finding (a step that touches the filesystem needs its own boundary,
+  not just the ones around it), same fix shape: caught by re-reviewing the diff rather
+  than by any test that happened to construct a broken archive entry, then covered with a
+  regression test for exactly that case.

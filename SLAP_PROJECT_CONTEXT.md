@@ -91,11 +91,13 @@ you're about to introduce the class of bug this project is built to avoid.
    - `python slap.py dashboard` → localhost page at `http://127.0.0.1:5050`, polls GMass
      reports on open (replies/clicks/bounces/blocks), shows sends/clicks/replies/
      bounces-and-blocks + engagement + pipeline + today's runs. Owner tags replies
-     (real / OOO / not-interested) here; OOO re-queues the next stage as a send-as-reply
-     (see below and §5). This page also links to:
-   - `/reachouts` — a separate, read-only, all-campaigns filterable page (one row per
-     recipient, every campaign, filter/sort entirely client-side, zero extra network
-     calls once loaded). See §8.
+     (real / OOO / not-interested) here; OOO **and now not-interested** both re-queue/
+     suppress via a real GMass call, not just a label (see below and §5). This page also
+     links to:
+   - `/reachouts` — an all-campaigns filterable page (one row per recipient, every
+     campaign, filter/sort entirely client-side, zero extra network calls once loaded).
+     No longer purely read-only: also offers Mark OOO, Real/OOO/Not-interested triage on
+     replied rows, and a bounce-remediation resend action — see §5.
 5. **OOO re-queue (a safety net, not GMass's own mechanism):** when the owner tags a
    reply "OOO" in the dashboard, SLAP itself — independent of whatever GMass's native
    cadence is doing — resends that recipient's *next* stage as a threaded reply
@@ -269,11 +271,14 @@ hatch for diagnostic-only state that was never going to need replaying anyway.
 
 **`meta` JSON shape by event type** (additive/backward-compatible — a reader always
 treats a missing key as blank/unknown, never fabricates one):
-- `queued`: `{"persona": ..., "company": ..., "role": ..., "req_id": ...}` — `company`/
-  `role`/`req_id` are the drop-parsed values, persisted here specifically so the
-  Reach-outs page and the résumé archive can use them; only present for recipients staged
-  *after* the résumé-archive/Reach-outs features shipped — older `queued` events lack
-  them.
+- `queued`: `{"persona": ..., "company": ..., "role": ..., "req_id": ...}`, plus two more
+  post-launch, both optional/additive like everything else here — `field_values` (the raw
+  `parse_drop()` dict, for `template-reload`) and `corrected_from` (the original bounced
+  address, only present on a `queued` event written by `resend_bounced()` — see that
+  entry below). `company`/`role`/`req_id` are the drop-parsed values, persisted here
+  specifically so the Reach-outs page and the résumé archive can use them; only present
+  for recipients staged *after* the résumé-archive/Reach-outs features shipped — older
+  `queued` events lack them.
 - `sent`: `is_final_stage: true` optionally, meaning "this was the persona's last
   configured stage" → cache status becomes `done` instead of `active`.
 - `click`: `{"url": ..., "click_time": ...}`.
@@ -284,7 +289,9 @@ treats a missing key as blank/unknown, never fabricates one):
   discriminator. Events recorded before this field existed simply lack `category` and are
   treated as `"bounce"` by default (`_latest_bounce_category()`).
 - `reply_reviewed`: `{"tag": "real" | "ooo" | "not_interested"}` — the precedent the
-  bounce/block `category` discriminator above deliberately copied.
+  bounce/block `category` discriminator above deliberately copied. **`not_interested` is
+  no longer pure bookkeeping** (see the dedicated entry below) — it now calls the same
+  account-wide `unsubscribe_recipient()` `ooo` does, before this event is ever recorded.
 - `ooo_tagged`/`requeued`/`draft_created`/`run_*`: no meaningful meta beyond the
   event-level columns.
 
@@ -322,23 +329,66 @@ date (two people, one résumé's content, two archive entries). Never offered fo
 campaigns (no clean way to skip the paste/compile loop). A broken pick fails loud for
 that one recipient only.
 
-**Reach-outs page (`/reachouts`) — shipped, not "pending."** Separate, read-only,
-all-campaigns page: one row per recipient (the `recipients` cache's natural grain — most
-recently associated campaign, not one row per historical campaign contact), filterable
-and sortable, zero GMass calls (`/reachouts` never calls `sync_reports()` at all). Filter
-dimensions: campaign/persona/domain (exact dropdowns), status (`queued`/`active`/`done`/
-`replied`/`bounced`/`ooo_requeued` — `queued` here is the same derived
-`first_sent_at IS NULL` definition above), engagement (replied/clicked-no-reply/none),
-reply tag (real/ooo/not_interested/untagged — "untagged" means "replied, pending
-triage," never "never replied at all"), req-id-present, date range (first-sent-or-
-last-event, whichever exists), and free-text search (recipient + company). `company`/
-`req_id` show blank for any recipient staged before this feature landed (see the `meta`
-backward-compatibility note above) — never guessed. `reachouts_rows()` and
-`filter_reachouts()` in `slap/dashboard.py` are pure, fully-tested Python; the actual
-`/reachouts` route renders every row unfiltered in one response, and a hand-written
-vanilla-JS block in `reachouts.html` mirrors `filter_reachouts()`'s semantics for real
-client-side interaction (this is the one place in the whole dashboard with any
-JavaScript at all).
+**Reach-outs page (`/reachouts`) — shipped, not "pending."** All-campaigns page: one row
+per recipient (the `recipients` cache's natural grain — most recently associated
+campaign, not one row per historical campaign contact), filterable and sortable, zero
+GMass calls (`/reachouts` never calls `sync_reports()` at all — all four write actions
+below are local-only, no live poll triggered by visiting this page). Filter dimensions:
+campaign/persona/domain (exact dropdowns), status (`queued`/`active`/`done`/`replied`/
+`bounced`/`ooo_requeued` — `queued` here is the same derived `first_sent_at IS NULL`
+definition above), engagement (replied/clicked-no-reply/none), reply tag (real/ooo/
+not_interested/untagged — "untagged" means "replied, pending triage," never "never
+replied at all"), req-id-present, date range (first-sent-or-last-event, whichever
+exists), and free-text search (recipient + company). `company`/`req_id` show blank for
+any recipient staged before this feature landed (see the `meta` backward-compatibility
+note above) — never guessed. `reachouts_rows()` and `filter_reachouts()` in
+`slap/dashboard.py` are pure, fully-tested Python; the actual `/reachouts` route renders
+every row unfiltered in one response, and a hand-written vanilla-JS block in
+`reachouts.html` mirrors `filter_reachouts()`'s semantics for real client-side
+interaction (this is the one place in the whole dashboard with any JavaScript at all,
+beyond the small inline scripts the widget actions below use).
+
+**No longer read-only, as of the status-chip/bounce-remediation batch (post-launch).**
+Every row now offers, conditionally: **Mark OOO** (unconditional, as before), **Real /
+OOO / Not interested** triage (only when `engagement == 'replied'` — the exact same
+`/reply/<recipient>/tag` route and `tag_reply()` function the main dashboard's triage
+widget already used, just a second entry point onto identical logic, not a duplicate),
+and **Resend to corrected address** (only when `status == 'bounced'` — see the bounce
+remediation entry below). The underlying filter dropdowns above are completely
+unaffected by any of this — they still operate on the exact same per-row data attributes
+`filter_reachouts()` always has.
+
+**Reach-outs layout: one "status chip" column, not three.** Status/Engagement/Reply-tag
+used to be three separate columns that could show information disagreeing with each
+other by construction (e.g. a "bounced" status next to a "replied" engagement value,
+which is a real, reachable combination — see below). `_status_chip()` in
+`slap/dashboard.py` computes one `{color, label}` per row instead:
+- **Color precedence: bounced (red) > replied (green) > clicked (orange) > none (no
+  color).** `status` and `engagement` are derived independently (status = latest event;
+  engagement = "did a reply/click ever happen"), so a recipient CAN genuinely be both
+  `status == 'bounced'` and `engagement == 'replied'` at once — the clearest real path is
+  an OOO resend (which fires after a reply) whose corrected/resumed address later
+  bounces. This is a structural finding from reading the code, not yet an *observed* one
+  (`slap.db` was empty at design time) — re-check against real data once there's enough
+  of it. The bounced-but-previously-engaged case still shows red (most actionable/
+  time-sensitive), never silently losing the prior-engagement history — it's just not
+  color-coded.
+- **Label carries the specific state**: `Bounced — <reason>` / `Blocked` (reusing
+  `_latest_bounce_meta()`, the same raw-meta read `bounces()` uses — see that widget's
+  own reason-text entry elsewhere in this doc), `OOO — resumes <date>`, `Not interested`,
+  `Replied`, `Clicked (<n distinct links>)`, or the plain status (`Active`/`Done`/
+  `Queued`) — in that precedence order. Long bounce reasons are truncated in the
+  rendered chip (Jinja `truncate(60)`, template-only) with the full text as a `title=`
+  hover tooltip — the label itself is never truncated in Python, only at render time.
+- **Expandable detail row** (a `▸ detail` toggle, plain vanilla JS — no new dependency)
+  shows: this recipient's clicked links (url + stage + time, deduped by url — see the
+  click-detail entry below), `corrected_from` (if this recipient's send is itself a
+  bounce correction), and `already_corrected_to` (if THIS recipient's own bounce has since
+  been corrected to one or more other addresses — see bounce remediation below). The
+  sort/filter JS was updated so a row's detail sub-row always moves and hides together
+  with its owning row (verified by a dedicated test — this is exactly the kind of DOM
+  bookkeeping bug that's easy to introduce silently when adding a second `<tr>` per
+  logical row).
 
 **Dashboard — current shipped state, not a wishlist (see §8 for full detail).** The
 "dashboard reorg + new widgets" this doc's older draft called "pending" shipped well
@@ -349,6 +399,81 @@ intelligence, Warm but silent, Replies needing triage, Bounces & blocks, Compani
 contacted, Pipeline, Today's runs — plus a link to `/reachouts`, and, only while at least
 one unresolved `template-reload` failure exists, a link to `/template-failures` (see this
 section's `template-reload` entry).
+
+**Bounce remediation (`resend_bounced()`, `./slap.py bounced`, Reach-outs "Resend to
+corrected address") — shipped, not a proposal.** Investigated before building: can a
+bounced recipient's exact staged send (subject/body/stage bodies/cadence/persona/
+attachment) actually be recovered after the fact, without asking the owner to re-paste
+the original drop? Yes — `staged.json` (the per-recipient manifest) and the `queued`
+event's `meta` (company/role/req_id) are never deleted by anything in this app (`cleanup`
+only ever unlinks the compiled PDF + its `.hash` sidecar — never the manifest, never
+`resume.tex`, never the workdir itself), so both survive indefinitely.
+- **Always a NEW `recipients` row** (`recipient` is the primary key) for the corrected
+  address — never a mutation of the bounced one, which keeps its own history exactly as
+  it was, append-only. `corrected_from` (the original bounced address) rides in the new
+  recipient's own `queued` event meta via `stage_recipient()`'s new `extra_meta`
+  parameter — the same additive-meta precedent already established for persona/company/
+  role/req_id. Always restarts the full cadence from stage 1: the corrected address never
+  received anything, no matter which stage bounced on the original one.
+- **Attachment recovery, in order**: (1) the original recipient's own workdir copy, if
+  `cleanup` hasn't reclaimed it yet; (2) an explicitly-chosen résumé-archive match — this
+  function never auto-picks one itself, even when there's exactly one match (mirrors
+  `_offer_resume_reuse`'s own "always a real choice, never a guess" rule); (3) fail loud
+  (`AmbiguousArchiveChoice`, carrying the candidate list, if matches exist but none was
+  chosen; a plain `QueueError` if there's nothing to recover from at all) — the CLI offers
+  the same numbered picker the domain-soft-warn résumé-reuse feature already has and
+  retries with a real choice; the dashboard route (which can't prompt) surfaces the same
+  fail-loud message. A static (latex-disabled) campaign's shared `resume.pdf` is never at
+  risk (never touched by `cleanup`), so this path only ever matters for LaTeX campaigns.
+- **Dedup runs, but only informs — never blocks.** Same division of responsibility
+  `stage_recipient()` already has with ITS caller (`_prep_one_recipient` owns the dedup
+  display, not `stage_recipient()` itself): `resend_bounced()` doesn't call
+  `domains.check_recipient()` at all; the CLI and the dashboard route each call it
+  themselves before invoking `resend_bounced()`, surfacing any hard/soft warning in their
+  own idiom (the CLI prints it; the dashboard shows it as a banner on redirect) — no
+  blocking confirm either way, since submitting a corrected address is already an
+  explicit, deliberate owner correction.
+- **`already_corrected_to`** (an iron-audit SHOULD-FIX, added after the first version
+  shipped): the ORIGINAL bounced row's own Reach-outs detail shows every address it's
+  since been corrected to, with that address's current status — purely informational,
+  does NOT hide or disable the resend action itself, since a corrected address can itself
+  bounce and legitimately need a second correction.
+
+**Click-target URL surfacing — shipped.** GMass's click reports were already fully
+captured (`meta.url`/`meta.click_time` on every `click` event, via `_sync_clicks()`) but
+never rendered anywhere — a different root cause than the bounce-reason gap fixed
+earlier (there, the *capture* itself was the gap; here, only the *display* was missing).
+`_click_details()` in `slap/dashboard.py` is the one shared aggregation both
+Warm-but-silent and the Reach-outs detail row now render from: deduped by `url` (keeping
+the EARLIEST `click_time` seen for each distinct link), sorted by time. **This
+url-deduped, earliest-time view is deliberately NOT what decides whether a hidden
+Warm-but-silent row resurfaces** — see the next entry for why that reads `events.
+timestamp` directly instead; conflating the two was a real bug caught during the
+iron-audit pass, not shipped.
+
+**Warm-but-silent hide/unhide (`slap/ui_state.py`) — shipped, a genuinely new kind of
+state for this app.** Hiding a row is a dashboard display preference, not something that
+happened to the recipient in the outreach sense — it doesn't belong in the append-only
+`events` log (which would pollute the source-of-truth history with cosmetic state), and
+it isn't derivable from `events` either (nothing about "hidden" is implied by what
+actually happened), so it can't be a `recipients`-style derived cache. `slap/ui_state.py`
+is a genuinely new, THIRD small SQLite table (`ui_state(recipient, widget, hidden_at)`)
+in the same `slap.db` file — deliberately NOT folded into `tracking.py`'s schema, so that
+module's "one SQLite file, two tables" docstring claim about the event-sourced model
+stays accurate; this is explicitly not a variant of `recipients`/`events`. No CHECK
+constraint on `widget` (free text) — sidesteps the exact SQL-migration cost documented
+above as the reason blocks reuse the `bounce` event type instead of adding a new one.
+**Hides auto-resurface**: a hidden row comes back if the recipient has a `click` event
+whose own `timestamp` column is newer than the `hidden_at` timestamp — deliberately
+reading the raw event timestamp directly (via `SELECT MAX(timestamp) ... WHERE type =
+'click'`), NOT `_click_details()`'s url-deduped, earliest-time view (see above), because
+that view would silently discard a RE-click on a url the recipient already clicked before
+hiding, and the row would then never resurface. Caught and fixed during the iron-audit
+pass — the first version used `_click_details()` for this and had exactly that bug.
+"Show hidden (N)" is a plain link toggle on the widget (`?show_hidden=1`); hidden rows get
+an Unhide action instead of Hide when shown this way. Hide/unhide state is read fresh on
+every request, never baked into the hourly Redis-cached `warm_but_silent()` payload
+itself, so it stays instant regardless of how stale that cache is.
 
 **Bounces vs. blocks — a real, fixed bug, not an open item.** GMass reports bounces and
 blocks as two separate report categories (`/api/reports/{id}/bounces` vs. `.../blocks`,
@@ -544,7 +669,7 @@ behaviorally *unproven*, and that remains the case).
 
 ---
 
-## 8. Current state (as of 2026-07-09)
+## 8. Current state (as of 2026-07-14)
 
 **All original 13 Build Order steps are complete, plus a long tail of post-launch
 features and real-usage bugfixes** (this app has been in real, personal use for a while
@@ -582,6 +707,23 @@ don't assume a feature landed just because a task once existed for it):
   real feature, re-renders not-yet-sent recipients against edited templates; see §5's
   dedicated entry for the two things confirmed against real code before it was built and
   the open-draft edge case an iron-audit caught before shipping.
+- **Reach-outs status chip + expandable detail row** — the old separate Status/
+  Engagement/Reply-tag columns are now one color-coded chip (bounced > replied > clicked
+  > none precedence), with click links / bounce reason / bounce-correction history in an
+  expandable per-row detail (§5).
+- **Bounce remediation** (`resend_bounced()`, `./slap.py bounced`, Reach-outs "Resend to
+  corrected address") — real feature, recovers a bounced recipient's exact staged send
+  for a corrected address; explicit-choice-only résumé-archive fallback, informational-
+  only dedup, `corrected_from`/`already_corrected_to` traceability (§5).
+- **Warm-but-silent hide/unhide** (`slap/ui_state.py`) — a genuinely new, third small
+  table outside the events/recipients model, purpose-built for UI dismissal state; hides
+  auto-resurface on a newer click (§5).
+- **Click-target URL surfacing** — GMass's already-captured click URLs are now actually
+  rendered (Warm-but-silent widget + Reach-outs detail row), not just tracked internally
+  (§5).
+- **`not_interested` now has a real consequence** — calls the same account-wide
+  `unsubscribe_recipient()` `ooo` already used, instead of being pure triage bookkeeping
+  (§5).
 
 **Genuinely still pending / unproven:**
 
@@ -729,3 +871,10 @@ down. Re-check these before designing anything that depends on the answer.
   older hand-copied `.example` plist from before that feature shipped? Worth a fresh
   wake test rather than assuming the old manual test still covers the generated-plist
   code path.
+- **Has a recipient ever actually been both `status == 'bounced'` and `engagement ==
+  'replied'`/`'clicked'` at once** (the Reach-outs status chip's color-precedence
+  rationale, §5)? Structurally reachable in the code (the clearest path: an OOO resend,
+  which fires after a reply, later bounces) but `slap.db` was empty when the chip was
+  designed, so this was never confirmed against a real historical case. Worth a quick
+  query (`recipients` joined against `events` for a `bounce` after a `reply`/`click`)
+  once there's enough real data to check.
