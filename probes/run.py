@@ -13,7 +13,7 @@ inbox, never to one hardcoded person's. This makes emailing a real lead with tes
 data impossible.
 
 Usage:
-    python probes/run.py <auth|attach|casing|stop|thread|reports|verify|swagger|client|resend|clicktest|unsubscribe|all>
+    python probes/run.py <auth|attach|casing|stop|thread|reports|verify|swagger|client|resend|clicktest|unsubscribe|alloweddays|all>
 """
 import argparse
 import base64
@@ -22,7 +22,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -844,6 +844,141 @@ def probe_unsubscribe(key: str) -> None:
     _record("unsubscribe", result)
 
 
+# GMass's own idiosyncratic allowedDays numbering (1=Saturday...7=Friday,
+# per the live swagger spec's campaignSettings.allowedDays description) --
+# distinct from Python's date.weekday() (Mon=0..Sun=6). Keyed by
+# date.weekday() so probe_allowed_days can go straight from "what weekday
+# does the naive stage-1 date fall on" to "what GMass code excludes it".
+_GMASS_DAY_FOR_PY_WEEKDAY = {0: 3, 1: 4, 2: 5, 3: 6, 4: 7, 5: 1, 6: 2}
+
+
+def probe_allowed_days(key: str) -> None:
+    """(post-launch) Does campaignSettings.allowedDays reschedule STAGE 2+
+    follow-ups around excluded days, or only gate the initial send's own
+    moment? The live swagger spec's field description ("...avoid sending
+    this campaign on the weekend"/"...just certain days of the week to
+    send this campaign") never says either way -- GMass's blog claims
+    their UI's "Choose Specific Days" feature recalculates follow-up
+    timing around excluded days, but that's a UI description, not API
+    documentation, and no prior probe has ever set this field.
+
+    Two REAL self-sends to settle the accepted-and-echoed-back half of the
+    question immediately:
+      - CONTROL: stageOneDays=1, no allowedDays -- naive expectation: the
+        stage-1 follow-up fires 1 calendar day after send.
+      - TEST: stageOneDays=1, allowedDays excluding TOMORROW's weekday --
+        the exact day the naive 1-day offset would land on. If allowedDays
+        affects follow-up scheduling the way the blog claims, stage 1
+        should be pushed to the next allowed day instead of firing
+        tomorrow; if it only gates the initial send, TEST's stage 1 fires
+        on the same day as CONTROL, unaffected.
+
+    GET /api/campaigns/{id} is read back on both right after sending, same
+    as probe_verify's B2, to record whether allowedDays is even echoed
+    back and whether `autoFollowups` (the only stage-config read surface
+    the spec exposes) reveals anything about a computed schedule.
+
+    What this probe CANNOT prove in one run, same class of gap as
+    probe_stop/probe_unsubscribe: no live report exposes a per-stage
+    fired timestamp, so whether TEST's follow-up actually lands a day
+    later than CONTROL's is inherently timing-dependent -- it can only be
+    read off real Gmail arrival times over the following days. This probe
+    records exactly what to watch for and when, and does the watching
+    itself is a MANUAL STEP STILL REQUIRED (see the printed instructions
+    at the end)."""
+    print("[allowed_days] two real self-sends: CONTROL (no allowedDays) vs "
+          "TEST (allowedDays excludes tomorrow's weekday)")
+    today = datetime.now(timezone.utc).date()
+    naive_stage_one_date = today + timedelta(days=1)
+    excluded_day = _GMASS_DAY_FOR_PY_WEEKDAY[naive_stage_one_date.weekday()]
+    allowed_days_value = ",".join(str(d) for d in range(1, 8) if d != excluded_day)
+    # The next day that's actually allowed after the excluded one -- i.e.
+    # what TEST's stage 1 SHOULD land on if allowedDays does reschedule
+    # follow-ups. Walks forward from the naive date until it's not the
+    # excluded weekday (handles the trivial case where it's the very next
+    # calendar day, which it always is here since only one day is excluded).
+    shifted_stage_one_date = naive_stage_one_date
+    while _GMASS_DAY_FOR_PY_WEEKDAY[shifted_stage_one_date.weekday()] == excluded_day:
+        shifted_stage_one_date += timedelta(days=1)
+    print(f"  today (UTC)={today} ({today.strftime('%A')}); naive stage-1 date="
+          f"{naive_stage_one_date} ({naive_stage_one_date.strftime('%A')}); "
+          f"TEST excludes GMass day {excluded_day} (allowedDays={allowed_days_value!r}); "
+          f"if rescheduled, TEST's stage 1 should land on {shifted_stage_one_date} "
+          f"({shifted_stage_one_date.strftime('%A')}) instead")
+
+    result = {
+        "probe": "allowed_days", "sent_at_utc": today.isoformat(),
+        "naive_stage_one_date": naive_stage_one_date.isoformat(),
+        "excluded_gmass_day": excluded_day, "allowed_days_value": allowed_days_value,
+        "shifted_stage_one_date_if_rescheduled": shifted_stage_one_date.isoformat(),
+    }
+    hdr = {"X-apikey": key}
+
+    def _send(label, *, recipient, extra_settings):
+        draft = _create_draft(key, recipient, subject=f"slap probe allowed_days ({label})",
+                              message=f"allowed_days probe body ({label})")
+        entry = {"recipient": recipient, "draft": draft, "campaign_id": None}
+        print(f"  [{label}] draft: HTTP {draft['response']['status']}, draft_id={draft['draft_id']}")
+        if draft["draft_id"]:
+            send_fields = {
+                "openTracking": False, "clickTracking": True, "createDrafts": False,
+                "stageOneDays": 1, "stageOneCampaignText": f"allowed_days probe {label} stage one",
+                "stageOneAction": "r",
+            }
+            send_fields.update(extra_settings)
+            r = _post_campaign(key, draft["draft_id"], send_fields, "path")
+            summary = _summarize(r)
+            campaign_id = _campaign_id(summary)
+            print(f"  [{label}] send: HTTP {r.status_code}, campaign_id={campaign_id}, "
+                  f"sent_fields={send_fields}")
+            entry["send"] = {"sent_fields": send_fields, "response": summary, "campaign_id": campaign_id}
+            entry["campaign_id"] = campaign_id
+            if campaign_id:
+                _RUN_STATE["campaign_ids"].append(campaign_id)
+        return entry
+
+    entry_control = _send("CONTROL", recipient=owner_test_address(12), extra_settings={})
+    result["control"] = entry_control
+    time.sleep(3)
+    entry_test = _send("TEST", recipient=owner_test_address(13),
+                       extra_settings={"allowedDays": allowed_days_value})
+    result["test"] = entry_test
+
+    # Same-day readback (probe_verify's B2 pattern): does the campaign
+    # object echo allowedDays back at all, and does autoFollowups reveal
+    # anything about a computed per-stage date?
+    for label, entry in (("control", entry_control), ("test", entry_test)):
+        cid = entry["campaign_id"]
+        if not cid:
+            continue
+        time.sleep(3)
+        rc = requests.get(f"{BASE_URL}/campaigns/{cid}", headers=hdr)
+        rc_summary = _summarize(rc)
+        result[f"{label}_readback"] = rc_summary
+        auto_followups = None
+        allowed_days_echoed = None
+        if isinstance(rc_summary["body"], dict):
+            auto_followups = rc_summary["body"].get("autoFollowups")
+            allowed_days_echoed = rc_summary["body"].get("allowedDays")
+        print(f"  [{label}] GET campaign {cid} back: HTTP {rc.status_code}, "
+              f"allowedDays echoed={allowed_days_echoed!r}, autoFollowups={auto_followups!r}")
+
+    _record("allowed_days", result)
+    print(
+        "\n  MANUAL STEP STILL REQUIRED (this is inherently timing-dependent -- no live "
+        "report exposes a per-stage fired timestamp, same class of gap as probe_stop/"
+        "probe_unsubscribe): check the guarded test inbox on and after "
+        f"{naive_stage_one_date} for two stage-1 follow-ups, subjects containing "
+        "'allowed_days (CONTROL)' and 'allowed_days (TEST)'.\n"
+        f"    - If CONTROL's follow-up arrives on {naive_stage_one_date} and TEST's ALSO "
+        f"arrives on {naive_stage_one_date} (same day) -> allowedDays does NOT reschedule "
+        "follow-ups, only the initial send's own moment.\n"
+        f"    - If CONTROL's follow-up arrives on {naive_stage_one_date} but TEST's is "
+        f"delayed to {shifted_stage_one_date} (or later) -> allowedDays DOES reschedule "
+        "follow-ups, consistent with GMass's blog claim for their UI feature."
+    )
+
+
 def _tiny_pdf() -> bytes:
     """Smallest valid one-page PDF."""
     return (b"%PDF-1.1\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
@@ -864,6 +999,7 @@ PROBES = {
     "stop": probe_stop, "thread": probe_thread, "reports": probe_reports,
     "verify": probe_verify, "swagger": probe_swagger, "client": probe_client,
     "resend": probe_resend, "clicktest": probe_clicktest, "unsubscribe": probe_unsubscribe,
+    "alloweddays": probe_allowed_days,
 }
 
 

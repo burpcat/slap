@@ -148,7 +148,8 @@ def cap_headroom(conn, global_config, *, today: date = None) -> int:
 
 
 def _send_one(conn, api_key: str, row: dict, *, workdir_root: Path = WORKDIR_ROOT,
-              create_draft_fn=gmass.create_draft, send_campaign_fn=gmass.send_campaign) -> bool:
+              create_draft_fn=gmass.create_draft, send_campaign_fn=gmass.send_campaign,
+              gmass_allowed_days: list = None, gmass_skip_holidays: bool = None) -> bool:
     recipient, campaign = row["recipient"], row["campaign"]
     workdir = recipient_workdir(campaign, recipient, root=workdir_root)
 
@@ -162,6 +163,18 @@ def _send_one(conn, api_key: str, row: dict, *, workdir_root: Path = WORKDIR_ROO
         manifest = load_manifest(workdir)
         attachment_name = manifest["attachment_name"]
         cadence = manifest["cadence"]
+        # cadence/stage_bodies/subject/body are ALL read fresh from
+        # staged.json right here, at drain time — never cached from an
+        # earlier point in this function's own lifetime. This is precisely
+        # what makes `slap.py template-reload` (post-launch, slap/reload.py)
+        # effective at all: if it overwrites a recipient's staged subject/
+        # body/stage_bodies BEFORE this drain runs, this read picks up the
+        # new content with zero changes needed here. It's also exactly why
+        # that feature refuses to touch a recipient with an OPEN draft (see
+        # slap.tracking.latest_open_draft_id) — this same manifest is read
+        # again on retry, but the actual DRAFT (created below) is NOT
+        # recreated on a retry, so only stage_bodies/cadence would pick up a
+        # local edit while the initial subject/body would not.
         stage_bodies = manifest["stage_bodies"]
         subject = manifest["subject"]
         body = manifest["body"]
@@ -174,7 +187,9 @@ def _send_one(conn, api_key: str, row: dict, *, workdir_root: Path = WORKDIR_ROO
         attachment_source = manifest.get("attachment_source")
         attachment_path = Path(attachment_source) if attachment_source else workdir / attachment_name
         attachment_bytes = attachment_path.read_bytes()
-        campaign_settings = gmass.build_campaign_settings(cadence, stage_bodies)
+        campaign_settings = gmass.build_campaign_settings(
+            cadence, stage_bodies, allowed_days=gmass_allowed_days, skip_holidays=gmass_skip_holidays,
+        )
     except Exception as e:
         append_event(conn, type="send_failed", recipient=recipient, campaign=campaign,
                      meta={"stage": "load_staged_data", "error": str(e)})
@@ -359,6 +374,13 @@ def drain(conn, global_config, api_key: str, *, now: date = None, sleep_fn=time.
                   "send_campaign_fn": send_campaign_fn}
         if send_fn is _send_ooo_resend:
             kwargs["today"] = today
+        else:
+            # Not threaded through to _send_ooo_resend: an OOO resend has no
+            # stage cadence of its own to restrict (build_reply_settings()
+            # never sets stageNDays at all) — the day restriction only means
+            # anything where there's a follow-up sequence for it to apply to.
+            kwargs["gmass_allowed_days"] = global_config.gmass_allowed_days
+            kwargs["gmass_skip_holidays"] = global_config.gmass_skip_holidays
         try:
             ok = send_fn(conn, api_key, row, **kwargs)
         except Exception as e:

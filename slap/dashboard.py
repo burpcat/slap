@@ -36,13 +36,14 @@ from __future__ import annotations
 import dataclasses
 import json
 import sqlite3
+import threading
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
 from flask import Flask, g, redirect, request, render_template, url_for
 
-from slap import archive, domains, gmass, gmass_cache, ui_state
+from slap import archive, display, domains, gmass, gmass_cache, reload, tracking, ui_state
 from slap.config import discover_campaigns
 from slap.domains import check_recipient
 from slap.queue import (
@@ -682,43 +683,23 @@ def visible_warm_but_silent(conn, rows: list) -> list:
     return [r for r in rows if r["recipient"] not in hidden]
 
 
-def _latest_bounce_category(conn, recipient: str) -> str:
-    """This recipient's most recent bounce-lifecycle event's category
-    ("bounce" or "block") — matches the same latest-event-wins convention
-    every other "current state" derivation in this app already uses (e.g.
-    reply_tags(), needs_triage()). A pre-existing event recorded before
-    `category` existed (see _sync_bounces()) simply has no such key —
-    defaults to "bounce", never guessed as "block" (the only category that
-    predates this field is real bounces; blocks were never recorded at all
-    until _sync_blocks() shipped, so there's no ambiguity to resolve)."""
-    row = conn.execute(
-        "SELECT meta FROM events WHERE recipient = ? AND type = 'bounce' ORDER BY id DESC LIMIT 1",
-        (recipient,),
-    ).fetchone()
-    if row is None or not row["meta"]:
-        return "bounce"
-    return json.loads(row["meta"]).get("category", "bounce")
-
-
 def _latest_bounce_meta(conn, recipient: str) -> dict:
-    """This recipient's most recent bounce-lifecycle event's category AND
-    reason text — same latest-event-wins read as _latest_bounce_category(),
-    kept as its own function (rather than changing that one's return shape)
-    so bounces()'s already-tested `category`-only output never changes by
-    accident. `reason` is the raw `bounceReason`/`blockReason` string GMass
-    sent (see _sync_bounces()/_sync_blocks()) — captured in every bounce
-    event's meta since those functions shipped, but never rendered anywhere
-    before reachouts_rows() started reading it here. None if genuinely
-    absent (a pre-`category`-field event, or GMass simply didn't send one) —
-    never fabricated."""
+    """This recipient's most recent bounce-lifecycle event's full `meta`
+    dict (`category` + `bounce_reason`/`bounce_time`) — matches the same
+    latest-event-wins convention every other "current state" derivation in
+    this app already uses (e.g. reply_tags(), needs_triage()). One query
+    backs both the category badge and the reason text (bounces()/
+    reachouts_rows()) rather than querying twice for data already fetched
+    once. A pre-existing event recorded before `category`/`bounce_reason`
+    existed simply lacks those keys — callers default them via `.get()`,
+    never guess."""
     row = conn.execute(
         "SELECT meta FROM events WHERE recipient = ? AND type = 'bounce' ORDER BY id DESC LIMIT 1",
         (recipient,),
     ).fetchone()
     if row is None or not row["meta"]:
-        return {"category": "bounce", "reason": None}
-    meta = json.loads(row["meta"])
-    return {"category": meta.get("category", "bounce"), "reason": meta.get("bounce_reason")}
+        return {}
+    return json.loads(row["meta"])
 
 
 def bounces(conn) -> list:
@@ -728,12 +709,26 @@ def bounces(conn) -> list:
     visibility. GMass reports bounces and blocks as two separate categories
     (see module docstring) — both are surfaced here, distinguished by
     `category` per row, rather than blended into one indistinguishable
-    list."""
+    list. `reason` is GMass's own `bounceReason`/`blockReason` text
+    (already captured in `meta.bounce_reason` at sync time — see
+    _sync_bounces()/_sync_blocks() — but previously never read back out
+    for display, so every row just showed a generic "Bounced"/"Blocked"
+    label with no detail on WHY). Defaults to "" (never guessed) for a
+    pre-existing event recorded before `bounce_reason` existed, or one
+    GMass itself returned with no reason text at all."""
     rows = conn.execute(
         "SELECT recipient, campaign, last_event_at FROM recipients "
         "WHERE status = 'bounced' ORDER BY last_event_at DESC"
     ).fetchall()
-    return [{**dict(r), "category": _latest_bounce_category(conn, r["recipient"])} for r in rows]
+    result = []
+    for r in rows:
+        meta = _latest_bounce_meta(conn, r["recipient"])
+        result.append({
+            **dict(r),
+            "category": meta.get("category", "bounce"),
+            "reason": meta.get("bounce_reason") or "",
+        })
+    return result
 
 
 def companies_contacted(conn, consumer_domains: set, *, today: date = None) -> dict:
@@ -904,7 +899,7 @@ def _already_corrected_to(conn) -> dict:
     return result
 
 
-def _status_chip(*, status: str, engagement: str, reply_tag, bounce_meta: dict,
+def _status_chip(*, status: str, engagement: str, reply_tag, bounce_category, bounce_reason,
                   ooo_resume_date, num_clicks: int) -> dict:
     """One computed `{color, label}` per Reach-outs row — folds status,
     engagement, reply_tag, and bounce category/reason into a single display
@@ -917,11 +912,16 @@ def _status_chip(*, status: str, engagement: str, reply_tag, bounce_meta: dict,
     previously 'replied'/'clicked' (e.g. an OOO resend that later bounces) —
     that history isn't lost, it's just not one of the three colors; OOO/
     not-interested/active/done/queued get a label only, no color, since
-    none of those is part of the 3-color ask."""
+    none of those is part of the 3-color ask.
+
+    `bounce_category`/`bounce_reason` come straight from _latest_bounce_meta()
+    (the raw event meta) — `bounce_category` defaults to "bounce" the same
+    way bounces() already does, `bounce_reason` is None/falsy when GMass
+    gave no reason text, never fabricated."""
     if status == "bounced":
-        label = "Blocked" if bounce_meta["category"] == "block" else "Bounced"
-        if bounce_meta["reason"]:
-            label = f"{label} — {bounce_meta['reason']}"
+        label = "Blocked" if bounce_category == "block" else "Bounced"
+        if bounce_reason:
+            label = f"{label} — {bounce_reason}"
         return {"color": "critical", "label": label}
 
     if status == "ooo_requeued":
@@ -940,6 +940,15 @@ def _status_chip(*, status: str, engagement: str, reply_tag, bounce_meta: dict,
     if status in ("done", "active", "queued"):
         return {"color": None, "label": status.capitalize()}
     return {"color": None, "label": status or "—"}
+
+
+def template_failures() -> list:
+    """The Template Failures tab's data: whatever slap.reload's most recent
+    `template-reload` run recorded as failed and still unresolved. A plain
+    local JSON read (see slap.reload's module docstring for why failures
+    live there, not in the events table) — no GMass call, no DB read at all,
+    so this can never be stale in the way the GMass-dependent widgets can."""
+    return reload.load_failures()
 
 
 def reachouts_rows(conn) -> list:
@@ -1001,6 +1010,12 @@ def reachouts_rows(conn) -> list:
       as the "currently OOO" filter (see reachouts.html; already dynamically
       lists every live status value with no template change needed).
 
+    - bounce_category / bounce_reason: ONLY set while status == 'bounced' —
+      same "gate the per-recipient lookup query on the status that actually
+      implies it" pattern ooo_resume_date above already established. From
+      _latest_bounce_meta() (the raw event meta; same source bounces()
+      already uses) — this page previously showed a bare "bounced" status
+      with no detail on why, same gap the Bounces & Blocks widget had.
     - chip: _status_chip()'s computed `{color, label}` — the single visual
       status indicator the Reach-outs layout redesign uses in place of
       separate Status/Engagement/Reply-tag columns (see that function's own
@@ -1050,10 +1065,16 @@ def reachouts_rows(conn) -> list:
             if pending is not None and pending != date.min:
                 ooo_resume_date = pending.isoformat()
 
+        bounce_category = None
+        bounce_reason = None
+        if status == "bounced":
+            bounce_meta = _latest_bounce_meta(conn, recipient)
+            bounce_category = bounce_meta.get("category", "bounce")
+            bounce_reason = bounce_meta.get("bounce_reason") or None
+
         meta = drop_meta.get(recipient, {"company": "", "role": "", "req_id": ""})
         row_date = row["first_sent_at"] or row["last_event_at"]
         clicks = click_details.get(recipient, [])
-        bounce_meta = _latest_bounce_meta(conn, recipient) if status == "bounced" else {"category": "bounce", "reason": None}
 
         result.append({
             "recipient": recipient,
@@ -1067,13 +1088,14 @@ def reachouts_rows(conn) -> list:
             "req_id_present": bool(meta["req_id"]),
             "date": row_date,
             "ooo_resume_date": ooo_resume_date,
-            "bounce_category": bounce_meta["category"] if status == "bounced" else None,
-            "bounce_reason": bounce_meta["reason"] if status == "bounced" else None,
+            "bounce_category": bounce_category,
+            "bounce_reason": bounce_reason,
             "corrected_from": corrected_from_map.get(recipient),
             "already_corrected_to": already_corrected_map.get(recipient, []),
             "clicks": clicks,
             "chip": _status_chip(status=status, engagement=engagement, reply_tag=tags.get(recipient),
-                                  bounce_meta=bounce_meta, ooo_resume_date=ooo_resume_date,
+                                  bounce_category=bounce_category, bounce_reason=bounce_reason,
+                                  ooo_resume_date=ooo_resume_date,
                                   num_clicks=len(clicks) or (1 if engagement == "clicked" else 0)),
             # Precomputed LOCAL calendar date (YYYY-MM-DD), reusing the same
             # _local_date() conversion todays_runs()/companies_contacted()
@@ -1205,44 +1227,88 @@ def _empty_gmass_data() -> dict:
     }
 
 
-def get_gmass_dependent_data(conn, api_key: str, consumer_domains: set, redis_client) -> dict:
+def _background_refresh(db_path: Path, api_key: str, consumer_domains: set, redis_client) -> None:
+    """Runs the SAME refresh_with_lock()/compute_gmass_dependent_data() path
+    the hourly `slap.py sync` job uses, but on a daemon thread spawned from
+    a dashboard request — see get_gmass_dependent_data's docstring for why
+    the request itself no longer waits on this.
+
+    Opens its OWN sqlite connection rather than reusing the request's
+    `g.db_conn`: sqlite3 connections default to `check_same_thread=True`
+    (unusable from this thread), and even setting that aside,
+    `teardown_appcontext` closes the request's connection as soon as that
+    request's response finishes sending — almost certainly before a
+    multi-second-to-multi-minute GMass sweep completes. `tracking.connect()`
+    (not a bare `sqlite3.connect()`) mirrors exactly what `slap.py`'s
+    `cmd_sync` already does with its own independent connection — reusing
+    an existing pattern, not inventing one.
+
+    Exceptions are caught and printed rather than left to crash silently on
+    a background thread with no other visible failure surface — the
+    request path that used to run this synchronously would have surfaced a
+    failure as a loud request error; this preserves that visibility."""
+    conn = tracking.connect(db_path)
+    try:
+        def do_refresh():
+            return compute_gmass_dependent_data(conn, api_key, consumer_domains)
+        gmass_cache.refresh_with_lock(redis_client, do_refresh)
+    except Exception as e:
+        display.error(f"slap dashboard: background GMass refresh failed: {e}")
+    finally:
+        conn.close()
+
+
+def _spawn_background_refresh(db_path: Path, api_key: str, consumer_domains: set, redis_client) -> None:
+    threading.Thread(
+        target=_background_refresh, args=(db_path, api_key, consumer_domains, redis_client), daemon=True,
+    ).start()
+
+
+def get_gmass_dependent_data(api_key: str, consumer_domains: set, redis_client, db_path: Path) -> dict:
     """Orchestrates the dashboard's four GMass-dependent widgets against the
     Redis cache refreshed hourly by `slap.py sync` (slap/gmass_cache.py).
+    Never blocks the request on a live GMass poll — a stale/missing/absent
+    cache renders whatever's available immediately and heals itself on a
+    background thread, never in the request's own critical path.
 
     - Fresh cache hit: zero GMass calls, zero SQLite recomputation for
       these four widgets — returns the cached blob directly.
-    - Stale or missing cache: triggers gmass_cache.refresh_with_lock() with
-      the SAME compute function the hourly job uses — "an early manual run
-      of the hourly job," not a second code path.
-    - Another refresh already in progress (the hourly job, or a concurrent
-      dashboard load, won the lock first): never runs a second refresh —
-      renders the last cached data if there is any, or an honest empty
-      state for the rare case there isn't yet.
-    - Redis unreachable at read time: skips the cache/lock dance entirely
-      and falls back to this dashboard's ORIGINAL behavior (a direct live
-      poll) — flagged via `cache_status` so the page can show a visible
-      indicator instead of silently pretending the cache is working.
+    - Stale or missing cache: spawns a background refresh via
+      gmass_cache.refresh_with_lock() (the SAME shared, fenced lock both
+      `slap.py sync` and this path have always used — safe even if several
+      requests land in the stale window and each spawns its own attempt,
+      since only one actually runs the sweep) and immediately renders the
+      last-known cached data (or an honest empty state if there's none
+      yet), tagged so the template can show a "may be stale, refreshing"
+      indicator. The request never waits to find out whether ITS spawned
+      thread won the lock or another one already had — that distinction
+      no longer matters once nothing blocks on the outcome either way.
+    - Redis unreachable at read time: does NOT auto-trigger anything — a
+      refresh lock is itself a Redis operation, so there is no way to
+      coordinate concurrent attempts while Redis is down. An earlier
+      version of this function called the live-poll refresh directly in
+      this branch, which meant a Redis outage with more than one
+      concurrent dashboard load could fire multiple simultaneous,
+      *uncoordinated* GMass sweeps — worse than the stale-cache case, which
+      can only ever have one attempt actually run per refresh window.
+      Renders an honest empty state instead; self-heals via the manual
+      "Refresh now" action once Redis is back, or the next hourly tick.
 
-    Every returned dict carries `cache_status` ('fresh' | 'refreshed' |
-    'refresh_in_progress' | 'redis_unavailable') for the template."""
-    def do_refresh():
-        return compute_gmass_dependent_data(conn, api_key, consumer_domains)
-
+    Every returned dict carries `cache_status` ('fresh' | 'stale_refreshing'
+    | 'redis_unavailable') for the template."""
     try:
         cached = gmass_cache.read_cache(redis_client)
     except gmass_cache.RedisUnavailable:
-        return {**do_refresh(), "cache_status": "redis_unavailable"}
+        return {**_empty_gmass_data(), "cache_status": "redis_unavailable"}
 
     if cached is not None and gmass_cache.is_fresh(cached):
         return {**cached, "cache_status": "fresh"}
 
-    refreshed = gmass_cache.refresh_with_lock(redis_client, do_refresh)
-    if refreshed is not None:
-        return {**refreshed, "cache_status": "refreshed"}
+    _spawn_background_refresh(db_path, api_key, consumer_domains, redis_client)
 
     if cached is not None:
-        return {**cached, "cache_status": "refresh_in_progress"}
-    return {**_empty_gmass_data(), "cache_status": "refresh_in_progress"}
+        return {**cached, "cache_status": "stale_refreshing"}
+    return {**_empty_gmass_data(), "cache_status": "stale_refreshing"}
 
 
 def _to_local(value) -> str:
@@ -1305,7 +1371,7 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
     @app.route("/")
     def index():
         conn = get_conn()
-        gmass_data = get_gmass_dependent_data(conn, api_key, consumer_domains, redis_client)
+        gmass_data = get_gmass_dependent_data(api_key, consumer_domains, redis_client, db_path)
         # Hide/unhide (post-launch): applied HERE, on top of the possibly-
         # hourly-cached warm_but_silent list, never baked into the cache
         # itself — see visible_warm_but_silent()'s own docstring for why
@@ -1338,6 +1404,14 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
             runs=todays_runs(conn),
             companies=companies_contacted(conn, consumer_domains),
             next_drain=next_drain(conn, global_config),
+            # Deliberately different from this dashboard's usual "show an
+            # honest empty state" default (see reachouts_rows/reply_tags for
+            # that default elsewhere): the Template Failures nav link itself
+            # is owner-requested to disappear entirely at zero, not render a
+            # "0 failures" link — the /template-failures route below still
+            # shows a real empty-state page for anyone who navigates there
+            # directly regardless of this count.
+            template_failures_count=len(template_failures()),
         )
 
     @app.route("/warm-but-silent/<string:recipient>/hide", methods=["POST"])
@@ -1349,6 +1423,21 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
     def unhide_warm_but_silent(recipient):
         ui_state.unhide(get_conn(), recipient, WARM_BUT_SILENT_WIDGET)
         return redirect(url_for("index", show_hidden=1))
+
+    @app.route("/gmass/refresh", methods=["POST"])
+    def gmass_refresh():
+        # Manual escalation of get_gmass_dependent_data's own background
+        # refresh — e.g. right after tagging a reply, since invalidate()
+        # already clears the cache for that action but the auto-refresh
+        # otherwise only fires on the NEXT page load. Redirects immediately
+        # either way rather than waiting on the sweep, same as the
+        # auto-triggered path never blocks the request that spawned it.
+        try:
+            gmass_cache.ping(redis_client)
+        except gmass_cache.RedisUnavailable:
+            return redirect(url_for("index"))
+        _spawn_background_refresh(db_path, api_key, consumer_domains, redis_client)
+        return redirect(url_for("index"))
 
     @app.route("/reachouts")
     def reachouts():
@@ -1365,6 +1454,15 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
         rows = reachouts_rows(get_conn())
         return render_template("reachouts.html", rows=rows, total_count=len(rows),
                                 warning=request.args.get("warning"))
+
+    @app.route("/template-failures")
+    def template_failures_page():
+        # Always registered regardless of whether any failures currently
+        # exist — direct navigation must show a real page (an honest "no
+        # failures" empty state), never a 404, even though the nav link to
+        # it (index() above) only appears when template_failures_count > 0.
+        failures = template_failures()
+        return render_template("template_failures.html", failures=failures, total_count=len(failures))
 
     @app.route("/reply/<string:recipient>/tag", methods=["POST"])
     def reply_tag(recipient):

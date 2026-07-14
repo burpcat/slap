@@ -201,7 +201,8 @@
       <td>{{ r.campaign or '—' }}</td>
       <td>{{ r.persona or '—' }}</td>
       <td>
-        <span class="chip {{ 'chip-' ~ r.chip.color if r.chip.color else 'chip-neutral' }}">{{ r.chip.label }}</span>
+        <span class="chip {{ 'chip-' ~ r.chip.color if r.chip.color else 'chip-neutral' }}"
+              {% if r.bounce_reason %}title="{{ r.bounce_reason }}"{% endif %}>{{ r.chip.label | truncate(60) }}</span>
         {% if r.clicks or r.corrected_from or r.already_corrected_to %}
         <button type="button" class="expand-toggle" onclick="toggleDetail(this)">&#9656; detail</button>
         {% endif %}

@@ -19,7 +19,7 @@ from pathlib import Path
 
 SLAP_PY = Path(__file__).resolve().parent.parent / "slap.py"
 ALL_COMMANDS = ["list", "send", "dashboard", "doctor", "domains", "rebuild", "runner", "sync",
-                "cleanup", "plist", "init", "bounced"]
+                "cleanup", "plist", "init", "template-reload", "bounced"]
 
 
 def run(*args, cwd=None, env=None, input=None):
@@ -1047,3 +1047,110 @@ def test_bounced_skips_recipient_when_archive_picker_declined(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert "no résumé chosen, nothing staged" in result.stdout
     assert not (tmp_path / "workdir" / "coldpost" / "jane.doe@othercorp.com").exists()
+
+
+# --- template-reload ---------------------------------------------------
+
+def _stage_via_send(tmp_path, *, recipient="jane@acme.com", company="Acme"):
+    """Real end-to-end staging through `send` (not stage_recipient() called
+    directly) — the whole point is proving field_values genuinely round-trips
+    through the actual CLI path a real owner uses, not just the library
+    call slap.reload itself is unit-tested against (see tests/test_reload.py)."""
+    _setup_three_field_campaign(tmp_path)
+    drop = f"Email: {recipient}\nCompany: {company}\n"
+    scripted_stdin = f"{drop}\nEOF\ny\nn\n"  # drop, stage-this-send, no-more
+    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_template_reload_fails_loud_without_config(tmp_path):
+    result = run("template-reload", cwd=tmp_path)
+    assert result.returncode != 0
+    assert "not found" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_template_reload_nothing_queued(tmp_path):
+    (tmp_path / "config.yaml").write_text(
+        (Path(__file__).resolve().parent.parent / "config.yaml.example")
+        .read_text()
+        .replace("<Owner Name>", "Test Owner")
+    )
+    result = run("template-reload", cwd=tmp_path)
+    assert result.returncode == 0
+    assert "Nothing queued" in result.stdout
+
+
+def test_template_reload_applies_edited_template_on_confirm(tmp_path):
+    recipient = "jane@acme.com"
+    _stage_via_send(tmp_path, recipient=recipient)
+
+    (tmp_path / "campaigns" / "coldpost" / "initial.txt").write_text(
+        "Subject: Hi from {{company}}\n\nHello there, {{company}} folks!\n"
+    )
+
+    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    result = run("template-reload", cwd=tmp_path, env=env, input="y\n")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 changed" in result.stdout
+    assert "Reloaded 1 recipient" in result.stdout
+
+    manifest = json.loads((tmp_path / "workdir" / "coldpost" / recipient / "staged.json").read_text())
+    assert manifest["body"] == "Hello there, Acme folks!"
+
+    # The failures report is (re-)written even on a clean run, and the
+    # dashboard's Template Failures tab must show nothing for it.
+    failures = json.loads((tmp_path / "template_reload_failures.json").read_text())
+    assert failures == []
+
+
+def test_template_reload_declining_confirm_leaves_staged_content_untouched(tmp_path):
+    recipient = "jane@acme.com"
+    _stage_via_send(tmp_path, recipient=recipient)
+    manifest_path = tmp_path / "workdir" / "coldpost" / recipient / "staged.json"
+    before = manifest_path.read_text()
+
+    (tmp_path / "campaigns" / "coldpost" / "initial.txt").write_text(
+        "Subject: Hi from {{company}}\n\nHello there, {{company}} folks!\n"
+    )
+
+    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    result = run("template-reload", cwd=tmp_path, env=env, input="n\n")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Skipped" in result.stdout
+    assert manifest_path.read_text() == before
+
+
+def test_template_reload_missing_placeholder_reported_in_failures_file(tmp_path):
+    recipient = "jane@acme.com"
+    _stage_via_send(tmp_path, recipient=recipient)
+
+    campaign_dir = tmp_path / "campaigns" / "coldpost"
+    campaign_dir.joinpath("campaign.yaml").write_text(
+        "persona: recruiter\n"
+        "latex: { enabled: false, attachment_name: r.pdf }\n"
+        "attachment_file: resume.pdf\n"
+        "fields:\n"
+        "  - { key: email, label: Email }\n"
+        "  - { key: company, label: Company }\n"
+        "  - { key: req_id, label: Req ID, optional: true }\n"
+        "  - { key: special_note, label: Special note, optional: true }\n"
+    )
+    campaign_dir.joinpath("stage1.txt").write_text("stage 1: {{special_note}}\n")
+
+    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    result = run("template-reload", cwd=tmp_path, env=env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 failed" in result.stdout
+
+    manifest = json.loads((tmp_path / "workdir" / "coldpost" / recipient / "staged.json").read_text())
+    assert manifest["stage_bodies"][0] == "stage 1"  # unchanged -- left completely untouched
+
+    failures = json.loads((tmp_path / "template_reload_failures.json").read_text())
+    assert len(failures) == 1
+    assert failures[0]["recipient"] == recipient
+    assert failures[0]["missing_fields"] == ["special_note"]

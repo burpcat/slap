@@ -5,6 +5,7 @@ See SLAP_BUILD_PROMPT.md for the full spec and CONTROL_SHEET.md for the
 current build state / package layout.
 """
 import argparse
+import difflib
 import os
 import sys
 from datetime import date
@@ -18,7 +19,7 @@ from slap.config import ConfigError, discover_campaigns, load_campaign, load_glo
 from slap.latex import recipient_workdir, run_latex_loop
 from slap.queue import AmbiguousArchiveChoice, QueueError, resend_bounced, stage_recipient
 from slap.templates import fill_template, merge_config_values, parse_drop
-from slap import archive, dashboard, doctor, domains, gmass, gmass_cache, init, launchd, runner, tracking
+from slap import archive, dashboard, doctor, domains, gmass, gmass_cache, init, launchd, reload, runner, tracking
 
 load_dotenv()
 
@@ -254,6 +255,7 @@ def _prep_one_recipient(conn, campaign, consumer_domains, values, recipient, arc
         latex_enabled=campaign.latex_enabled,
         company=values.get("company", ""), role=values.get("role_catted", ""),
         req_id=values.get("req_id", ""), archive_dir=archive_dir,
+        field_values=values,
     )
     display.success(f"Staged {recipient}.")
 
@@ -422,6 +424,100 @@ def cmd_rebuild(args):
     display.success(f"Rebuilt recipients cache ({recipient_count} recipients) from {event_count} events.")
 
 
+RELOAD_SAMPLE_DIFF_COUNT = 3
+
+
+def _reload_diff_lines(change) -> list:
+    def render(subject, body, stage_bodies):
+        lines = [f"Subject: {subject}", "", *body.splitlines()]
+        for i, sb in enumerate(stage_bodies, start=1):
+            lines += ["", f"--- stage {i} ---", *sb.splitlines()]
+        return lines
+
+    old_lines = render(change.old_subject, change.old_body, change.old_stage_bodies)
+    new_lines = render(change.new_subject, change.new_body, change.new_stage_bodies)
+    return list(difflib.unified_diff(
+        old_lines, new_lines, fromfile="staged (current)", tofile="reloaded (new)", lineterm="",
+    ))
+
+
+def _print_reload_diff(change) -> None:
+    print(f"\n{change.recipient}  (campaign={change.campaign})")
+    diff_lines = _reload_diff_lines(change)
+    if not diff_lines:
+        print("  (no visible line-level diff)")
+        return
+    for line in diff_lines:
+        if line.startswith("+") and not line.startswith("+++"):
+            display.success(f"  {line}")
+        elif line.startswith("-") and not line.startswith("---"):
+            display.error(f"  {line}")
+        else:
+            print(f"  {line}")
+
+
+def cmd_template_reload(args):
+    try:
+        global_config = load_global_config()
+    except ConfigError as e:
+        display.fail(f"slap: {e}")
+        sys.exit(1)
+
+    conn = tracking.connect()
+    plan = reload.scan(conn, global_config)
+    total = len(plan.changed) + len(plan.unchanged) + len(plan.failures)
+
+    if total == 0:
+        print("Nothing queued — nothing to reload.")
+        reload.write_failures([])
+        return
+
+    campaigns_changed = sorted({c.campaign for c in plan.changed})
+    print(f"Checked {total} queued recipient(s) across the whole queue:")
+    print(f"  {len(plan.changed)} changed"
+          + (f" (campaign(s): {', '.join(campaigns_changed)})" if campaigns_changed else ""))
+    print(f"  {len(plan.unchanged)} already match their current templates (no-op)")
+    print(f"  {len(plan.failures)} failed — left untouched")
+
+    if plan.failures:
+        display.warn(f"\n⚠ {len(plan.failures)} recipient(s) could not be reloaded:")
+        for f in plan.failures:
+            display.warn(f"  {f.recipient}  campaign={f.campaign}  — {f.reason}")
+
+    # Recorded regardless of what happens next (see slap.reload's module
+    # docstring): this run's failures ARE "the most recent run"'s, whether or
+    # not the owner goes on to confirm applying the successful changes below.
+    reload.write_failures(plan.failures)
+
+    if not plan.changed:
+        print("\nNo content changes to apply.")
+        return
+
+    sample = plan.changed[:RELOAD_SAMPLE_DIFF_COUNT]
+    print(f"\nSample diff{'s' if len(sample) != 1 else ''} ({len(sample)} of {len(plan.changed)} changed):")
+    for c in sample:
+        _print_reload_diff(c)
+
+    if input(f"\nApply {len(plan.changed)} change(s) to staged content? [y/N]: ").strip().lower() != "y":
+        print("Skipped — no staged content changed.")
+        return
+
+    apply_failures = reload.apply_changes(plan.changed)
+    applied = len(plan.changed) - len(apply_failures)
+    if apply_failures:
+        # Extremely rare (see apply_changes's own docstring — something
+        # external interfered between scan() and this confirm), but the
+        # report already written above must still reflect it: "the most
+        # recent run"'s failures include these too, not just the ones scan()
+        # found before the owner even confirmed.
+        reload.write_failures(plan.failures + apply_failures)
+        display.warn(f"\n⚠ {len(apply_failures)} recipient(s) failed while applying (left untouched):")
+        for f in apply_failures:
+            display.warn(f"  {f.recipient}  campaign={f.campaign}  — {f.reason}")
+
+    display.success(f"\nReloaded {applied} recipient(s) against current templates.")
+
+
 def cmd_cleanup(args):
     try:
         global_config = load_global_config()
@@ -550,6 +646,10 @@ def build_parser():
     ).set_defaults(func=cmd_init)
     sub.add_parser("domains", help="Regenerate/print the domain index").set_defaults(func=cmd_domains)
     sub.add_parser("rebuild", help="Rebuild the recipients cache from events").set_defaults(func=cmd_rebuild)
+    sub.add_parser(
+        "template-reload",
+        help="Re-render every not-yet-sent recipient's staged content against current templates",
+    ).set_defaults(func=cmd_template_reload)
     sub.add_parser(
         "runner", help="Unattended drain — invoked by launchd, see LAUNCHD.md"
     ).set_defaults(func=cmd_runner)

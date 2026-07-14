@@ -58,7 +58,8 @@ def stage_recipient(conn, *, campaign: str, recipient: str, persona: str, cadenc
                      subject: str, body: str, stage_bodies: list,
                      attachment_path: Path, attachment_name: str, latex_enabled: bool,
                      company: str = "", role: str = "", req_id: str = "", archive_dir: Path = None,
-                     when: date = None, workdir_root: Path = WORKDIR_ROOT, extra_meta: dict = None) -> Path:
+                     when: date = None, workdir_root: Path = WORKDIR_ROOT, extra_meta: dict = None,
+                     field_values: dict = None) -> Path:
     """Write the queued event + staged manifest for one recipient (does not
     send). Returns the recipient's workdir.
 
@@ -99,7 +100,18 @@ def stage_recipient(conn, *, campaign: str, recipient: str, persona: str, cadenc
     into the same `queued` event's meta on top of persona/company/role/
     req_id — e.g. `{"corrected_from": "<bounced address>"}` from
     resend_bounced() below, keeping a corrected resend traceable back to the
-    original bounce without a new event type or schema column."""
+    original bounce without a new event type or schema column.
+
+    `field_values` (post-launch, slap.reload): the raw, pre-fill drop-parsed
+    dict (parse_drop()'s return value — every campaign field, not just
+    company/role/req_id) — stored so slap.reload.scan() can re-render this
+    recipient's subject/body/stage_bodies against a LATER-edited template
+    file without ever needing the owner to re-paste the original drop.
+    Optional (defaults to None) purely for backward compatibility with
+    existing callers/tests written before this field existed; a manifest
+    written with `field_values=None` simply can't be reloaded later (see
+    slap.reload.scan's own handling of that case — a distinct, actionable
+    failure reason, not a crash)."""
     workdir = recipient_workdir(campaign, recipient, root=workdir_root)
 
     if latex_enabled:
@@ -116,6 +128,7 @@ def stage_recipient(conn, *, campaign: str, recipient: str, persona: str, cadenc
         "campaign": campaign, "recipient": recipient, "persona": persona, "cadence": cadence,
         "subject": subject, "body": body, "stage_bodies": stage_bodies,
         "attachment_name": attachment_name, "attachment_source": attachment_source,
+        "field_values": field_values,
     }
     (workdir / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
@@ -268,6 +281,12 @@ def resend_bounced(conn, *, original_recipient: str, corrected_email: str,
         attachment_name=attachment_name, latex_enabled=latex_enabled, company=company, role=role,
         req_id=req_id, archive_dir=archive_dir, when=when, workdir_root=workdir_root,
         extra_meta={"corrected_from": original_recipient},
+        # Carries the original recipient's own field_values through (if
+        # they have any — see stage_recipient()'s own docstring) so the
+        # corrected recipient stays reloadable via slap.reload just like
+        # any other staged recipient; None (the pre-template-reload case)
+        # degrades the same way it does everywhere else.
+        field_values=manifest.get("field_values"),
     )
 
 
@@ -290,7 +309,20 @@ def due_recipients(conn) -> list:
     fixes (a confirmed proceed-anyway send that vanished: never sent, never
     failed, never counted as still queued). `send_failed` does not count as
     closing a queued cycle — a failed attempt stays due for retry on the
-    next drain."""
+    next drain.
+
+    Second caller (post-launch): `slap.reload.scan()` uses this EXACT query,
+    unmodified, as its own "which recipients have nothing sent at all yet"
+    eligibility set — not a coincidence, the "queued, no later sent event"
+    definition here is precisely "this recipient's staged content has never
+    been locked into a real GMass send" (see `slap.reload`'s module
+    docstring for why that's the one hard limit on what it can safely
+    re-render). Reusing this query instead of re-deriving a similar-but-
+    subtly-different one is what makes `slap.reload` immune to the exact
+    first_sent_at pitfall this docstring already fixed for the runner —
+    a recipient re-staged into a new campaign is correctly still eligible
+    for reload against that new campaign's templates, not silently
+    excluded forever."""
     rows = conn.execute(
         """
         SELECT r.* FROM recipients r

@@ -5,6 +5,7 @@ reply-tag -> OOO -> re-queue fires a send-as-reply.
 import dataclasses
 import json
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -21,9 +22,10 @@ from slap.dashboard import (
     _click_details, _clicked_recipients, _recipient_drop_meta, actionable_replies, bounces,
     companies_contacted, compute_gmass_dependent_data, create_app, engagement_intelligence,
     filter_reachouts, get_gmass_dependent_data, needs_triage, next_drain, pipeline, reachouts_rows,
-    reply_tags, sync_reports, tag_reply, this_week, today_strip, todays_runs, visible_warm_but_silent,
-    warm_but_silent,
+    reply_tags, sync_reports, tag_reply, template_failures, this_week, today_strip, todays_runs,
+    visible_warm_but_silent, warm_but_silent,
 )
+from slap.reload import ReloadFailure, write_failures
 from slap.tracking import append_event, connect
 
 import redis as redis_lib
@@ -74,8 +76,34 @@ class FakeRedisDown:
 
 
 @pytest.fixture
-def conn(tmp_path):
-    return connect(tmp_path / "test.db")
+def db_path(tmp_path):
+    return tmp_path / "test.db"
+
+
+@pytest.fixture
+def conn(db_path):
+    return connect(db_path)
+
+
+class _ImmediateThread:
+    """threading.Thread stand-in that runs its target synchronously on
+    .start(), so tests can assert on a spawned background GMass refresh's
+    effects deterministically instead of racing a real daemon thread (and
+    so a patched gmass.get_reports doesn't get called for real once the
+    `with patch(...)` scope that covered the triggering request has already
+    exited)."""
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+        self._target = target
+        self._args = args
+        self._kwargs = kwargs or {}
+
+    def start(self):
+        self._target(*self._args, **self._kwargs)
+
+
+@pytest.fixture
+def sync_background_thread(monkeypatch):
+    monkeypatch.setattr("slap.dashboard.threading.Thread", _ImmediateThread)
 
 
 def make_global_config(*, daily_cap=500, drain_retries=3):
@@ -452,19 +480,19 @@ def _fresh_cache_entry(**overrides):
     return entry
 
 
-def test_get_gmass_dependent_data_fresh_cache_makes_zero_gmass_calls(conn):
+def test_get_gmass_dependent_data_fresh_cache_makes_zero_gmass_calls(conn, db_path):
     client = FakeRedis()
     gmass_cache.write_cache(client, _fresh_cache_entry(engagement={"has_data": True, "reply_rate_by_persona": {},
                                                                     "reply_by_stage": {}, "click_by_stage": {},
                                                                     "time_to_first_reply": {}}))
     with patch("slap.dashboard.gmass.get_reports") as mock_get:
-        result = get_gmass_dependent_data(conn, "fake-key", set(), client)
+        result = get_gmass_dependent_data("fake-key", set(), client, db_path)
     mock_get.assert_not_called()
     assert result["cache_status"] == "fresh"
     assert result["engagement"]["has_data"] is True
 
 
-def test_get_gmass_dependent_data_stale_cache_triggers_refresh_via_refresh_with_lock(conn):
+def test_get_gmass_dependent_data_stale_cache_spawns_background_refresh(conn, db_path, sync_background_thread):
     seed_sent_recipient(conn)
     client = FakeRedis()
     stale = _fresh_cache_entry()
@@ -472,30 +500,41 @@ def test_get_gmass_dependent_data_stale_cache_triggers_refresh_via_refresh_with_
     gmass_cache.write_cache(client, stale)
 
     with patch("slap.dashboard.gmass.get_reports", return_value=[]) as mock_get:
-        result = get_gmass_dependent_data(conn, "fake-key", set(), client)
-    mock_get.assert_called()  # the SAME refresh path the hourly job uses, triggered synchronously
-    assert result["cache_status"] == "refreshed"
-    assert gmass_cache.is_fresh(gmass_cache.read_cache(client))  # cache now holds the fresh result
+        result = get_gmass_dependent_data("fake-key", set(), client, db_path)
+    mock_get.assert_called()  # the SAME refresh path the hourly job uses, run on a (synchronous, in this test) thread
+    assert result["cache_status"] == "stale_refreshing"
+    assert result["bounces"] == []  # returned the STALE snapshot immediately — never waits on the refresh
+    assert gmass_cache.is_fresh(gmass_cache.read_cache(client))  # but the background refresh already wrote fresh data
 
 
-def test_get_gmass_dependent_data_missing_cache_triggers_refresh(conn):
+def test_get_gmass_dependent_data_missing_cache_spawns_background_refresh(conn, db_path, sync_background_thread):
     seed_sent_recipient(conn)
     client = FakeRedis()
     with patch("slap.dashboard.gmass.get_reports", return_value=[]) as mock_get:
-        result = get_gmass_dependent_data(conn, "fake-key", set(), client)
+        result = get_gmass_dependent_data("fake-key", set(), client, db_path)
     mock_get.assert_called()
-    assert result["cache_status"] == "refreshed"
+    assert result["cache_status"] == "stale_refreshing"
+    assert gmass_cache.is_fresh(gmass_cache.read_cache(client))
 
 
-def test_get_gmass_dependent_data_redis_unavailable_falls_back_to_live_poll(conn):
+def test_get_gmass_dependent_data_redis_unavailable_never_auto_refreshes(conn, db_path):
+    # Priority-0 fix: Redis unreachable means acquire_lock() is impossible
+    # too, so there's no safe way to coordinate an auto-triggered refresh —
+    # a version that called the live poll directly here let concurrent
+    # requests during a Redis outage fire multiple unlocked, simultaneous
+    # GMass sweeps. Must render the honest empty state and do nothing else.
     seed_sent_recipient(conn)
     with patch("slap.dashboard.gmass.get_reports", return_value=[]) as mock_get:
-        result = get_gmass_dependent_data(conn, "fake-key", set(), FakeRedisDown())
-    mock_get.assert_called()  # today's ORIGINAL behavior — a direct live poll
+        result = get_gmass_dependent_data("fake-key", set(), FakeRedisDown(), db_path)
+    mock_get.assert_not_called()
     assert result["cache_status"] == "redis_unavailable"
+    assert result["engagement"]["has_data"] is False
+    assert result["bounces"] == []
 
 
-def test_get_gmass_dependent_data_lock_held_uses_stale_cached_data_without_a_second_refresh(conn):
+def test_get_gmass_dependent_data_lock_held_uses_stale_cached_data_without_a_second_refresh(
+    conn, db_path, sync_background_thread,
+):
     client = FakeRedis()
     stale = _fresh_cache_entry(bounces=[{"recipient": "stale@x.com"}])
     stale["cached_at"] = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
@@ -503,20 +542,22 @@ def test_get_gmass_dependent_data_lock_held_uses_stale_cached_data_without_a_sec
     gmass_cache.acquire_lock(client)  # simulates the hourly job already mid-refresh
 
     with patch("slap.dashboard.gmass.get_reports") as mock_get:
-        result = get_gmass_dependent_data(conn, "fake-key", set(), client)
+        result = get_gmass_dependent_data("fake-key", set(), client, db_path)
     mock_get.assert_not_called()  # never a second, concurrent refresh
-    assert result["cache_status"] == "refresh_in_progress"
+    assert result["cache_status"] == "stale_refreshing"
     assert result["bounces"] == [{"recipient": "stale@x.com"}]  # served the last known data
 
 
-def test_get_gmass_dependent_data_lock_held_with_no_cache_yet_renders_honest_empty_state(conn):
+def test_get_gmass_dependent_data_lock_held_with_no_cache_yet_renders_honest_empty_state(
+    conn, db_path, sync_background_thread,
+):
     client = FakeRedis()
     gmass_cache.acquire_lock(client)  # e.g. the very first sync ever, racing a dashboard open
 
     with patch("slap.dashboard.gmass.get_reports") as mock_get:
-        result = get_gmass_dependent_data(conn, "fake-key", set(), client)
+        result = get_gmass_dependent_data("fake-key", set(), client, db_path)
     mock_get.assert_not_called()
-    assert result["cache_status"] == "refresh_in_progress"
+    assert result["cache_status"] == "stale_refreshing"
     assert result["engagement"]["has_data"] is False
     assert result["warm_but_silent"] == []
     assert result["bounces"] == []
@@ -1064,6 +1105,57 @@ def test_bounces_defaults_category_to_bounce_for_pre_existing_events_without_it(
     assert result[0]["category"] == "bounce"
 
 
+def test_bounces_surfaces_the_actual_reason_text_for_a_bounce(conn):
+    # Previously: the widget only ever showed a generic "Bounced" label,
+    # even though the real reason text was already captured in
+    # meta.bounce_reason at sync time -- never read back out for display.
+    append_event(conn, type="queued", recipient="bounced@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter"})
+    append_event(conn, type="bounce", recipient="bounced@x.com", campaign="c",
+                 meta={"bounce_reason": "mailbox full", "bounce_time": "t1", "category": "bounce"})
+    result = bounces(conn)
+    assert result[0]["reason"] == "mailbox full"
+
+
+def test_bounces_surfaces_the_actual_reason_text_for_a_block(conn):
+    append_event(conn, type="queued", recipient="blocked@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter"})
+    append_event(conn, type="bounce", recipient="blocked@x.com", campaign="c",
+                 meta={"bounce_reason": "rejected due to security policies", "bounce_time": "t2",
+                       "category": "block"})
+    result = bounces(conn)
+    assert result[0]["reason"] == "rejected due to security policies"
+
+
+def test_bounces_invalid_address_shows_real_reason_not_a_generic_label(conn):
+    # A real, GMass-shaped hard-bounce diagnostic for a non-existent
+    # recipient -- must show up verbatim, not collapse to a bare "bounced"
+    # with no detail on WHY.
+    real_reason = (
+        "Final-Recipient: rfc822; akshat@truefoundry.com\n"
+        "Action: failed\nStatus: 5.1.1\n"
+        "Diagnostic-Code: smtp; 550-5.1.1 The email account that you tried to reach "
+        "does not exist."
+    )
+    append_event(conn, type="queued", recipient="akshat@truefoundry.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter"})
+    append_event(conn, type="bounce", recipient="akshat@truefoundry.com", campaign="c",
+                 meta={"bounce_reason": real_reason, "bounce_time": "t3", "category": "bounce"})
+    result = bounces(conn)
+    assert result[0]["reason"] == real_reason
+    assert result[0]["reason"] != "bounced"
+    assert "does not exist" in result[0]["reason"]
+
+
+def test_bounces_reason_blank_not_none_when_gmass_gave_no_reason_text(conn):
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter"})
+    append_event(conn, type="bounce", recipient="a@x.com", campaign="c",
+                 meta={"bounce_reason": None, "bounce_time": "t1", "category": "bounce"})
+    result = bounces(conn)
+    assert result[0]["reason"] == ""
+
+
 def test_companies_contacted_counts_distinct_non_consumer_domains(conn):
     append_event(conn, type="queued", recipient="a@acme.com", campaign="c", stage=0, meta={"persona": "recruiter"})
     append_event(conn, type="sent", recipient="a@acme.com", campaign="c", stage=0, timestamp=_ts(0))
@@ -1127,6 +1219,13 @@ def test_next_drain_reports_window_and_queue_depth(conn):
 @pytest.fixture
 def app(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)  # today_strip() calls discover_campaigns() against cwd
+    # get_gmass_dependent_data's background GMass refresh runs synchronously
+    # in tests (see _ImmediateThread) — every other assertion in this file
+    # expects a request's effect on GMass-dependent data to be visible
+    # immediately afterward, not racing a real daemon thread. The one test
+    # that needs a REAL thread (concurrent-request-threads regression,
+    # below) builds its own app directly rather than using this fixture.
+    monkeypatch.setattr("slap.dashboard.threading.Thread", _ImmediateThread)
     db_path = tmp_path / "test.db"
     connect(db_path).close()
     return create_app(db_path, make_global_config(), consumer_domains=set(), api_key="fake-key",
@@ -1140,6 +1239,31 @@ def test_create_app_index_renders(app):
     assert resp.status_code == 200
     assert b"slap dashboard" in resp.data
     assert b"Nothing needs triage." in resp.data
+
+
+def test_create_app_index_bounces_widget_shows_real_reason_text(app, tmp_path):
+    # Previously: the Bounces & Blocks widget only ever showed a generic
+    # "Bounced"/"Blocked" label, even though the real reason text was
+    # already captured in meta.bounce_reason -- never rendered anywhere.
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="queued", recipient="dead@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter"})
+    append_event(conn, type="bounce", recipient="dead@x.com", campaign="c",
+                 meta={"bounce_reason": "mailbox full", "bounce_time": "t1", "category": "bounce"})
+    conn.close()
+
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+        client = app.test_client()
+        # First load: no cache yet, so it renders the empty state immediately
+        # while a background refresh (synchronous in this test — see the
+        # `app` fixture) computes the real data and writes it to the cache.
+        first = client.get("/")
+        # Second load: reads that now-fresh cache directly.
+        second = client.get("/")
+
+    assert first.status_code == second.status_code == 200
+    assert b"mailbox full" not in first.data
+    assert b"mailbox full" in second.data
 
 
 def test_create_app_index_fresh_cache_makes_zero_gmass_calls(app):
@@ -1175,7 +1299,8 @@ def test_create_app_index_renders_click_urls_in_warm_but_silent(app, tmp_path):
             return []
         mock_get.side_effect = side_effect
         client = app.test_client()
-        resp = client.get("/")
+        client.get("/")  # first load: no cache yet, renders empty while the (synchronous-in-test) refresh runs
+        resp = client.get("/")  # second load: reads the now-fresh cache directly
     assert resp.status_code == 200
     assert b"https://acme.com/careers" in resp.data
 
@@ -1192,7 +1317,8 @@ def test_create_app_hide_warm_but_silent_removes_it_from_the_default_view(app, t
             if rt == "clicks" else []
         )
         client = app.test_client()
-        resp = client.get("/")
+        client.get("/")  # first load: no cache yet, renders empty while the (synchronous-in-test) refresh runs
+        resp = client.get("/")  # second load: reads the now-fresh cache directly
         assert b"jane@acme.com" in resp.data
 
         hide_resp = client.post("/warm-but-silent/jane@acme.com/hide")
@@ -1302,11 +1428,45 @@ def test_create_app_index_redis_unavailable_shows_indicator(tmp_path, monkeypatc
     connect(db_path).close()
     down_app = create_app(db_path, make_global_config(), consumer_domains=set(), api_key="fake-key",
                            redis_client=FakeRedisDown())
-    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]) as mock_get:
         client = down_app.test_client()
         resp = client.get("/")
     assert resp.status_code == 200  # never breaks the dashboard outright
     assert b"cache unavailable" in resp.data
+    mock_get.assert_not_called()  # Priority-0 fix: no auto-triggered live poll while Redis is down
+
+
+def test_create_app_gmass_refresh_spawns_background_refresh_and_redirects(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    seed_sent_recipient(conn)
+    conn.close()
+
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]) as mock_get:
+        client = app.test_client()
+        resp = client.post("/gmass/refresh")
+    assert resp.status_code == 302
+    assert resp.headers["Location"] == "/"
+    mock_get.assert_called()  # the background refresh ran (synchronously, in this test — see the `app` fixture)
+    assert gmass_cache.is_fresh(gmass_cache.read_cache(app.redis_client))
+
+
+def test_create_app_gmass_refresh_redis_unavailable_does_not_spawn(tmp_path, monkeypatch):
+    # Same Priority-0 invariant as get_gmass_dependent_data's own
+    # redis_unavailable branch: no lock is possible while Redis is down, so
+    # this manual escalation must not fall back to an uncoordinated live
+    # poll either — it should just redirect back, a no-op.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("slap.dashboard.threading.Thread", _ImmediateThread)
+    db_path = tmp_path / "test.db"
+    connect(db_path).close()
+    down_app = create_app(db_path, make_global_config(), consumer_domains=set(), api_key="fake-key",
+                           redis_client=FakeRedisDown())
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]) as mock_get:
+        client = down_app.test_client()
+        resp = client.post("/gmass/refresh")
+    assert resp.status_code == 302
+    assert resp.headers["Location"] == "/"
+    mock_get.assert_not_called()
 
 
 def test_create_app_reply_tag_invalidates_cache(app, tmp_path):
@@ -1350,6 +1510,14 @@ def test_create_app_reply_tag_real_resolves_triage_and_redirects(app, tmp_path):
         resp = client.post("/reply/carol@x.com/tag", data={"tag": "real"})
         assert resp.status_code == 302
 
+        # First load after the tag: cache was invalidated, so this renders
+        # the empty state immediately while a background refresh (synchronous
+        # in this test) recomputes actionable_replies() against the
+        # now-resolved DB state and writes it to the cache.
+        client.get("/")
+        # Second load: reads that freshly-recomputed cache — "Nothing needs
+        # triage." here reflects the real resolved state, not just an empty
+        # cache coincidentally rendering the same text.
         follow = client.get("/")
     assert b"Nothing needs triage." in follow.data
 
@@ -1554,6 +1722,25 @@ def test_dashboard_survives_real_concurrent_request_threads(tmp_path, monkeypatc
         finally:
             server.shutdown()
             thread.join()
+
+        # None of the 5 concurrent requests had a cache to read, so each one
+        # spawned its own REAL background refresh thread (unlike every other
+        # test in this file, which patches threading.Thread to run
+        # synchronously) — each opening its own tracking.connect(db_path)
+        # inside _background_refresh, the whole point of not reusing
+        # g.db_conn. Prove at least one of them actually completed and wrote
+        # to the cache, rather than silently swallowing a cross-thread
+        # sqlite3 error and leaving display.error as the only (easy to miss)
+        # trace. Bounded poll since these are daemon threads with no handle
+        # to join here.
+        deadline = time.monotonic() + 5
+        cached = None
+        while time.monotonic() < deadline:
+            cached = gmass_cache.read_cache(app.redis_client)
+            if cached is not None:
+                break
+            time.sleep(0.05)
+        assert cached is not None, "no background refresh completed within 5s — possible swallowed cross-thread error"
 
 
 # --- Reach-outs: all-campaigns, filterable, read-only recipient table ------
@@ -1938,6 +2125,22 @@ def test_reachouts_rows_ooo_resume_date_none_for_a_normal_recipient(conn):
     assert reachouts_rows(conn)[0]["ooo_resume_date"] is None
 
 
+def test_reachouts_rows_bounce_reason_shown_for_a_bounced_recipient(conn):
+    # Previously: this page showed a bare "bounced" status with no detail
+    # on why -- same gap the Bounces & Blocks widget had.
+    _stage_and_send(conn, recipient="dead@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="bounce", recipient="dead@x.com", campaign="c",
+                 meta={"bounce_reason": "mailbox full", "bounce_time": "t1", "category": "bounce"})
+    row = reachouts_rows(conn)[0]
+    assert row["status"] == "bounced"
+    assert row["bounce_reason"] == "mailbox full"
+
+
+def test_reachouts_rows_bounce_reason_none_for_a_normal_recipient(conn):
+    _stage_and_send(conn, recipient="normal@x.com", campaign="c", persona="recruiter")
+    assert reachouts_rows(conn)[0]["bounce_reason"] is None
+
+
 def test_reachouts_rows_ooo_resume_date_none_for_legacy_ooo_tagged_without_a_resume_date(conn):
     # A pre-resume_date-feature ooo_tagged event (no resume_date in its meta)
     # has no genuine specific date to show — _pending_ooo_resume_date treats
@@ -2151,6 +2354,21 @@ def test_create_app_reachouts_renders_rows_across_campaigns(app, tmp_path):
     assert b"jane@acme.com" in resp.data
     assert b"bob@widgets.com" in resp.data
     assert b"2 of 2 reach-outs shown" in resp.data
+
+
+def test_create_app_reachouts_renders_bounce_reason_text(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    _stage_and_send(conn, recipient="dead@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="bounce", recipient="dead@x.com", campaign="c",
+                 meta={"bounce_reason": "mailbox full", "bounce_time": "t1", "category": "bounce"})
+    conn.close()
+
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+        client = app.test_client()
+        resp = client.get("/reachouts")
+
+    assert resp.status_code == 200
+    assert b"mailbox full" in resp.data
 
 
 def test_create_app_reachouts_renders_ooo_status_and_resume_date(app, tmp_path):
@@ -2376,3 +2594,87 @@ def test_create_app_reachouts_never_calls_gmass(app, tmp_path):
 
     assert resp.status_code == 200
     mock_get_reports.assert_not_called()
+
+
+# --- Template Failures tab (slap.reload) ------------------------------------
+
+def _make_failure(recipient="jane@acme.com", campaign="coldpost", reason="template now references "
+                   "field(s) this recipient has no stored value for: special_note",
+                   missing_fields=None):
+    return ReloadFailure(
+        recipient=recipient, campaign=campaign, reason=reason,
+        missing_fields=missing_fields if missing_fields is not None else ["special_note"],
+        attempted_at="2026-07-10T12:00:00+00:00",
+    )
+
+
+def test_template_failures_helper_reads_written_report(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert template_failures() == []
+    write_failures([_make_failure()])
+    result = template_failures()
+    assert len(result) == 1
+    assert result[0]["recipient"] == "jane@acme.com"
+
+
+def test_create_app_index_no_nav_link_when_no_template_failures(app):
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+        client = app.test_client()
+        resp = client.get("/")
+    assert resp.status_code == 200
+    assert b"Template Failures" not in resp.data
+
+
+def test_create_app_index_shows_nav_link_when_template_failures_exist(app, tmp_path):
+    write_failures([_make_failure()], path=tmp_path / "template_reload_failures.json")
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+        client = app.test_client()
+        resp = client.get("/")
+    assert resp.status_code == 200
+    assert b"Template Failures (1)" in resp.data
+    assert b'href="/template-failures"' in resp.data
+
+
+def test_create_app_index_nav_link_disappears_once_resolved(app, tmp_path):
+    failures_path = tmp_path / "template_reload_failures.json"
+    write_failures([_make_failure()], path=failures_path)
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+        client = app.test_client()
+        assert b"Template Failures" in client.get("/").data
+
+    # A later `template-reload` run that found nothing wrong fully overwrites
+    # the report -- the nav link must vanish on the very next page load, with
+    # no separate "mark resolved" step.
+    write_failures([], path=failures_path)
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+        resp = client.get("/")
+    assert b"Template Failures" not in resp.data
+
+
+def test_create_app_template_failures_page_empty_state(app):
+    client = app.test_client()
+    resp = client.get("/template-failures")
+    assert resp.status_code == 200
+    assert b"No template-reload failures" in resp.data
+
+
+def test_create_app_template_failures_page_lists_entries(app, tmp_path):
+    write_failures(
+        [_make_failure(recipient="jane@acme.com", campaign="coldpost", missing_fields=["special_note"])],
+        path=tmp_path / "template_reload_failures.json",
+    )
+    client = app.test_client()
+    resp = client.get("/template-failures")
+    assert resp.status_code == 200
+    assert b"jane@acme.com" in resp.data
+    assert b"coldpost" in resp.data
+    assert b"special_note" in resp.data
+
+
+def test_create_app_template_failures_page_reachable_directly_with_zero_failures(app):
+    # Direct navigation must work even though the index() nav link never
+    # points here when there's nothing to show -- no 404, no error.
+    client = app.test_client()
+    resp = client.get("/template-failures")
+    assert resp.status_code == 200
+    assert b"No template-reload failures" in resp.data
