@@ -17,7 +17,7 @@ from slap import display
 from slap.cleanup import DEFAULT_MIN_DAYS_IDLE, delete_eligible, find_cleanup_candidates
 from slap.config import ConfigError, discover_campaigns, load_campaign, load_global_config
 from slap.latex import recipient_workdir, run_latex_loop
-from slap.queue import stage_recipient
+from slap.queue import AmbiguousArchiveChoice, QueueError, resend_bounced, stage_recipient
 from slap.templates import fill_template, merge_config_values, parse_drop
 from slap import archive, dashboard, doctor, domains, gmass, gmass_cache, init, launchd, reload, runner, tracking
 
@@ -551,6 +551,83 @@ def cmd_cleanup(args):
         display.success(f"\nDeleted {len(deleted)} PDF(s) (+ .hash sidecars). resume.tex kept for all.")
 
 
+def cmd_bounced(args):
+    """Bounce remediation (post-launch), TUI counterpart to the Reach-outs
+    page's per-row "Resend to corrected address" action — both call the
+    exact same slap.queue.resend_bounced(), see that function's own
+    docstring for the recovery/fallback logic. Interactive, matching
+    cmd_send's own style: one bounced recipient at a time, corrected address
+    prompted, dedup surfaced as information only (never a blocking
+    confirm — the owner already made an explicit correction by typing an
+    address), then a plain y/N to actually stage it."""
+    try:
+        global_config = load_global_config()
+    except ConfigError as e:
+        display.fail(f"slap: {e}")
+        sys.exit(1)
+    try:
+        consumer_domains = domains.load_consumer_domains(Path(global_config.consumer_domains_file))
+    except domains.DomainsError as e:
+        display.fail(f"slap: {e}")
+        sys.exit(1)
+
+    conn = tracking.connect()
+    bounced = dashboard.bounces(conn)
+    if not bounced:
+        print("No bounces or blocks to fix.")
+        return
+
+    archive_dir = archive.archive_dir_from_env()
+
+    for b in bounced:
+        recipient, campaign = b["recipient"], b["campaign"]
+        kind = "Blocked" if b["category"] == "block" else "Bounced"
+        print(f"\n{kind}: {recipient}  (campaign={campaign})")
+        corrected = input(display.styled_prompt(
+            "Corrected email address [blank to skip]: ", style=display.YELLOW
+        )).strip()
+        if not corrected:
+            print("Skipped.")
+            continue
+
+        dedup = domains.check_recipient(conn, corrected, consumer_domains)
+        if dedup.hard_warning:
+            w = dedup.hard_warning
+            display.error(f"⚠ HARD WARN: {corrected} already contacted — campaign={w.campaign} "
+                          f"status={w.status}")
+        if dedup.soft_warning_contacts:
+            display.warn(f"⚠ SOFT WARN: {len(dedup.soft_warning_contacts)} other contact(s) already on "
+                         f"domain {dedup.soft_warning_domain}")
+
+        if input("Resend the full sequence to this address? [y/N]: ").strip().lower() != "y":
+            print("Skipped.")
+            continue
+
+        try:
+            resend_bounced(conn, original_recipient=recipient, corrected_email=corrected,
+                            archive_dir=archive_dir)
+        except AmbiguousArchiveChoice as e:
+            # The workdir's own compiled PDF is gone (cleaned up) but the
+            # archive has candidate(s) for this company — offer the exact
+            # same numbered picker _prep_one_recipient's résumé-reuse flow
+            # already uses, rather than silently guessing one (see
+            # resend_bounced's own docstring for why it never auto-picks).
+            choice = _offer_resume_reuse(e.matches)
+            if choice is None:
+                display.error(f"⚠ Could not resend for {recipient}: no résumé chosen, nothing staged.")
+                continue
+            try:
+                resend_bounced(conn, original_recipient=recipient, corrected_email=corrected,
+                                archive_dir=archive_dir, archive_choice=choice)
+            except QueueError as e2:
+                display.error(f"⚠ Could not resend for {recipient}: {e2}")
+                continue
+        except QueueError as e:
+            display.error(f"⚠ Could not resend for {recipient}: {e}")
+            continue
+        display.success(f"Staged {corrected} (corrected from {recipient}).")
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Personal cold job-outreach CLI over GMass.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -594,6 +671,10 @@ def build_parser():
     p_cleanup.add_argument("--min-days-idle", type=int, default=DEFAULT_MIN_DAYS_IDLE, dest="min_days_idle",
                             help=f"Idle-days threshold (default {DEFAULT_MIN_DAYS_IDLE})")
     p_cleanup.set_defaults(func=cmd_cleanup)
+
+    sub.add_parser(
+        "bounced", help="Fix bounced/blocked recipients — prompt a corrected address and resend"
+    ).set_defaults(func=cmd_bounced)
     return parser
 
 

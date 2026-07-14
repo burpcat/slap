@@ -58,7 +58,7 @@ def stage_recipient(conn, *, campaign: str, recipient: str, persona: str, cadenc
                      subject: str, body: str, stage_bodies: list,
                      attachment_path: Path, attachment_name: str, latex_enabled: bool,
                      company: str = "", role: str = "", req_id: str = "", archive_dir: Path = None,
-                     when: date = None, workdir_root: Path = WORKDIR_ROOT,
+                     when: date = None, workdir_root: Path = WORKDIR_ROOT, extra_meta: dict = None,
                      field_values: dict = None) -> Path:
     """Write the queued event + staged manifest for one recipient (does not
     send). Returns the recipient's workdir.
@@ -96,6 +96,12 @@ def stage_recipient(conn, *, campaign: str, recipient: str, persona: str, cadenc
     before this change simply lacks these keys, and every reader treats a
     missing key as blank/unknown, never a guessed value.
 
+    `extra_meta` (post-launch, bounce remediation) merges additional keys
+    into the same `queued` event's meta on top of persona/company/role/
+    req_id — e.g. `{"corrected_from": "<bounced address>"}` from
+    resend_bounced() below, keeping a corrected resend traceable back to the
+    original bounce without a new event type or schema column.
+
     `field_values` (post-launch, slap.reload): the raw, pre-fill drop-parsed
     dict (parse_drop()'s return value — every campaign field, not just
     company/role/req_id) — stored so slap.reload.scan() can re-render this
@@ -132,12 +138,156 @@ def stage_recipient(conn, *, campaign: str, recipient: str, persona: str, cadenc
         display.warn(f"resume archive: unexpected error archiving for {recipient}: {e}")
 
     append_event(conn, type="queued", recipient=recipient, campaign=campaign, stage=0,
-                 meta={"persona": persona, "company": company, "role": role, "req_id": req_id})
+                 meta={"persona": persona, "company": company, "role": role, "req_id": req_id,
+                       **(extra_meta or {})})
     return workdir
 
 
 def load_manifest(workdir: Path) -> dict:
     return json.loads((workdir / MANIFEST_NAME).read_text(encoding="utf-8"))
+
+
+class QueueError(Exception):
+    """Raised on fail-loud queue-module misuse (e.g. nothing recoverable to resend)."""
+
+
+class AmbiguousArchiveChoice(QueueError):
+    """Raised by resend_bounced() when résumé-archive matches exist for the
+    bounced recipient's company but none was explicitly chosen via
+    `archive_choice` (see that function's own docstring for why it never
+    auto-picks one, even when there's only one match). Carries `matches` so
+    a caller that CAN prompt (the `bounced` CLI command, via the same
+    _offer_resume_reuse picker slap.py's normal send flow already uses) can
+    offer them and retry with a real choice. A caller that can't prompt
+    (the dashboard route) still gets a clear, fail-loud message via the
+    `QueueError` base class."""
+    def __init__(self, message: str, matches: list):
+        super().__init__(message)
+        self.matches = matches
+
+
+def resend_bounced(conn, *, original_recipient: str, corrected_email: str,
+                    archive_dir: Path = None, archive_choice: Path = None,
+                    workdir_root: Path = WORKDIR_ROOT, when: date = None) -> Path:
+    """Bounce remediation (post-launch): recovers a bounced recipient's exact
+    staged send and re-stages it for `corrected_email` as a brand-new
+    recipient — never a mutation of the bounced one (`recipients.recipient`
+    is the primary key; the bounced row's own history stays exactly as it
+    was, append-only). Always restarts the full cadence from stage 1 — the
+    corrected address never received anything, no matter which stage
+    bounced on the original one. `corrected_from` rides in the new
+    recipient's own `queued` event meta (via stage_recipient()'s
+    `extra_meta`) so the correction stays traceable back to the original
+    bounce — see slap.dashboard.reachouts_rows() for how this surfaces.
+
+    Recoverability (investigated before building this): `staged.json` (this
+    recipient's manifest — subject/body/stage_bodies/cadence/persona/
+    attachment, already template-filled) and the original `queued` event's
+    meta (company/role/req_id) are NEVER deleted by anything in this app —
+    slap.cleanup only ever unlinks the compiled PDF and its `.hash` sidecar,
+    never the manifest, never resume.tex, never the workdir itself. So both
+    survive indefinitely and this never needs the owner to re-paste the
+    original drop. The one thing that CAN be missing is the per-recipient
+    compiled PDF itself, for a latex-enabled campaign that's since been
+    cleaned up (bounced + idle past cleanup's min_days_idle and not covered
+    by a live archive symlink) — this tries, in order: (1) the original
+    recipient's own workdir copy, (2) `archive_choice` if the caller already
+    resolved one (see below), (3) fail loud, telling the owner to re-paste
+    the LaTeX source via a normal `send` instead — never guessing or
+    fabricating an attachment. A static (latex-disabled) campaign's
+    `attachment_source` points at the shared campaigns/<name>/resume.pdf,
+    which cleanup never touches at all, so it's always there.
+
+    `archive_choice` (an archive.py symlink entry) is the caller's own,
+    already-made pick of WHICH résumé-archive match to reuse — this function
+    never auto-picks one itself, even when there's exactly one match: the
+    original résumé-reuse feature (slap.py's `_offer_resume_reuse`) always
+    puts a real choice in front of the owner first (a company can have
+    several archived résumés for different roles; "the only match found" is
+    still a guess, not a confirmed choice). When the workdir PDF is missing
+    and `archive_choice` isn't given, this fails loud instead, listing
+    whatever matches archive.find_matches_for_company() found so the caller
+    can re-invoke with one explicitly chosen — the CLI's `bounced` command
+    does this via the same interactive picker `_offer_resume_reuse` already
+    provides; the dashboard route (which can't prompt) surfaces the same
+    fail-loud message rather than silently guessing.
+
+    Deliberately does NOT run the dedup check itself — same division of
+    responsibility stage_recipient() already has with ITS caller
+    (slap.py's `_prep_one_recipient` does the dedup check and owns how it's
+    displayed, not stage_recipient() itself). Here, the `bounced` CLI
+    command and the dashboard's resend route each call
+    slap.domains.check_recipient() themselves before calling this, so each
+    surfaces any warning in its own idiom — informational only, no blocking
+    confirm, since submitting a corrected address is already an explicit,
+    deliberate owner correction."""
+    row = conn.execute(
+        "SELECT campaign, status FROM recipients WHERE recipient = ?", (original_recipient,)
+    ).fetchone()
+    if row is None:
+        raise QueueError(f"{original_recipient!r} is not a known recipient — nothing to resend")
+    if row["status"] != "bounced":
+        raise QueueError(f"{original_recipient!r} is not bounced (status={row['status']!r}) — refusing to resend")
+    campaign = row["campaign"]
+
+    original_workdir = recipient_workdir(campaign, original_recipient, root=workdir_root)
+    try:
+        manifest = load_manifest(original_workdir)
+        persona, cadence = manifest["persona"], manifest["cadence"]
+        subject, body, stage_bodies = manifest["subject"], manifest["body"], manifest["stage_bodies"]
+        attachment_name = manifest["attachment_name"]
+    except (OSError, ValueError, KeyError) as e:
+        raise QueueError(f"could not recover the original staged send for {original_recipient!r}: {e}") from e
+
+    drop_meta_row = conn.execute(
+        "SELECT meta FROM events WHERE recipient = ? AND type = 'queued' ORDER BY id DESC LIMIT 1",
+        (original_recipient,),
+    ).fetchone()
+    drop_meta = json.loads(drop_meta_row["meta"]) if drop_meta_row and drop_meta_row["meta"] else {}
+    company, role, req_id = drop_meta.get("company", ""), drop_meta.get("role", ""), drop_meta.get("req_id", "")
+
+    latex_enabled = manifest.get("attachment_source") is None
+    if not latex_enabled:
+        attachment_path = Path(manifest["attachment_source"])
+    else:
+        candidate = original_workdir / attachment_name
+        if candidate.exists():
+            attachment_path = candidate
+        elif archive_choice is not None:
+            corrected_workdir = recipient_workdir(campaign, corrected_email, root=workdir_root)
+            try:
+                attachment_path = archive.copy_reused_resume(archive_choice, corrected_workdir, attachment_name)
+            except archive.ArchiveError as e:
+                raise QueueError(f"could not reuse {archive_choice.name} for {corrected_email}: {e}") from e
+        else:
+            matches = archive.find_matches_for_company(archive_dir, company) if archive_dir else []
+            if not matches:
+                raise QueueError(
+                    f"no compiled résumé left for {original_recipient!r} (already cleaned up) and no "
+                    f"résumé-archive match for company {company!r} — re-paste the LaTeX source via a normal "
+                    f"`send` to {campaign!r} for {corrected_email} instead"
+                )
+            names = ", ".join(m.name for m in matches)
+            raise AmbiguousArchiveChoice(
+                f"no compiled résumé left for {original_recipient!r} (already cleaned up) — "
+                f"{len(matches)} résumé-archive match(es) for company {company!r} found ({names}) but none "
+                f"chosen; re-invoke with archive_choice set to one of them",
+                matches=matches,
+            )
+
+    return stage_recipient(
+        conn, campaign=campaign, recipient=corrected_email, persona=persona, cadence=cadence,
+        subject=subject, body=body, stage_bodies=stage_bodies, attachment_path=attachment_path,
+        attachment_name=attachment_name, latex_enabled=latex_enabled, company=company, role=role,
+        req_id=req_id, archive_dir=archive_dir, when=when, workdir_root=workdir_root,
+        extra_meta={"corrected_from": original_recipient},
+        # Carries the original recipient's own field_values through (if
+        # they have any — see stage_recipient()'s own docstring) so the
+        # corrected recipient stays reloadable via slap.reload just like
+        # any other staged recipient; None (the pre-template-reload case)
+        # degrades the same way it does everywhere else.
+        field_values=manifest.get("field_values"),
+    )
 
 
 def due_recipients(conn) -> list:

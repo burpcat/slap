@@ -43,11 +43,12 @@ from pathlib import Path
 import requests
 from flask import Flask, g, redirect, request, render_template, url_for
 
-from slap import display, domains, gmass, gmass_cache, reload, tracking
+from slap import archive, display, domains, gmass, gmass_cache, reload, tracking, ui_state
 from slap.config import discover_campaigns
 from slap.domains import check_recipient
 from slap.queue import (
-    _pending_ooo_resume_date, due_for_ooo_resend, due_recipients, tag_ooo as _tag_ooo,
+    QueueError, _pending_ooo_resume_date, due_for_ooo_resend, due_recipients, resend_bounced,
+    tag_ooo as _tag_ooo,
 )
 from slap.runner import cap_headroom
 from slap.tracking import append_event
@@ -456,8 +457,13 @@ def tag_reply(conn, recipient: str, tag: str, *, resume_date: date = None, api_k
     See slap.gmass.unsubscribe_recipient's docstring for why this is
     account-wide, not per-campaign.
 
-    'real'/'not_interested' are unchanged: pure triage bookkeeping with no
-    state transition (neither is a valid recipients.status value).
+    'not_interested' now ALSO calls `unsubscribe_fn` first, same as 'ooo' —
+    an explicit "not interested" is a stronger stop signal than an
+    auto-detected OOO (a temporary pause, not a request to stop), so it gets
+    the same GMass-side suppression and the same "nothing recorded locally
+    if the call fails" guarantee. 'real' is the one tag left as pure triage
+    bookkeeping with no side effect — a genuinely engaged reply should never
+    be touched.
 
     `unsubscribe_fn` defaults to None and is resolved to
     `gmass.unsubscribe_recipient` INSIDE this function body, not as a bound
@@ -475,6 +481,8 @@ def tag_reply(conn, recipient: str, tag: str, *, resume_date: date = None, api_k
         (unsubscribe_fn or gmass.unsubscribe_recipient)(api_key, recipient)
         _tag_ooo(conn, recipient, resume_date)
         return
+    if tag == "not_interested":
+        (unsubscribe_fn or gmass.unsubscribe_recipient)(api_key, recipient)
     row = conn.execute("SELECT campaign FROM recipients WHERE recipient = ?", (recipient,)).fetchone()
     campaign = row["campaign"] if row else None
     append_event(conn, type="reply_reviewed", recipient=recipient, campaign=campaign, meta={"tag": tag})
@@ -557,6 +565,37 @@ def todays_runs(conn, *, today: date = None) -> dict:
     }
 
 
+def _click_details(conn) -> dict:
+    """Every recipient's click history, deduped by `url` (keeping the
+    earliest click_time seen for each distinct url) and sorted by
+    click_time — the shared "which links did they actually click" detail
+    reused by both warm_but_silent() (main dashboard) and reachouts_rows()
+    (Reach-outs page), so the two can never disagree about it. Built from
+    the same url/click_time meta _sync_clicks() already writes on every
+    click event; a click recorded with no url (e.g. a bare event seeded
+    before that meta existed, or by a test) is simply omitted here, the same
+    "never fabricated" convention _recipient_drop_meta() already follows for
+    missing meta."""
+    rows = conn.execute(
+        "SELECT recipient, stage, meta FROM events WHERE type = 'click' ORDER BY id ASC"
+    ).fetchall()
+    by_recipient: dict = {}
+    for row in rows:
+        meta = json.loads(row["meta"]) if row["meta"] else {}
+        url = meta.get("url")
+        if url is None:
+            continue
+        click_time = meta.get("click_time")
+        entry = by_recipient.setdefault(row["recipient"], {})
+        existing = entry.get(url)
+        if existing is None or (click_time or "") < (existing["click_time"] or ""):
+            entry[url] = {"url": url, "stage": row["stage"], "click_time": click_time}
+    return {
+        recipient: sorted(clicks.values(), key=lambda c: (c["click_time"] or ""))
+        for recipient, clicks in by_recipient.items()
+    }
+
+
 def warm_but_silent(conn) -> list:
     """Recipients who clicked a link but have NOT replied — the highest-
     value signal on the dashboard (a click with no reply means the message
@@ -565,11 +604,16 @@ def warm_but_silent(conn) -> list:
     section) — stays honestly empty until real click events exist. "Not
     replied" means no reply event ever, not just "not currently in a reply
     state" — once someone has replied at all they're no longer silent, even
-    if a later OOO cycle reopened their sequence."""
+    if a later OOO cycle reopened their sequence.
+
+    `clicks` (added post-launch) is each recipient's deduped-by-url click
+    detail from _click_details() — `stages_clicked` (bare stage numbers) is
+    kept exactly as before for anything already relying on it."""
     click_rows = conn.execute(
         "SELECT recipient, campaign, stage FROM events WHERE type = 'click' ORDER BY recipient, stage"
     ).fetchall()
     replied = {r["recipient"] for r in conn.execute("SELECT DISTINCT recipient FROM events WHERE type = 'reply'")}
+    click_details = _click_details(conn)
 
     by_recipient: dict = {}
     for row in click_rows:
@@ -585,7 +629,58 @@ def warm_but_silent(conn) -> list:
         if row["stage"] is not None and row["stage"] not in entry["stages_clicked"]:
             entry["stages_clicked"].append(row["stage"])
 
+    for recipient, entry in by_recipient.items():
+        entry["clicks"] = click_details.get(recipient, [])
+
     return sorted(by_recipient.values(), key=lambda e: e["recipient"])
+
+
+WARM_BUT_SILENT_WIDGET = "warm_but_silent"
+
+
+def _warm_but_silent_hidden_recipients(conn) -> set:
+    """Recipients whose Warm-but-silent row is CURRENTLY hidden — not a bare
+    read of ui_state.list_hidden(), because a hide auto-resurfaces once a
+    NEWER click has landed since (the point of hiding is "I've seen this,
+    nothing new here" — a fresh click is new information worth resurfacing).
+    ui_state itself has no opinion on that rule (see its own docstring) —
+    this is where it's applied.
+
+    Deliberately uses each `click` event's own `timestamp` column (always a
+    reliable, consistently-formatted UTC value SLAP itself wrote at record
+    time — see slap/tracking.py's "all timestamps are UTC" rule), NOT
+    _click_details()'s `meta.click_time` (GMass's own reported value,
+    deduped to the EARLIEST time per distinct url — exactly wrong here: a
+    RE-click of a url the recipient already clicked before hiding would be
+    silently discarded by that dedup and would never resurface the row).
+    `events.timestamp` has no such dedup — every click, including a repeat
+    on the same url, advances it."""
+    hidden_rows = ui_state.list_hidden(conn, WARM_BUT_SILENT_WIDGET)
+    if not hidden_rows:
+        return set()
+    still_hidden = set()
+    for row in hidden_rows:
+        recipient, hidden_since = row["recipient"], row["hidden_at"]
+        latest_row = conn.execute(
+            "SELECT MAX(timestamp) AS latest FROM events WHERE recipient = ? AND type = 'click'",
+            (recipient,),
+        ).fetchone()
+        latest_click = latest_row["latest"] or ""
+        if latest_click and latest_click > hidden_since:
+            continue  # a newer click since hiding -- resurfaced, not hidden
+        still_hidden.add(recipient)
+    return still_hidden
+
+
+def visible_warm_but_silent(conn, rows: list) -> list:
+    """`rows` (warm_but_silent()'s output, possibly served from the hourly
+    Redis cache) minus whichever recipients are currently hidden. Takes the
+    already-computed rows rather than recomputing them so hide/unhide stays
+    instant even though the underlying click/reply data can be up to an hour
+    stale — hidden-state itself is never cached, it's read fresh every
+    request."""
+    hidden = _warm_but_silent_hidden_recipients(conn)
+    return [r for r in rows if r["recipient"] not in hidden]
 
 
 def _latest_bounce_meta(conn, recipient: str) -> dict:
@@ -593,10 +688,11 @@ def _latest_bounce_meta(conn, recipient: str) -> dict:
     dict (`category` + `bounce_reason`/`bounce_time`) — matches the same
     latest-event-wins convention every other "current state" derivation in
     this app already uses (e.g. reply_tags(), needs_triage()). One query
-    backs both the category badge and the reason text below (bounces()/
+    backs both the category badge and the reason text (bounces()/
     reachouts_rows()) rather than querying twice for data already fetched
     once. A pre-existing event recorded before `category`/`bounce_reason`
-    existed simply lacks those keys — callers default them, never guess."""
+    existed simply lacks those keys — callers default them via `.get()`,
+    never guess."""
     row = conn.execute(
         "SELECT meta FROM events WHERE recipient = ? AND type = 'bounce' ORDER BY id DESC LIMIT 1",
         (recipient,),
@@ -761,6 +857,91 @@ def _recipient_drop_meta(conn) -> dict:
     return result
 
 
+def _corrected_from_by_recipient(conn) -> dict:
+    """Per recipient, the original bounced address this recipient's send was
+    corrected from (slap.queue.resend_bounced()'s `corrected_from` meta on
+    the new recipient's own `queued` event) — a recipient absent here was
+    never created via that path. Kept as its own lookup (rather than a new
+    key on _recipient_drop_meta()'s return dict) so that function's
+    existing, tested `{company, role, req_id}` shape never changes."""
+    rows = conn.execute(
+        "SELECT recipient, meta FROM events WHERE type = 'queued' ORDER BY id ASC"
+    ).fetchall()
+    result: dict = {}
+    for row in rows:
+        meta = json.loads(row["meta"]) if row["meta"] else {}
+        if "corrected_from" in meta:
+            result[row["recipient"]] = meta["corrected_from"]
+    return result
+
+
+def _already_corrected_to(conn) -> dict:
+    """Reverse of _corrected_from_by_recipient(): per ORIGINAL bounced
+    recipient, every new recipient they were later corrected to (in call
+    order), each with that new recipient's CURRENT status — an iron-audit
+    SHOULD-FIX: without this, a bounced row's Reach-outs detail had no
+    memory that a correction already happened, so nothing stopped the owner
+    from not noticing and submitting a second, redundant correction for the
+    same bounce. This is purely informational and does NOT hide or disable
+    the resend form itself (warn, don't block) — the corrected address can
+    itself bounce and legitimately need a second correction."""
+    corrected_from = _corrected_from_by_recipient(conn)
+    reverse: dict = {}
+    for new_recipient, original in corrected_from.items():
+        reverse.setdefault(original, []).append(new_recipient)
+    result: dict = {}
+    for original, new_recipients in reverse.items():
+        entries = []
+        for nr in new_recipients:
+            row = conn.execute("SELECT status FROM recipients WHERE recipient = ?", (nr,)).fetchone()
+            entries.append({"recipient": nr, "status": row["status"] if row else None})
+        result[original] = entries
+    return result
+
+
+def _status_chip(*, status: str, engagement: str, reply_tag, bounce_category, bounce_reason,
+                  ooo_resume_date, num_clicks: int) -> dict:
+    """One computed `{color, label}` per Reach-outs row — folds status,
+    engagement, reply_tag, and bounce category/reason into a single display
+    value (see the Reach-outs layout redesign) instead of several columns
+    that could silently disagree. `color` follows the badge precedence
+    bounced > replied > clicked > none: bounced is the most actionable,
+    time-sensitive fact regardless of any PRIOR engagement. `status` and
+    `engagement` are independently derived (see reachouts_rows()'s own
+    docstring), so a recipient CAN genuinely be both 'bounced' and
+    previously 'replied'/'clicked' (e.g. an OOO resend that later bounces) —
+    that history isn't lost, it's just not one of the three colors; OOO/
+    not-interested/active/done/queued get a label only, no color, since
+    none of those is part of the 3-color ask.
+
+    `bounce_category`/`bounce_reason` come straight from _latest_bounce_meta()
+    (the raw event meta) — `bounce_category` defaults to "bounce" the same
+    way bounces() already does, `bounce_reason` is None/falsy when GMass
+    gave no reason text, never fabricated."""
+    if status == "bounced":
+        label = "Blocked" if bounce_category == "block" else "Bounced"
+        if bounce_reason:
+            label = f"{label} — {bounce_reason}"
+        return {"color": "critical", "label": label}
+
+    if status == "ooo_requeued":
+        label = f"OOO — resumes {ooo_resume_date}" if ooo_resume_date else "OOO"
+        return {"color": None, "label": label}
+
+    if reply_tag == "not_interested":
+        return {"color": None, "label": "Not interested"}
+
+    if engagement == "replied":
+        return {"color": "good", "label": "Replied"}
+
+    if engagement == "clicked":
+        return {"color": "serious", "label": f"Clicked ({num_clicks})" if num_clicks > 1 else "Clicked"}
+
+    if status in ("done", "active", "queued"):
+        return {"color": None, "label": status.capitalize()}
+    return {"color": None, "label": status or "—"}
+
+
 def template_failures() -> list:
     """The Template Failures tab's data: whatever slap.reload's most recent
     `template-reload` run recorded as failed and still unresolved. A plain
@@ -828,16 +1009,40 @@ def reachouts_rows(conn) -> list:
       self-corrects back to normal, which is also why it's the one wired up
       as the "currently OOO" filter (see reachouts.html; already dynamically
       lists every live status value with no template change needed).
-    - bounce_reason: ONLY set while status == 'bounced' — same "gate the
-      per-recipient lookup query on the status that actually implies it"
-      pattern ooo_resume_date above already established. GMass's own
-      bounceReason/blockReason text (see bounces()'s identical use of
-      _latest_bounce_meta()) — this page previously showed a bare "bounced"
-      status with no detail on why, same gap the Bounces & Blocks widget had.
+
+    - bounce_category / bounce_reason: ONLY set while status == 'bounced' —
+      same "gate the per-recipient lookup query on the status that actually
+      implies it" pattern ooo_resume_date above already established. From
+      _latest_bounce_meta() (the raw event meta; same source bounces()
+      already uses) — this page previously showed a bare "bounced" status
+      with no detail on why, same gap the Bounces & Blocks widget had.
+    - chip: _status_chip()'s computed `{color, label}` — the single visual
+      status indicator the Reach-outs layout redesign uses in place of
+      separate Status/Engagement/Reply-tag columns (see that function's own
+      docstring for the precedence rule).
+    - clicks: this recipient's click detail from _click_details() (deduped
+      by url, sorted by time) — empty list if never clicked or no url meta
+      was ever captured for their clicks. Same shared helper
+      warm_but_silent() uses, so the two never disagree on "what did they
+      click."
+    - corrected_from / already_corrected_to: bounce-remediation traceability
+      (slap.queue.resend_bounced()). corrected_from is the ORIGINAL bounced
+      address this row was created to fix (None for anyone not created via
+      that path); already_corrected_to is the reverse — every recipient a
+      given bounced row was LATER corrected to, each with their current
+      status — an iron-audit SHOULD-FIX so a bounced row's own detail shows
+      whether it was already resent, rather than silently offering the same
+      "Resend to corrected address" action with no memory of prior attempts.
+      Purely informational; never hides or disables the resend action
+      itself (warn, don't block — a corrected address can itself bounce and
+      legitimately need a second correction).
     """
     clicked = _clicked_recipients(conn)
     tags = reply_tags(conn)
     drop_meta = _recipient_drop_meta(conn)
+    click_details = _click_details(conn)
+    corrected_from_map = _corrected_from_by_recipient(conn)
+    already_corrected_map = _already_corrected_to(conn)
     rows = conn.execute("SELECT * FROM recipients").fetchall()
 
     result = []
@@ -860,12 +1065,16 @@ def reachouts_rows(conn) -> list:
             if pending is not None and pending != date.min:
                 ooo_resume_date = pending.isoformat()
 
+        bounce_category = None
         bounce_reason = None
         if status == "bounced":
-            bounce_reason = _latest_bounce_meta(conn, recipient).get("bounce_reason") or None
+            bounce_meta = _latest_bounce_meta(conn, recipient)
+            bounce_category = bounce_meta.get("category", "bounce")
+            bounce_reason = bounce_meta.get("bounce_reason") or None
 
         meta = drop_meta.get(recipient, {"company": "", "role": "", "req_id": ""})
         row_date = row["first_sent_at"] or row["last_event_at"]
+        clicks = click_details.get(recipient, [])
 
         result.append({
             "recipient": recipient,
@@ -879,7 +1088,15 @@ def reachouts_rows(conn) -> list:
             "req_id_present": bool(meta["req_id"]),
             "date": row_date,
             "ooo_resume_date": ooo_resume_date,
+            "bounce_category": bounce_category,
             "bounce_reason": bounce_reason,
+            "corrected_from": corrected_from_map.get(recipient),
+            "already_corrected_to": already_corrected_map.get(recipient, []),
+            "clicks": clicks,
+            "chip": _status_chip(status=status, engagement=engagement, reply_tag=tags.get(recipient),
+                                  bounce_category=bounce_category, bounce_reason=bounce_reason,
+                                  ooo_resume_date=ooo_resume_date,
+                                  num_clicks=len(clicks) or (1 if engagement == "clicked" else 0)),
             # Precomputed LOCAL calendar date (YYYY-MM-DD), reusing the same
             # _local_date() conversion todays_runs()/companies_contacted()
             # already use — so the client-side date-range filter (reachouts.
@@ -1155,12 +1372,30 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
     def index():
         conn = get_conn()
         gmass_data = get_gmass_dependent_data(api_key, consumer_domains, redis_client, db_path)
+        # Hide/unhide (post-launch): applied HERE, on top of the possibly-
+        # hourly-cached warm_but_silent list, never baked into the cache
+        # itself — see visible_warm_but_silent()'s own docstring for why
+        # (hidden-state must stay instant, not wait for the next hourly
+        # refresh). show_hidden=1 shows every row (hidden ones get an
+        # "Unhide" action instead of "Hide") rather than a separate page.
+        all_warm_but_silent = gmass_data["warm_but_silent"]
+        hidden_recipients = _warm_but_silent_hidden_recipients(conn)
+        show_hidden = request.args.get("show_hidden") == "1"
+        visible_warm_but_silent_rows = (
+            all_warm_but_silent if show_hidden
+            else [r for r in all_warm_but_silent if r["recipient"] not in hidden_recipients]
+        )
         return render_template(
             "dashboard.html",
             sync_result=gmass_data["sync_result"],
             engagement=gmass_data["engagement"],
             replies=gmass_data["replies"],
-            warm_but_silent=gmass_data["warm_but_silent"],
+            warm_but_silent=visible_warm_but_silent_rows,
+            warm_but_silent_hidden_recipients=hidden_recipients,
+            warm_but_silent_hidden_count=len(
+                [r for r in all_warm_but_silent if r["recipient"] in hidden_recipients]
+            ),
+            show_hidden=show_hidden,
             bounces=gmass_data["bounces"],
             cache_status=gmass_data["cache_status"],
             today=today_strip(conn, global_config),
@@ -1178,6 +1413,16 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
             # directly regardless of this count.
             template_failures_count=len(template_failures()),
         )
+
+    @app.route("/warm-but-silent/<string:recipient>/hide", methods=["POST"])
+    def hide_warm_but_silent(recipient):
+        ui_state.hide(get_conn(), recipient, WARM_BUT_SILENT_WIDGET)
+        return redirect(url_for("index"))
+
+    @app.route("/warm-but-silent/<string:recipient>/unhide", methods=["POST"])
+    def unhide_warm_but_silent(recipient):
+        ui_state.unhide(get_conn(), recipient, WARM_BUT_SILENT_WIDGET)
+        return redirect(url_for("index", show_hidden=1))
 
     @app.route("/gmass/refresh", methods=["POST"])
     def gmass_refresh():
@@ -1207,7 +1452,8 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
         # server round-trip, so no pagination or query-param handling is
         # needed here either.
         rows = reachouts_rows(get_conn())
-        return render_template("reachouts.html", rows=rows, total_count=len(rows))
+        return render_template("reachouts.html", rows=rows, total_count=len(rows),
+                                warning=request.args.get("warning"))
 
     @app.route("/template-failures")
     def template_failures_page():
@@ -1243,7 +1489,9 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
             # locally either (see tag_reply's docstring: the GMass call runs
             # BEFORE any local event, precisely so a failure here can never
             # leave a false "handled" local pause with no real suppression).
-            return f"could not mark {recipient} OOO — GMass suppression call failed, nothing was recorded: {e}", 502
+            # Both 'ooo' and 'not_interested' hit this path now (both call
+            # unsubscribe_fn first) — the message stays tag-generic.
+            return f"could not tag {recipient} ({tag!r}) — GMass suppression call failed, nothing was recorded: {e}", 502
         # Any successful tag can change actionable_replies()'s output (all
         # three tags resolve needs_triage()) — invalidate rather than let
         # the owner's own action sit invisible in a stale cache for up to
@@ -1253,5 +1501,33 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
         gmass_cache.invalidate(redis_client)
         redirect_to = request.form.get("redirect_to", "index")
         return redirect(url_for("reachouts" if redirect_to == "reachouts" else "index"))
+
+    @app.route("/reachouts/<string:recipient>/resend", methods=["POST"])
+    def resend(recipient):
+        # Bounce remediation (post-launch): the Reach-outs row action for a
+        # status=='bounced' recipient. Shares slap.queue.resend_bounced()
+        # with the `./slap.py bounced` CLI command — see that function's own
+        # docstring for why it does NOT run the dedup check itself; this
+        # route runs it here, purely for display (informational only, never
+        # blocking — the owner has already made an explicit correction by
+        # submitting this form).
+        corrected_email = request.form.get("corrected_email", "").strip()
+        if not corrected_email:
+            return "corrected_email is required", 400
+        conn = get_conn()
+        dedup = check_recipient(conn, corrected_email, consumer_domains)
+        warning = None
+        if dedup.hard_warning:
+            w = dedup.hard_warning
+            warning = f"{corrected_email} already contacted — campaign={w.campaign} status={w.status}"
+        elif dedup.soft_warning_contacts:
+            warning = (f"{len(dedup.soft_warning_contacts)} other contact(s) already on domain "
+                       f"{dedup.soft_warning_domain}")
+        try:
+            resend_bounced(conn, original_recipient=recipient, corrected_email=corrected_email,
+                            archive_dir=archive.archive_dir_from_env())
+        except QueueError as e:
+            return str(e), 400
+        return redirect(url_for("reachouts", warning=warning) if warning else url_for("reachouts"))
 
     return app

@@ -4,8 +4,11 @@ send stages without firing. Also covers OOO re-queue tagging (step 10, §7).
 import json
 from datetime import date
 
+import pytest
+
 from slap.queue import (
-    _pending_ooo_resume_date, due_for_ooo_resend, due_recipients, load_manifest, stage_recipient, tag_ooo,
+    QueueError, _pending_ooo_resume_date, due_for_ooo_resend, due_recipients, load_manifest,
+    resend_bounced, stage_recipient, tag_ooo,
 )
 from slap.tracking import append_event, connect
 
@@ -122,6 +125,177 @@ def test_stage_recipient_does_not_double_copy_already_staged_attachment(tmp_path
         workdir_root=workdir_root,
     )
     assert already_staged.read_bytes() == b"%PDF-already-there"
+
+
+# --- resend_bounced: bounce remediation (post-launch feature) --------------
+
+def _write_valid_pdf(path):
+    from pypdf import PdfWriter
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    with open(path, "wb") as f:
+        writer.write(f)
+
+
+def _stage_and_bounce(conn, tmp_path, *, recipient, campaign="c", persona="recruiter",
+                      company="", role="", req_id="", latex_enabled=True, workdir_root=None,
+                      reason="550 no such user"):
+    workdir_root = workdir_root or (tmp_path / "workdir")
+    attachment = make_attachment(tmp_path, name=f"orig-{recipient.replace('@', '-')}.pdf")
+    stage_recipient(
+        conn, campaign=campaign, recipient=recipient, persona=persona, cadence=[2, 3, 5],
+        subject="Hi {{company}}", body="Body text", stage_bodies=["s1", "s2", "s3"],
+        attachment_path=attachment, attachment_name="Resume.pdf", latex_enabled=latex_enabled,
+        company=company, role=role, req_id=req_id, workdir_root=workdir_root,
+    )
+    append_event(conn, type="sent", recipient=recipient, campaign=campaign, stage=0, gmass_campaign_id="1")
+    append_event(conn, type="bounce", recipient=recipient, campaign=campaign,
+                 meta={"bounce_reason": reason, "bounce_time": "t1", "category": "bounce"})
+    return workdir_root
+
+
+def test_resend_bounced_stages_new_recipient_with_recovered_content(tmp_path):
+    conn = connect(tmp_path / "test.db")
+    workdir_root = _stage_and_bounce(conn, tmp_path, recipient="jane@acme.com", company="Acme", role="SWE")
+
+    workdir = resend_bounced(conn, original_recipient="jane@acme.com",
+                              corrected_email="jane.doe@acme.com", workdir_root=workdir_root)
+
+    manifest = load_manifest(workdir)
+    assert manifest["subject"] == "Hi {{company}}"
+    assert manifest["body"] == "Body text"
+    assert manifest["cadence"] == [2, 3, 5]
+    assert manifest["persona"] == "recruiter"
+
+    events = [dict(r) for r in conn.execute(
+        "SELECT * FROM events WHERE recipient = ? AND type = 'queued'", ("jane.doe@acme.com",)
+    )]
+    assert len(events) == 1
+    meta = json.loads(events[0]["meta"])
+    assert meta == {"persona": "recruiter", "company": "Acme", "role": "SWE", "req_id": "",
+                     "corrected_from": "jane@acme.com"}
+
+    row = conn.execute("SELECT * FROM recipients WHERE recipient = ?", ("jane.doe@acme.com",)).fetchone()
+    assert row["status"] == "active"  # always restarts fresh, never inherits the bounced one's state
+
+    # The original bounced row is untouched -- a new recipient, not a mutation.
+    original = conn.execute("SELECT * FROM recipients WHERE recipient = ?", ("jane@acme.com",)).fetchone()
+    assert original["status"] == "bounced"
+
+
+def test_resend_bounced_raises_for_unknown_recipient(tmp_path):
+    conn = connect(tmp_path / "test.db")
+    with pytest.raises(QueueError, match="not a known recipient"):
+        resend_bounced(conn, original_recipient="ghost@x.com", corrected_email="new@x.com",
+                        workdir_root=tmp_path / "workdir")
+
+
+def test_resend_bounced_raises_when_recipient_is_not_bounced(tmp_path):
+    conn = connect(tmp_path / "test.db")
+    workdir_root = tmp_path / "workdir"
+    attachment = make_attachment(tmp_path)
+    stage_recipient(
+        conn, campaign="c", recipient="jane@acme.com", persona="recruiter", cadence=[2, 3, 5],
+        subject="Hi", body="Body", stage_bodies=["s1", "s2", "s3"],
+        attachment_path=attachment, attachment_name="Resume.pdf", latex_enabled=True,
+        workdir_root=workdir_root,
+    )
+    with pytest.raises(QueueError, match="not bounced"):
+        resend_bounced(conn, original_recipient="jane@acme.com", corrected_email="jane2@acme.com",
+                        workdir_root=workdir_root)
+
+
+def test_resend_bounced_static_campaign_reuses_shared_attachment_source(tmp_path):
+    conn = connect(tmp_path / "test.db")
+    shared_pdf = tmp_path / "shared_resume.pdf"
+    shared_pdf.write_bytes(b"%PDF-shared")
+    workdir_root = tmp_path / "workdir"
+    stage_recipient(
+        conn, campaign="c", recipient="jane@acme.com", persona="recruiter", cadence=[2, 3, 5],
+        subject="Hi", body="Body", stage_bodies=["s1", "s2", "s3"],
+        attachment_path=shared_pdf, attachment_name="Resume.pdf", latex_enabled=False,
+        workdir_root=workdir_root,
+    )
+    append_event(conn, type="sent", recipient="jane@acme.com", campaign="c", stage=0, gmass_campaign_id="1")
+    append_event(conn, type="bounce", recipient="jane@acme.com", campaign="c",
+                 meta={"bounce_reason": "mailbox full", "bounce_time": "t1", "category": "bounce"})
+
+    workdir = resend_bounced(conn, original_recipient="jane@acme.com",
+                              corrected_email="jane2@acme.com", workdir_root=workdir_root)
+    manifest = load_manifest(workdir)
+    assert manifest["attachment_source"] == str(shared_pdf.resolve())
+    assert not (workdir / "Resume.pdf").exists()  # never duplicated per-recipient
+
+
+def test_resend_bounced_raises_when_pdf_missing_and_archive_match_not_yet_chosen(tmp_path):
+    # A match existing is NOT enough to auto-reuse it, even when there's
+    # only one -- same "never auto-pick, always a real confirmed choice"
+    # rule the original résumé-reuse feature (_offer_resume_reuse) already
+    # follows. Without an explicit archive_choice, this must fail loud
+    # rather than silently guessing.
+    conn = connect(tmp_path / "test.db")
+    workdir_root = _stage_and_bounce(conn, tmp_path, recipient="jane@acme.com", company="Acme", role="SWE")
+    original_workdir = workdir_root / "c" / "jane@acme.com"
+    (original_workdir / "Resume.pdf").unlink()  # simulate slap.cleanup having reclaimed it
+
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    archived_pdf = tmp_path / "archived.pdf"
+    _write_valid_pdf(archived_pdf)
+    (archive_dir / "acme-swe-2026-01-01.pdf").symlink_to(archived_pdf)
+
+    with pytest.raises(QueueError, match="none chosen"):
+        resend_bounced(conn, original_recipient="jane@acme.com", corrected_email="jane2@acme.com",
+                        archive_dir=archive_dir, workdir_root=workdir_root)
+
+
+def test_resend_bounced_reuses_an_explicitly_chosen_archive_entry(tmp_path):
+    conn = connect(tmp_path / "test.db")
+    workdir_root = _stage_and_bounce(conn, tmp_path, recipient="jane@acme.com", company="Acme", role="SWE")
+    original_workdir = workdir_root / "c" / "jane@acme.com"
+    (original_workdir / "Resume.pdf").unlink()  # simulate slap.cleanup having reclaimed it
+
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    archived_pdf = tmp_path / "archived.pdf"
+    _write_valid_pdf(archived_pdf)
+    entry = archive_dir / "acme-swe-2026-01-01.pdf"
+    entry.symlink_to(archived_pdf)
+
+    workdir = resend_bounced(conn, original_recipient="jane@acme.com", corrected_email="jane2@acme.com",
+                              archive_dir=archive_dir, archive_choice=entry, workdir_root=workdir_root)
+    assert (workdir / "Resume.pdf").exists()
+    assert (workdir / "Resume.pdf").read_bytes() == archived_pdf.read_bytes()
+
+
+def test_resend_bounced_raises_queue_error_when_chosen_archive_entry_is_broken(tmp_path):
+    conn = connect(tmp_path / "test.db")
+    workdir_root = _stage_and_bounce(conn, tmp_path, recipient="jane@acme.com", company="Acme", role="SWE")
+    original_workdir = workdir_root / "c" / "jane@acme.com"
+    (original_workdir / "Resume.pdf").unlink()
+
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    gone = tmp_path / "gone.pdf"
+    gone.write_bytes(b"%PDF-fake")
+    entry = archive_dir / "acme-swe-2026-01-01.pdf"
+    entry.symlink_to(gone)
+    gone.unlink()  # dangling target
+
+    with pytest.raises(QueueError, match="could not reuse"):
+        resend_bounced(conn, original_recipient="jane@acme.com", corrected_email="jane2@acme.com",
+                        archive_dir=archive_dir, archive_choice=entry, workdir_root=workdir_root)
+
+
+def test_resend_bounced_raises_when_pdf_missing_and_no_archive_match(tmp_path):
+    conn = connect(tmp_path / "test.db")
+    workdir_root = _stage_and_bounce(conn, tmp_path, recipient="jane@acme.com", company="Acme", role="SWE")
+    original_workdir = workdir_root / "c" / "jane@acme.com"
+    (original_workdir / "Resume.pdf").unlink()
+
+    with pytest.raises(QueueError, match="re-paste the LaTeX source"):
+        resend_bounced(conn, original_recipient="jane@acme.com", corrected_email="jane2@acme.com",
+                        workdir_root=workdir_root)
 
 
 def test_due_recipients_empty_when_nothing_queued(tmp_path):

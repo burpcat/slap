@@ -16,12 +16,14 @@ import pytest
 from werkzeug.serving import make_server
 
 from slap.config import GlobalConfig, ScheduleConfig
-from slap import gmass_cache
+from slap import gmass_cache, ui_state
+from slap.queue import stage_recipient
 from slap.dashboard import (
-    _clicked_recipients, _recipient_drop_meta, actionable_replies, bounces, companies_contacted,
-    compute_gmass_dependent_data, create_app, engagement_intelligence, filter_reachouts,
-    get_gmass_dependent_data, needs_triage, next_drain, pipeline, reachouts_rows, reply_tags,
-    sync_reports, tag_reply, template_failures, this_week, today_strip, todays_runs, warm_but_silent,
+    _click_details, _clicked_recipients, _recipient_drop_meta, actionable_replies, bounces,
+    companies_contacted, compute_gmass_dependent_data, create_app, engagement_intelligence,
+    filter_reachouts, get_gmass_dependent_data, needs_triage, next_drain, pipeline, reachouts_rows,
+    reply_tags, sync_reports, tag_reply, template_failures, this_week, today_strip, todays_runs,
+    visible_warm_but_silent, warm_but_silent,
 )
 from slap.reload import ReloadFailure, write_failures
 from slap.tracking import append_event, connect
@@ -827,8 +829,36 @@ def test_tag_reply_real_writes_reply_reviewed(conn):
 def test_tag_reply_not_interested_writes_reply_reviewed(conn):
     append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
     append_event(conn, type="reply", recipient="a@x.com", campaign="c")
-    tag_reply(conn, "a@x.com", "not_interested")
+    tag_reply(conn, "a@x.com", "not_interested", api_key="fake-key", unsubscribe_fn=_fake_unsubscribe)
+    events = [dict(r) for r in conn.execute("SELECT * FROM events WHERE type = 'reply_reviewed'")]
+    assert len(events) == 1
     assert needs_triage(conn) == []
+
+
+def test_tag_reply_not_interested_calls_unsubscribe_same_as_ooo(conn):
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
+    captured = {}
+
+    def capturing_unsubscribe(api_key, email):
+        captured["api_key"] = api_key
+        captured["email"] = email
+        return _fake_unsubscribe(api_key, email)
+
+    tag_reply(conn, "a@x.com", "not_interested", api_key="the-real-key", unsubscribe_fn=capturing_unsubscribe)
+    assert captured == {"api_key": "the-real-key", "email": "a@x.com"}
+
+
+def test_tag_reply_not_interested_calls_unsubscribe_before_recording_anything_locally(conn):
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
+
+    def failing_unsubscribe(api_key, email):
+        raise RuntimeError("simulated GMass failure")
+
+    with pytest.raises(RuntimeError, match="simulated GMass failure"):
+        tag_reply(conn, "a@x.com", "not_interested", api_key="fake-key", unsubscribe_fn=failing_unsubscribe)
+    assert conn.execute("SELECT * FROM events WHERE type = 'reply_reviewed'").fetchone() is None
 
 
 def test_tag_reply_rejects_unknown_tag(conn):
@@ -997,6 +1027,34 @@ def test_warm_but_silent_never_includes_a_literal_none_stage(conn):
 
 def test_warm_but_silent_empty_when_no_clicks(conn):
     assert warm_but_silent(conn) == []
+
+
+def test_warm_but_silent_includes_click_url_detail(conn):
+    append_event(conn, type="click", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"url": "https://acme.com/careers", "click_time": "2026-07-03T00:00:00"})
+    append_event(conn, type="click", recipient="a@x.com", campaign="c", stage=1,
+                 meta={"url": "https://linkedin.com/in/x", "click_time": "2026-07-10T00:00:00"})
+    result = warm_but_silent(conn)
+    assert len(result) == 1
+    assert result[0]["clicks"] == [
+        {"url": "https://acme.com/careers", "stage": 0, "click_time": "2026-07-03T00:00:00"},
+        {"url": "https://linkedin.com/in/x", "stage": 1, "click_time": "2026-07-10T00:00:00"},
+    ]
+
+
+def test_warm_but_silent_clicks_empty_when_no_url_meta(conn):
+    append_event(conn, type="click", recipient="a@x.com", campaign="c", stage=0)
+    result = warm_but_silent(conn)
+    assert result[0]["clicks"] == []
+
+
+def test_click_details_dedupes_by_url_keeping_earliest_time(conn):
+    append_event(conn, type="click", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"url": "https://acme.com", "click_time": "2026-07-05T00:00:00"})
+    append_event(conn, type="click", recipient="a@x.com", campaign="c", stage=1,
+                 meta={"url": "https://acme.com", "click_time": "2026-07-01T00:00:00"})
+    result = _click_details(conn)
+    assert result["a@x.com"] == [{"url": "https://acme.com", "stage": 1, "click_time": "2026-07-01T00:00:00"}]
 
 
 def test_bounces_lists_bounced_recipients(conn):
@@ -1230,6 +1288,140 @@ def test_create_app_index_stale_cache_triggers_refresh(app, tmp_path):
     assert gmass_cache.read_cache(app.redis_client) is not None  # cache now populated
 
 
+def test_create_app_index_renders_click_urls_in_warm_but_silent(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    seed_sent_recipient(conn)
+    conn.close()
+    with patch("slap.dashboard.gmass.get_reports") as mock_get:
+        def side_effect(api_key, cid, report_type):
+            if report_type == "clicks":
+                return [{"emailAddress": "jane@acme.com", "url": "https://acme.com/careers", "clickTime": "t1"}]
+            return []
+        mock_get.side_effect = side_effect
+        client = app.test_client()
+        client.get("/")  # first load: no cache yet, renders empty while the (synchronous-in-test) refresh runs
+        resp = client.get("/")  # second load: reads the now-fresh cache directly
+    assert resp.status_code == 200
+    assert b"https://acme.com/careers" in resp.data
+
+
+def test_create_app_hide_warm_but_silent_removes_it_from_the_default_view(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    seed_sent_recipient(conn)
+    conn.close()
+
+    with patch("slap.dashboard.gmass.get_reports") as mock_get:
+        mock_get.side_effect = lambda api_key, cid, rt: (
+            [{"emailAddress": "jane@acme.com", "url": "https://acme.com/careers",
+              "clickTime": "2026-07-03T00:00:00+00:00"}]
+            if rt == "clicks" else []
+        )
+        client = app.test_client()
+        client.get("/")  # first load: no cache yet, renders empty while the (synchronous-in-test) refresh runs
+        resp = client.get("/")  # second load: reads the now-fresh cache directly
+        assert b"jane@acme.com" in resp.data
+
+        hide_resp = client.post("/warm-but-silent/jane@acme.com/hide")
+        assert hide_resp.status_code == 302
+
+        resp2 = client.get("/")
+    assert b"jane@acme.com" not in resp2.data
+    assert b"show hidden (1)" in resp2.data
+
+
+def test_create_app_hide_warm_but_silent_still_visible_with_show_hidden_param(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    seed_sent_recipient(conn)
+    conn.close()
+
+    with patch("slap.dashboard.gmass.get_reports") as mock_get:
+        mock_get.side_effect = lambda api_key, cid, rt: (
+            [{"emailAddress": "jane@acme.com", "url": "https://acme.com/careers",
+              "clickTime": "2026-07-03T00:00:00+00:00"}]
+            if rt == "clicks" else []
+        )
+        client = app.test_client()
+        client.get("/")
+        client.post("/warm-but-silent/jane@acme.com/hide")
+        resp = client.get("/?show_hidden=1")
+    assert resp.status_code == 200
+    assert b"jane@acme.com" in resp.data
+    assert b"/warm-but-silent/jane@acme.com/unhide" in resp.data
+
+
+def test_create_app_unhide_warm_but_silent_restores_default_view(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    seed_sent_recipient(conn)
+    conn.close()
+
+    with patch("slap.dashboard.gmass.get_reports") as mock_get:
+        mock_get.side_effect = lambda api_key, cid, rt: (
+            [{"emailAddress": "jane@acme.com", "url": "https://acme.com/careers", "clickTime": "t1"}]
+            if rt == "clicks" else []
+        )
+        client = app.test_client()
+        client.get("/")
+        client.post("/warm-but-silent/jane@acme.com/hide")
+        unhide_resp = client.post("/warm-but-silent/jane@acme.com/unhide")
+        assert unhide_resp.status_code == 302
+        resp = client.get("/")
+    assert b"jane@acme.com" in resp.data
+    assert b"show hidden" not in resp.data
+
+
+def test_visible_warm_but_silent_excludes_hidden_recipient(tmp_path):
+    conn = connect(tmp_path / "test.db")
+    ui_state.hide(conn, "a@x.com", "warm_but_silent")
+    rows = [{"recipient": "a@x.com"}, {"recipient": "b@x.com"}]
+    assert [r["recipient"] for r in visible_warm_but_silent(conn, rows)] == ["b@x.com"]
+
+
+def test_visible_warm_but_silent_auto_resurfaces_on_newer_click(tmp_path):
+    # _warm_but_silent_hidden_recipients() reads click timing LIVE from
+    # `conn` (the click event's own `timestamp` column), not from the `rows`
+    # argument's own `clicks` field -- deliberately: `rows` may be up to an
+    # hour stale (served from the Redis cache), but a fresh click that
+    # landed AFTER the hide action must resurface the row immediately, not
+    # wait for the next cache refresh.
+    conn = connect(tmp_path / "test.db")
+    ui_state.hide(conn, "a@x.com", "warm_but_silent", when=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    append_event(conn, type="click", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"url": "https://x.com", "click_time": "2026-07-01T00:00:00+00:00"},
+                 timestamp=datetime(2026, 7, 1, tzinfo=timezone.utc))
+    rows = [{"recipient": "a@x.com"}]
+    assert [r["recipient"] for r in visible_warm_but_silent(conn, rows)] == ["a@x.com"]
+
+
+def test_visible_warm_but_silent_stays_hidden_without_a_newer_click(tmp_path):
+    conn = connect(tmp_path / "test.db")
+    ui_state.hide(conn, "a@x.com", "warm_but_silent", when=datetime(2026, 7, 1, tzinfo=timezone.utc))
+    append_event(conn, type="click", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"url": "https://x.com", "click_time": "2026-01-01T00:00:00+00:00"},
+                 timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    rows = [{"recipient": "a@x.com"}]
+    assert visible_warm_but_silent(conn, rows) == []
+
+
+def test_visible_warm_but_silent_resurfaces_on_a_repeat_click_of_the_same_url(tmp_path):
+    # The bug the auditor caught: _click_details() dedupes by url, keeping
+    # only the EARLIEST click_time per url -- using that for the resurface
+    # check would silently discard a RE-click of a url the recipient already
+    # clicked before hiding, and the row would never resurface. The fix
+    # reads events.timestamp directly (no url-dedup) so a repeat click still
+    # counts.
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="click", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"url": "https://x.com", "click_time": "2026-01-01T00:00:00+00:00"},
+                 timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    ui_state.hide(conn, "a@x.com", "warm_but_silent", when=datetime(2026, 3, 1, tzinfo=timezone.utc))
+    # A second click on the SAME url, after the hide.
+    append_event(conn, type="click", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"url": "https://x.com", "click_time": "2026-01-01T00:00:00+00:00"},
+                 timestamp=datetime(2026, 7, 1, tzinfo=timezone.utc))
+    rows = [{"recipient": "a@x.com"}]
+    assert [r["recipient"] for r in visible_warm_but_silent(conn, rows)] == ["a@x.com"]
+
+
 def test_create_app_index_redis_unavailable_shows_indicator(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     db_path = tmp_path / "test.db"
@@ -1399,6 +1591,41 @@ def test_create_app_reply_tag_ooo_failure_returns_502_and_records_nothing(app, t
 
     conn2 = connect(tmp_path / "test.db")
     assert conn2.execute("SELECT * FROM events WHERE type = 'ooo_tagged'").fetchone() is None
+
+
+def test_create_app_reply_tag_not_interested_calls_unsubscribe_and_redirects(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="queued", recipient="carol@x.com", campaign="c", stage=0,
+                 meta={"persona": "founder"})
+    append_event(conn, type="sent", recipient="carol@x.com", campaign="c", stage=0, gmass_campaign_id="1")
+    append_event(conn, type="reply", recipient="carol@x.com", campaign="c", stage=0)
+    conn.close()
+
+    with patch("slap.dashboard.gmass.unsubscribe_recipient", return_value=_fake_unsubscribe(None, None)) as mock_unsub:
+        client = app.test_client()
+        resp = client.post("/reply/carol@x.com/tag", data={"tag": "not_interested", "redirect_to": "index"})
+        assert resp.status_code == 302
+        mock_unsub.assert_called_once_with("fake-key", "carol@x.com")
+
+    conn2 = connect(tmp_path / "test.db")
+    events = [dict(r) for r in conn2.execute("SELECT * FROM events WHERE type = 'reply_reviewed'")]
+    assert len(events) == 1
+
+
+def test_create_app_reply_tag_not_interested_failure_returns_502_and_records_nothing(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="queued", recipient="carol@x.com", campaign="c", stage=0,
+                 meta={"persona": "founder"})
+    append_event(conn, type="reply", recipient="carol@x.com", campaign="c", stage=0)
+    conn.close()
+
+    with patch("slap.dashboard.gmass.unsubscribe_recipient", side_effect=RuntimeError("network down")):
+        client = app.test_client()
+        resp = client.post("/reply/carol@x.com/tag", data={"tag": "not_interested"})
+        assert resp.status_code == 502
+
+    conn2 = connect(tmp_path / "test.db")
+    assert conn2.execute("SELECT * FROM events WHERE type = 'reply_reviewed'").fetchone() is None
 
 
 def test_create_app_mark_ooo_from_reachouts_row_with_no_reply_redirects_to_reachouts(app, tmp_path):
@@ -1704,6 +1931,96 @@ def test_reachouts_rows_engagement_replied_beats_clicked(conn):
     assert rows["neither@x.com"]["engagement"] == "none"
 
 
+# --- reachouts_rows: status chip (color-coded badge, item 1) ---------------
+
+def test_reachouts_rows_chip_bounced_with_reason(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="bounce", recipient="a@x.com", campaign="c",
+                 meta={"bounce_reason": "550 no such user", "bounce_time": "t1", "category": "bounce"})
+    rows = {r["recipient"]: r for r in reachouts_rows(conn)}
+    assert rows["a@x.com"]["chip"] == {"color": "critical", "label": "Bounced — 550 no such user"}
+    assert rows["a@x.com"]["bounce_category"] == "bounce"
+    assert rows["a@x.com"]["bounce_reason"] == "550 no such user"
+
+
+def test_reachouts_rows_chip_blocked_without_reason(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="bounce", recipient="a@x.com", campaign="c",
+                 meta={"bounce_reason": None, "bounce_time": "t1", "category": "block"})
+    rows = {r["recipient"]: r for r in reachouts_rows(conn)}
+    assert rows["a@x.com"]["chip"] == {"color": "critical", "label": "Blocked"}
+
+
+def test_reachouts_rows_chip_bounced_takes_priority_over_prior_reply(conn):
+    # Structural overlap check (item 1): status and engagement are derived
+    # independently, so a recipient who replied and was LATER (re)sent to and
+    # bounced is both 'bounced' (status) and 'replied' (engagement) at once.
+    # The chip's color must still show bounced (red), not replied (green).
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
+    append_event(conn, type="bounce", recipient="a@x.com", campaign="c",
+                 meta={"bounce_reason": "mailbox full", "bounce_time": "t1", "category": "bounce"})
+    rows = {r["recipient"]: r for r in reachouts_rows(conn)}
+    row = rows["a@x.com"]
+    assert row["status"] == "bounced"
+    assert row["engagement"] == "replied"  # history preserved, just not color-coded
+    assert row["chip"]["color"] == "critical"
+
+
+def test_reachouts_rows_chip_ooo_with_resume_date(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="ooo_tagged", recipient="a@x.com", campaign="c",
+                 meta={"resume_date": "2026-08-01"})
+    rows = {r["recipient"]: r for r in reachouts_rows(conn)}
+    assert rows["a@x.com"]["chip"] == {"color": None, "label": "OOO — resumes 2026-08-01"}
+
+
+def test_reachouts_rows_chip_not_interested(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
+    append_event(conn, type="reply_reviewed", recipient="a@x.com", campaign="c", meta={"tag": "not_interested"})
+    rows = {r["recipient"]: r for r in reachouts_rows(conn)}
+    assert rows["a@x.com"]["chip"] == {"color": None, "label": "Not interested"}
+
+
+def test_reachouts_rows_chip_replied(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
+    rows = {r["recipient"]: r for r in reachouts_rows(conn)}
+    assert rows["a@x.com"]["chip"] == {"color": "good", "label": "Replied"}
+
+
+def test_reachouts_rows_chip_clicked_multiple_distinct_links(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="click", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"url": "https://acme.com/careers", "click_time": "t1"})
+    append_event(conn, type="click", recipient="a@x.com", campaign="c", stage=1,
+                 meta={"url": "https://linkedin.com/in/x", "click_time": "t2"})
+    rows = {r["recipient"]: r for r in reachouts_rows(conn)}
+    assert rows["a@x.com"]["chip"] == {"color": "serious", "label": "Clicked (2)"}
+    assert [c["url"] for c in rows["a@x.com"]["clicks"]] == ["https://acme.com/careers", "https://linkedin.com/in/x"]
+
+
+def test_reachouts_rows_chip_clicked_no_url_meta_still_labeled_clicked(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="click", recipient="a@x.com", campaign="c", stage=0)
+    rows = {r["recipient"]: r for r in reachouts_rows(conn)}
+    assert rows["a@x.com"]["chip"] == {"color": "serious", "label": "Clicked"}
+    assert rows["a@x.com"]["clicks"] == []
+
+
+def test_reachouts_rows_chip_active_done_queued(conn):
+    _stage_and_send(conn, recipient="active@x.com", campaign="c", persona="recruiter")
+    _stage_and_send(conn, recipient="queued@x.com", campaign="c", persona="recruiter", send=False)
+    append_event(conn, type="queued", recipient="done@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
+    append_event(conn, type="sent", recipient="done@x.com", campaign="c", stage=0, gmass_campaign_id="1",
+                 meta={"is_final_stage": True})
+    rows = {r["recipient"]: r for r in reachouts_rows(conn)}
+    assert rows["active@x.com"]["chip"] == {"color": None, "label": "Active"}
+    assert rows["queued@x.com"]["chip"] == {"color": None, "label": "Queued"}
+    assert rows["done@x.com"]["chip"] == {"color": None, "label": "Done"}
+
+
 def test_reachouts_rows_domain_company_and_req_id_present(conn):
     _stage_and_send(conn, recipient="jane@acme.com", campaign="c", persona="recruiter",
                      company="Acme", req_id="REQ-1")
@@ -1715,6 +2032,55 @@ def test_reachouts_rows_domain_company_and_req_id_present(conn):
     assert rows["jane@acme.com"]["req_id_present"] is True
     assert rows["bob@x.com"]["company"] == ""
     assert rows["bob@x.com"]["req_id_present"] is False
+
+
+def test_reachouts_rows_surfaces_corrected_from(conn, tmp_path):
+    from slap.queue import resend_bounced
+
+    workdir_root = tmp_path / "workdir"
+    attachment = tmp_path / "attach.pdf"
+    attachment.write_bytes(b"%PDF-fake")
+    stage_recipient(
+        conn, campaign="c", recipient="jane@acme.com", persona="recruiter", cadence=[2, 3, 5],
+        subject="Hi", body="Body", stage_bodies=["s1", "s2", "s3"], attachment_path=attachment,
+        attachment_name="Resume.pdf", latex_enabled=True, company="Acme", workdir_root=workdir_root,
+    )
+    append_event(conn, type="sent", recipient="jane@acme.com", campaign="c", stage=0, gmass_campaign_id="1")
+    append_event(conn, type="bounce", recipient="jane@acme.com", campaign="c",
+                 meta={"bounce_reason": "550 no such user", "bounce_time": "t1", "category": "bounce"})
+
+    resend_bounced(conn, original_recipient="jane@acme.com", corrected_email="jane.doe@acme.com",
+                    workdir_root=workdir_root)
+
+    rows = {r["recipient"]: r for r in reachouts_rows(conn)}
+    assert rows["jane.doe@acme.com"]["corrected_from"] == "jane@acme.com"
+    assert rows["jane@acme.com"]["corrected_from"] is None
+
+
+def test_reachouts_rows_surfaces_already_corrected_to(conn, tmp_path):
+    # The bounced row's own detail must show it was already resent -- an
+    # iron-audit SHOULD-FIX so the owner isn't offered "Resend" again with
+    # no memory a correction already happened.
+    from slap.queue import resend_bounced
+
+    workdir_root = tmp_path / "workdir"
+    attachment = tmp_path / "attach.pdf"
+    attachment.write_bytes(b"%PDF-fake")
+    stage_recipient(
+        conn, campaign="c", recipient="jane@acme.com", persona="recruiter", cadence=[2, 3, 5],
+        subject="Hi", body="Body", stage_bodies=["s1", "s2", "s3"], attachment_path=attachment,
+        attachment_name="Resume.pdf", latex_enabled=True, company="Acme", workdir_root=workdir_root,
+    )
+    append_event(conn, type="sent", recipient="jane@acme.com", campaign="c", stage=0, gmass_campaign_id="1")
+    append_event(conn, type="bounce", recipient="jane@acme.com", campaign="c",
+                 meta={"bounce_reason": "550 no such user", "bounce_time": "t1", "category": "bounce"})
+
+    resend_bounced(conn, original_recipient="jane@acme.com", corrected_email="jane.doe@acme.com",
+                    workdir_root=workdir_root)
+
+    rows = {r["recipient"]: r for r in reachouts_rows(conn)}
+    assert rows["jane@acme.com"]["already_corrected_to"] == [{"recipient": "jane.doe@acme.com", "status": "active"}]
+    assert rows["jane.doe@acme.com"]["already_corrected_to"] == []
 
 
 def test_reachouts_rows_date_falls_back_to_last_event_at_when_never_sent(conn):
@@ -2027,6 +2393,194 @@ def test_create_app_reachouts_renders_ooo_status_and_resume_date(app, tmp_path):
     assert resp.status_code == 200
     assert b"ooo_requeued" in resp.data
     assert b"2026-08-15" in resp.data
+
+
+def test_create_app_reachouts_renders_status_chip_for_bounced_recipient(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    _stage_and_send(conn, recipient="jane@acme.com", campaign="c", persona="founder")
+    append_event(conn, type="bounce", recipient="jane@acme.com", campaign="c",
+                 meta={"bounce_reason": "550 no such user", "bounce_time": "t1", "category": "bounce"})
+    conn.close()
+
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+        client = app.test_client()
+        resp = client.get("/reachouts")
+    assert resp.status_code == 200
+    assert b"chip-critical" in resp.data
+    assert b"Bounced \xe2\x80\x94 550 no such user" in resp.data
+
+
+def test_create_app_reachouts_renders_expand_toggle_only_when_there_is_detail(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    _stage_and_send(conn, recipient="clicked@acme.com", campaign="c", persona="founder")
+    append_event(conn, type="click", recipient="clicked@acme.com", campaign="c", stage=0,
+                 meta={"url": "https://acme.com/careers", "click_time": "2026-07-03T00:00:00+00:00"})
+    _stage_and_send(conn, recipient="plain@acme.com", campaign="c", persona="founder")
+    conn.close()
+
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+        client = app.test_client()
+        resp = client.get("/reachouts")
+    body = resp.data.decode()
+    assert resp.status_code == 200
+    clicked_row = body[body.index('data-recipient="clicked@acme.com"'):body.index('data-recipient="plain@acme.com"')]
+    plain_row = body[body.index('data-recipient="plain@acme.com"'):]
+    assert "expand-toggle" in clicked_row
+    assert "https://acme.com/careers" in clicked_row
+    assert "expand-toggle" not in plain_row.split("</table>")[0]
+
+
+def test_create_app_reachouts_renders_already_corrected_to(app, tmp_path):
+    from slap.queue import resend_bounced
+
+    conn = connect(tmp_path / "test.db")
+    workdir_root = tmp_path / "workdir"
+    attachment = tmp_path / "attach.pdf"
+    attachment.write_bytes(b"%PDF-fake")
+    stage_recipient(
+        conn, campaign="c", recipient="jane@acme.com", persona="recruiter", cadence=[2, 3, 5],
+        subject="Hi", body="Body", stage_bodies=["s1", "s2", "s3"], attachment_path=attachment,
+        attachment_name="Resume.pdf", latex_enabled=True, company="Acme", workdir_root=workdir_root,
+    )
+    append_event(conn, type="sent", recipient="jane@acme.com", campaign="c", stage=0, gmass_campaign_id="1")
+    append_event(conn, type="bounce", recipient="jane@acme.com", campaign="c",
+                 meta={"bounce_reason": "550 no such user", "bounce_time": "t1", "category": "bounce"})
+    resend_bounced(conn, original_recipient="jane@acme.com", corrected_email="jane.doe@acme.com",
+                    workdir_root=workdir_root)
+    conn.close()
+
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+        client = app.test_client()
+        resp = client.get("/reachouts")
+    assert resp.status_code == 200
+    body = resp.data.decode()
+    assert "already corrected to" in body
+    assert "jane.doe@acme.com" in body
+    # The resend form must still be offered on the bounced row -- informational,
+    # never blocking, since a corrected address can itself bounce again.
+    jane_row = body[body.index('data-recipient="jane@acme.com"'):body.index('data-recipient="jane.doe@acme.com"')]
+    assert "/reachouts/jane@acme.com/resend" in jane_row
+
+
+def test_create_app_reachouts_ooo_row_has_fade_css_hook(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="queued", recipient="cold@company.com", campaign="c", stage=0,
+                 meta={"persona": "founder"})
+    append_event(conn, type="sent", recipient="cold@company.com", campaign="c", stage=0, gmass_campaign_id="1")
+    conn.close()
+
+    with patch("slap.dashboard.gmass.unsubscribe_recipient", return_value=_fake_unsubscribe(None, None)):
+        client = app.test_client()
+        client.post("/reply/cold@company.com/tag",
+                     data={"tag": "ooo", "resume_date": "2026-08-15", "redirect_to": "reachouts"})
+        with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+            resp = client.get("/reachouts")
+    assert resp.status_code == 200
+    assert b'data-status="ooo_requeued"' in resp.data
+    assert b'[data-status="ooo_requeued"] { opacity: 0.55; }' in resp.data
+
+
+def test_create_app_reachouts_triage_buttons_only_on_replied_rows(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    _stage_and_send(conn, recipient="replied@acme.com", campaign="c", persona="founder")
+    append_event(conn, type="reply", recipient="replied@acme.com", campaign="c")
+    _stage_and_send(conn, recipient="silent@acme.com", campaign="c", persona="founder")
+    conn.close()
+
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+        client = app.test_client()
+        resp = client.get("/reachouts")
+
+    assert resp.status_code == 200
+    body = resp.data.decode()
+    replied_row = body[body.index('data-recipient="replied@acme.com"'):body.index('data-recipient="silent@acme.com"')]
+    silent_row = body[body.index('data-recipient="silent@acme.com"'):]
+    assert 'value="real"' in replied_row
+    assert 'value="not_interested"' in replied_row
+    assert 'value="real"' not in silent_row
+    assert 'value="not_interested"' not in silent_row
+
+
+def test_create_app_reachouts_not_interested_action_calls_unsubscribe(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    _stage_and_send(conn, recipient="replied@acme.com", campaign="c", persona="founder")
+    append_event(conn, type="reply", recipient="replied@acme.com", campaign="c")
+    conn.close()
+
+    with patch("slap.dashboard.gmass.unsubscribe_recipient", return_value=_fake_unsubscribe(None, None)) as mock_unsub:
+        client = app.test_client()
+        resp = client.post("/reply/replied@acme.com/tag",
+                            data={"tag": "not_interested", "redirect_to": "reachouts"})
+        assert resp.status_code == 302
+        assert resp.headers["Location"] == "/reachouts"
+        mock_unsub.assert_called_once_with("fake-key", "replied@acme.com")
+
+
+def _stage_and_bounce(conn, tmp_path, *, recipient, campaign="c", company=""):
+    attachment = tmp_path / f"{recipient.replace('@', '-')}.pdf"
+    attachment.write_bytes(b"%PDF-fake")
+    stage_recipient(
+        conn, campaign=campaign, recipient=recipient, persona="recruiter", cadence=[2, 3, 5],
+        subject="Hi", body="Body", stage_bodies=["s1", "s2", "s3"],
+        attachment_path=attachment, attachment_name="Resume.pdf", latex_enabled=True, company=company,
+    )
+    append_event(conn, type="sent", recipient=recipient, campaign=campaign, stage=0, gmass_campaign_id="1")
+    append_event(conn, type="bounce", recipient=recipient, campaign=campaign,
+                 meta={"bounce_reason": "550 no such user", "bounce_time": "t1", "category": "bounce"})
+
+
+def test_create_app_resend_route_stages_new_recipient_and_redirects(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    _stage_and_bounce(conn, tmp_path, recipient="jane@acme.com", company="Acme")
+    conn.close()
+
+    # A different domain than the bounced original -- the "no dedup warning"
+    # path; correcting a typo at the SAME domain is covered separately below
+    # (the bounced original itself always counts as "another contact on this
+    # domain", so a same-domain correction always soft-warns -- expected).
+    client = app.test_client()
+    resp = client.post("/reachouts/jane@acme.com/resend", data={"corrected_email": "jane@othercorp.com"})
+    assert resp.status_code == 302
+    assert resp.headers["Location"] == "/reachouts"
+
+    conn2 = connect(tmp_path / "test.db")
+    row = conn2.execute("SELECT * FROM recipients WHERE recipient = ?", ("jane@othercorp.com",)).fetchone()
+    assert row is not None
+    assert row["status"] == "active"
+
+
+def test_create_app_resend_route_requires_corrected_email(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    _stage_and_bounce(conn, tmp_path, recipient="jane@acme.com")
+    conn.close()
+
+    client = app.test_client()
+    resp = client.post("/reachouts/jane@acme.com/resend", data={})
+    assert resp.status_code == 400
+
+
+def test_create_app_resend_route_errors_when_not_bounced(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    _stage_and_send(conn, recipient="jane@acme.com", campaign="c", persona="recruiter")
+    conn.close()
+
+    client = app.test_client()
+    resp = client.post("/reachouts/jane@acme.com/resend", data={"corrected_email": "jane2@acme.com"})
+    assert resp.status_code == 400
+
+
+def test_create_app_resend_route_shows_warning_on_dedup_hit(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    _stage_and_bounce(conn, tmp_path, recipient="jane@acme.com", company="Acme")
+    # jane2@acme.com is already a known contact -- the hard-warn case.
+    _stage_and_send(conn, recipient="jane2@acme.com", campaign="c", persona="recruiter")
+    conn.close()
+
+    client = app.test_client()
+    resp = client.post("/reachouts/jane@acme.com/resend", data={"corrected_email": "jane2@acme.com"},
+                        follow_redirects=True)
+    assert resp.status_code == 200
+    assert b"already contacted" in resp.data
 
 
 def test_create_app_reachouts_never_calls_gmass(app, tmp_path):
