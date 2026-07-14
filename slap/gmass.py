@@ -72,6 +72,24 @@ REPORT_TYPES = {"replies", "clicks", "bounces", "opens", "recipients", "unsubscr
 # GMass's per-stage field names use English ordinal words, not digits.
 _ORDINALS = ["One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight"]
 
+# campaignSettings.allowedDays's live-verified accepted format — full day
+# names, case-insensitive, comma-separated. NOT what the live swagger spec's
+# own field description claims ("comma separated string where 1=Saturday,
+# 2=Sunday, 3=Monday, and so on"): every integer 0-20 (plain and zero-padded)
+# was rejected live with HTTP 400 "Invalid day of the week: {n}"; every full
+# day name (any case) was accepted with HTTP 200. Abbreviations ("Mon",
+# "Su", single letters) were also rejected — only the full name works.
+# Confirmed via a live sweep (probes/findings/full_sweep_allowed_days_result.json),
+# not trusted from the docs.
+_GMASS_DAY_NAME = {
+    "mon": "Monday", "tue": "Tuesday", "wed": "Wednesday", "thu": "Thursday",
+    "fri": "Friday", "sat": "Saturday", "sun": "Sunday",
+}
+
+
+def _allowed_days_value(days: list) -> str:
+    return ",".join(_GMASS_DAY_NAME[d] for d in days)
+
 _URL_RE = re.compile(r'https?://[^\s<>"]+')
 
 
@@ -241,7 +259,8 @@ def get_reports(api_key: str, campaign_id, report_type: str) -> list:
 
 def build_campaign_settings(cadence: list, stage_bodies: list, *, open_tracking: bool = False,
                              click_tracking: bool = True, create_drafts: bool = False,
-                             stop_action: str = "r") -> dict:
+                             stop_action: str = "r", allowed_days: list = None,
+                             skip_holidays: bool = None) -> dict:
     """Build the flat send_campaign() body for an initial send: one
     stageNDays/stageNCampaignText/stageNAction triple per persona cadence
     stage, using GMass's English-ordinal field names. Does not cover the OOO
@@ -254,7 +273,34 @@ def build_campaign_settings(cadence: list, stage_bodies: list, *, open_tracking:
     into `stageNCampaignText` fields on THIS call, sent exactly once at
     initial send (`slap.runner._send_one`) — there is no second call anyone
     could make later to update stage 2/3's text after the fact. Confirmed
-    against this function before `template-reload` was built, not assumed."""
+    against this function before `template-reload` was built, not assumed.
+
+    `allowed_days`/`skip_holidays` are OPTIONAL and additive: `allowed_days`
+    omitted (`None`, the default) sends no `allowedDays` field at all —
+    byte-for-byte the pre-existing request body. `skipWeekends` is
+    deliberately never sent by this function: `allowedDays` is a strict
+    superset (omitting sat/sun already encodes "skip weekends," plus
+    arbitrary other exclusions), and the API gives no documented precedence
+    rule for what happens if the two disagree.
+
+    `skip_holidays` is TRI-STATE, not a plain on/off: `None` (the default)
+    omits `skipHolidays` entirely; `True`/`False` sends that literal value.
+    This matters because GMass support has confirmed their server-side
+    default when the field is OMITTED is actually `True` (holidays ARE
+    skipped) — so an owner who explicitly wants holidays NOT skipped needs
+    to be able to send `skipHolidays: false`, which a plain bool defaulting
+    to `False` could never distinguish from "not configured at all."
+
+    GMass support has also confirmed (2026-07-13, in response to this
+    exact question) that `allowedDays` reschedules AUTO FOLLOW-UP STAGES,
+    not just the initial send: a follow-up that would otherwise land on a
+    disallowed day gets pushed to the next allowed day/time. This was the
+    one open question this whole feature depended on — no longer a
+    documented-but-unverified blog claim.
+
+    Like every other field this function sets, `allowed_days`/
+    `skip_holidays` are locked in permanently at THIS call — see this
+    function's own docstring above about template-reload for why."""
     if len(cadence) != len(stage_bodies):
         raise GMassError(
             f"cadence has {len(cadence)} stage(s) but {len(stage_bodies)} stage bodies given"
@@ -272,6 +318,10 @@ def build_campaign_settings(cadence: list, stage_bodies: list, *, open_tracking:
         settings[f"stage{ordinal}Days"] = days
         settings[f"stage{ordinal}CampaignText"] = body
         settings[f"stage{ordinal}Action"] = stop_action
+    if allowed_days:
+        settings["allowedDays"] = _allowed_days_value(allowed_days)
+    if skip_holidays is not None:
+        settings["skipHolidays"] = skip_holidays
     return settings
 
 

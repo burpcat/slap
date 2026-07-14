@@ -53,6 +53,25 @@ def _load_yaml_mapping(path: Path) -> dict:
 VALID_DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
 
+def _validate_day_list(raw_list, ctx: str) -> list:
+    """Shared validation rule for any config key that's a list of lowercase
+    3-letter day abbreviations: non-empty, every entry in VALID_DAYS, no
+    duplicates. Reused by schedule.active_days (required) and
+    gmass.allowed_days (optional) so both enforce the exact same rule
+    rather than two copies that could quietly drift apart."""
+    if not isinstance(raw_list, list) or not raw_list:
+        raise ConfigError(f"{ctx} must be a non-empty list")
+    days = []
+    for d in raw_list:
+        norm = d.lower() if isinstance(d, str) else None
+        if norm not in VALID_DAYS:
+            raise ConfigError(f"{ctx}: {d!r} is not a valid day — use one of {VALID_DAYS}")
+        days.append(norm)
+    if len(set(days)) != len(days):
+        raise ConfigError(f"{ctx} contains duplicate day(s): {raw_list}")
+    return days
+
+
 @dataclass
 class ScheduleConfig:
     fire_window_start: str
@@ -86,6 +105,32 @@ class GlobalConfig:
     # fail-loud enforcement for this key anywhere — an owner who never adds
     # a `redis:` block to config.yaml just gets this sensible local default.
     redis_url: str = "redis://localhost:6379/0"
+    # Deliberately a SEPARATE key from schedule.active_days, not a reuse of
+    # it: active_days answers "when may SLAP's own local runner wake up" — a
+    # low-stakes, reversible, purely local knob (worst case, a drain waits a
+    # day). This answers "which days may GMass fire THIS recipient's
+    # follow-ups" — locked in per-recipient at send time with no retroactive
+    # fix possible (see slap.gmass.build_campaign_settings's docstring: no
+    # code path anywhere ever re-POSTs an already-created campaign's
+    # settings). Conflating the two would mean an edit to the low-stakes
+    # local knob silently starts carrying irreversible, recipient-facing
+    # consequences. None (the default) means "send no allowedDays field at
+    # all" — fully unrestricted, byte-for-byte today's pre-existing
+    # behavior for anyone who never adds this key.
+    gmass_allowed_days: list = None
+    # Independent of gmass_allowed_days, not derived from it: GMass's own
+    # designated-holiday calendar can fall on an otherwise-allowed weekday.
+    # TRI-STATE, not a plain bool: None (the default, key absent from
+    # config.yaml) sends no skipHolidays field at all, inheriting whatever
+    # GMass does server-side when it's omitted — confirmed directly by
+    # GMass support that this default is actually TRUE (holidays ARE
+    # skipped) even with no field sent, surprising enough that an owner who
+    # wants holidays NOT skipped needs to be able to send `skipHolidays:
+    # false` explicitly, not just "not send true" — a plain bool defaulting
+    # to False could never express that distinction (both "unset" and
+    # "explicitly false" would look identical). True/False (explicitly
+    # configured) always sends that literal value.
+    gmass_skip_holidays: bool = None
 
 
 @dataclass
@@ -158,18 +203,7 @@ def load_global_config(path: Path = CONFIG_PATH) -> GlobalConfig:
             raise ConfigError(f"{schedule_ctx}.{key} must be an integer — got {value!r}")
 
     active_days_raw = _require(sched_raw, "active_days", schedule_ctx)
-    if not isinstance(active_days_raw, list) or not active_days_raw:
-        raise ConfigError(f"{schedule_ctx}.active_days must be a non-empty list")
-    active_days = []
-    for d in active_days_raw:
-        norm = d.lower() if isinstance(d, str) else None
-        if norm not in VALID_DAYS:
-            raise ConfigError(
-                f"{schedule_ctx}.active_days: {d!r} is not a valid day — use one of {VALID_DAYS}"
-            )
-        active_days.append(norm)
-    if len(set(active_days)) != len(active_days):
-        raise ConfigError(f"{schedule_ctx}.active_days contains duplicate day(s): {active_days_raw}")
+    active_days = _validate_day_list(active_days_raw, f"{schedule_ctx}.active_days")
 
     schedule = ScheduleConfig(
         fire_window_start=schedule_values["fire_window_start"],
@@ -195,6 +229,20 @@ def load_global_config(path: Path = CONFIG_PATH) -> GlobalConfig:
     if not isinstance(redis_url, str):
         raise ConfigError(f"{path}: redis.url must be a string — got {redis_url!r}")
 
+    # Both optional, unlike gmass.api_key_env above (already _require()'d,
+    # so `gmass` is already guaranteed to be a dict by this point). Absent
+    # entirely -> None/False -> build_campaign_settings() sends neither
+    # field, byte-for-byte today's pre-existing behavior.
+    gmass_raw = raw["gmass"]
+    gmass_allowed_days_raw = gmass_raw.get("allowed_days")
+    gmass_allowed_days = (
+        _validate_day_list(gmass_allowed_days_raw, f"{path}: gmass.allowed_days")
+        if gmass_allowed_days_raw is not None else None
+    )
+    gmass_skip_holidays = gmass_raw.get("skip_holidays")
+    if gmass_skip_holidays is not None and not isinstance(gmass_skip_holidays, bool):
+        raise ConfigError(f"{path}: gmass.skip_holidays must be a boolean — got {gmass_skip_holidays!r}")
+
     return GlobalConfig(
         from_email=from_email,
         from_name=from_name,
@@ -205,6 +253,8 @@ def load_global_config(path: Path = CONFIG_PATH) -> GlobalConfig:
         path=path,
         signature=signature,
         redis_url=redis_url,
+        gmass_allowed_days=gmass_allowed_days,
+        gmass_skip_holidays=gmass_skip_holidays,
     )
 
 
