@@ -322,7 +322,10 @@ Opens `http://127.0.0.1:5050`. Panels, top to bottom:
   **Blocked**. GMass tracks these as two separate categories (different report endpoints,
   different reasons) — both are shown here rather than one blended into the other, so a
   recipient whose mail got blocked by a spam filter doesn't look identical to one whose
-  address just doesn't exist.
+  address just doesn't exist. A **Reason** column shows GMass's actual reason text for
+  each one (truncated in the table; hover for the full text) — no more guessing why
+  something bounced from the Bounced/Blocked label alone. The same reason text shows up
+  next to a recipient's status on the Reach-outs page too.
 - **Companies contacted** — a rollup by company domain.
 - **Pipeline** — who's mid-sequence at which stage, and what's scheduled to fire today/tomorrow.
 - **Today's runs** — each drain that actually did something today (fired, sent, failed
