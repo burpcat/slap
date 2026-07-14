@@ -19,7 +19,8 @@ from slap.tracking import append_event, connect, latest_open_draft_id
 
 
 def make_global_config(tmp_path, *, daily_cap=500, drain_retries=3, send_delay_min=10,
-                        send_delay_max=15, api_key_env="GMASS_API_KEY", active_days=None):
+                        send_delay_max=15, api_key_env="GMASS_API_KEY", active_days=None,
+                        gmass_allowed_days=None, gmass_skip_holidays=None):
     return GlobalConfig(
         from_email="owner@gmail.com", from_name="Owner", api_key_env=api_key_env,
         personas={"recruiter": [2, 3, 5], "founder": [2, 5, 7], "hiring_manager": [2, 4, 6]},
@@ -33,6 +34,7 @@ def make_global_config(tmp_path, *, daily_cap=500, drain_retries=3, send_delay_m
         # resolves this path directly (no cwd-relative fallback), so this
         # must never resolve to the real repo-root consumer_domains.txt.
         consumer_domains_file=str(tmp_path / "consumer_domains.txt"), path=tmp_path / "config.yaml",
+        gmass_allowed_days=gmass_allowed_days, gmass_skip_holidays=gmass_skip_holidays,
     )
 
 
@@ -54,7 +56,7 @@ def stage_one(conn, tmp_path, recipient="jane@acme.com", persona="recruiter", ca
 
 
 def fake_gmass(draft_id="r-fake", campaign_id=999, create_fails=False, send_fails=False):
-    calls = {"create": 0, "send": 0}
+    calls = {"create": 0, "send": 0, "last_campaign_settings": None}
 
     def create_draft_fn(api_key, *, recipient, subject, message, attachment=None):
         calls["create"] += 1
@@ -64,6 +66,7 @@ def fake_gmass(draft_id="r-fake", campaign_id=999, create_fails=False, send_fail
 
     def send_campaign_fn(api_key, draft_id_arg, *, campaign_settings):
         calls["send"] += 1
+        calls["last_campaign_settings"] = campaign_settings
         if send_fails:
             raise RuntimeError("simulated send_campaign failure")
         return {"campaign_id": campaign_id, "raw": {}}
@@ -108,8 +111,48 @@ def test_drain_sends_a_staged_recipient(conn, tmp_path):
                     create_draft_fn=create_fn, send_campaign_fn=send_fn)
 
     assert result == DrainResult(ran=True, sent=1, failed=0, remaining_queued=0, preflight_error=None)
-    assert calls == {"create": 1, "send": 1}
+    assert calls["create"] == 1 and calls["send"] == 1
     assert due_recipients(conn) == []
+
+
+# --- gmass_allowed_days / gmass_skip_holidays (Investigation 1) ------------
+
+def test_drain_initial_send_threads_gmass_allowed_days_and_skip_holidays_through(conn, tmp_path):
+    gc = make_global_config(tmp_path, gmass_allowed_days=["mon", "wed", "fri"], gmass_skip_holidays=True)
+    stage_one(conn, tmp_path)
+    create_fn, send_fn, calls = fake_gmass()
+
+    drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+          create_draft_fn=create_fn, send_campaign_fn=send_fn)
+
+    assert calls["last_campaign_settings"]["allowedDays"] == "Monday,Wednesday,Friday"
+    assert calls["last_campaign_settings"]["skipHolidays"] is True
+
+
+def test_drain_initial_send_threads_explicit_skip_holidays_false_through(conn, tmp_path):
+    # Tri-state end-to-end: an owner explicitly opting OUT of GMass's own
+    # skip-holidays-by-default server behavior must see that False actually
+    # sent, not silently dropped the way "unset" is.
+    gc = make_global_config(tmp_path, gmass_skip_holidays=False)
+    stage_one(conn, tmp_path)
+    create_fn, send_fn, calls = fake_gmass()
+
+    drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+          create_draft_fn=create_fn, send_campaign_fn=send_fn)
+
+    assert calls["last_campaign_settings"]["skipHolidays"] is False
+
+
+def test_drain_initial_send_omits_fields_when_gmass_config_unset(conn, tmp_path):
+    gc = make_global_config(tmp_path)  # gmass_allowed_days=None, gmass_skip_holidays=None (defaults)
+    stage_one(conn, tmp_path)
+    create_fn, send_fn, calls = fake_gmass()
+
+    drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+          create_draft_fn=create_fn, send_campaign_fn=send_fn)
+
+    assert "allowedDays" not in calls["last_campaign_settings"]
+    assert "skipHolidays" not in calls["last_campaign_settings"]
 
 
 def test_drain_static_campaign_attaches_from_shared_source_not_a_workdir_copy(conn, tmp_path):
@@ -159,7 +202,7 @@ def test_drain_falls_back_to_workdir_copy_when_attachment_source_is_absent(conn,
                     create_draft_fn=create_fn, send_campaign_fn=send_fn)
 
     assert result.sent == 1
-    assert calls == {"create": 1, "send": 1}
+    assert calls["create"] == 1 and calls["send"] == 1
 
 
 def test_drain_static_campaign_missing_shared_source_fails_only_that_recipient(conn, tmp_path):
@@ -212,7 +255,7 @@ def test_drain_sends_a_recipient_already_contacted_in_an_earlier_campaign(conn, 
                     create_draft_fn=create_fn, send_campaign_fn=send_fn)
 
     assert result == DrainResult(ran=True, sent=1, failed=0, remaining_queued=0, preflight_error=None)
-    assert calls == {"create": 1, "send": 1}
+    assert calls["create"] == 1 and calls["send"] == 1
 
 
 def test_drain_writes_run_started_and_run_completed(conn, tmp_path):
@@ -679,6 +722,22 @@ def test_ooo_resend_reuses_staged_stage_body_and_replies_to_original_campaign(co
     assert captured["attachment"] is None  # no re-attaching the résumé on a threaded reply
     assert captured["campaign_settings"]["sendAsReply"] is True
     assert captured["campaign_settings"]["campaignIdToReplyTo"] == reply_to_id
+
+
+def test_ooo_resend_never_receives_gmass_allowed_days_or_skip_holidays(conn, tmp_path):
+    # An OOO resend has no stage cadence of its own to restrict —
+    # build_reply_settings() never sets stageNDays at all — so the day
+    # restriction must never be threaded through to it, even when the
+    # owner's config sets it for initial sends.
+    send_reply_and_tag_ooo(conn, tmp_path)
+    create_fn, send_fn, calls = fake_gmass(draft_id="r-resend", campaign_id=777)
+    gc = make_global_config(tmp_path, gmass_allowed_days=["mon", "wed", "fri"], gmass_skip_holidays=True)
+
+    drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+          create_draft_fn=create_fn, send_campaign_fn=send_fn)
+
+    assert "allowedDays" not in calls["last_campaign_settings"]
+    assert "skipHolidays" not in calls["last_campaign_settings"]
 
 
 def test_ooo_resend_advances_current_stage_and_status(conn, tmp_path):

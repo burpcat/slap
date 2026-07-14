@@ -13,7 +13,7 @@ import pytest
 
 from slap.gmass import (
     DEFAULT_TIMEOUT, GMassError, build_campaign_settings, build_reply_settings, create_draft,
-    get_reports, send_campaign, unsubscribe_recipient, _plain_text_to_html,
+    get_reports, send_campaign, unsubscribe_recipient, _plain_text_to_html, _allowed_days_value,
 )
 
 
@@ -244,6 +244,58 @@ def test_build_campaign_settings_overrides():
     assert settings["openTracking"] is True
     assert settings["createDrafts"] is True
     assert settings["stageOneAction"] == "a"
+
+
+# --- build_campaign_settings: allowed_days/skip_holidays (Investigation 1) -
+#
+# _allowed_days_value's mapping is live-verified, not from the docs: the
+# swagger spec's own field description ("1=Saturday, 2=Sunday, 3=Monday...")
+# was tested and REJECTED (HTTP 400 "Invalid day of the week: 1") for every
+# integer 0-20; full day names (any case) were the only accepted format
+# (probes/findings/full_sweep_allowed_days_result.json).
+
+def test_build_campaign_settings_omits_allowed_days_and_skip_holidays_by_default():
+    settings = build_campaign_settings([2], ["body"])
+    assert "allowedDays" not in settings
+    assert "skipHolidays" not in settings
+
+
+def test_build_campaign_settings_allowed_days_uses_live_verified_day_names():
+    settings = build_campaign_settings([2], ["body"], allowed_days=["mon", "wed", "fri"])
+    assert settings["allowedDays"] == "Monday,Wednesday,Friday"
+
+
+def test_build_campaign_settings_never_sends_skip_weekends():
+    # allowedDays is a strict superset of "skip weekends" (omitting sat/sun
+    # already encodes it) and the API documents no precedence rule if the
+    # two disagree — this function must never emit skipWeekends at all.
+    settings = build_campaign_settings([2], ["body"], allowed_days=["mon", "tue", "wed", "thu", "fri"])
+    assert "skipWeekends" not in settings
+
+
+def test_build_campaign_settings_skip_holidays_true():
+    settings = build_campaign_settings([2], ["body"], skip_holidays=True)
+    assert settings["skipHolidays"] is True
+
+
+def test_build_campaign_settings_skip_holidays_explicit_false_is_sent_not_omitted():
+    # Tri-state: GMass support confirms the server-side default when this
+    # field is OMITTED is actually True (holidays already skipped with no
+    # config at all) — an explicit False must be SENT to override that
+    # default, not silently collapse to the same "say nothing" as unset.
+    settings = build_campaign_settings([2], ["body"], skip_holidays=False)
+    assert settings["skipHolidays"] is False
+
+
+def test_build_campaign_settings_skip_holidays_none_omits_field():
+    settings = build_campaign_settings([2], ["body"], skip_holidays=None)
+    assert "skipHolidays" not in settings
+
+
+def test_allowed_days_value_maps_every_day_to_its_live_verified_name():
+    assert _allowed_days_value(["mon", "tue", "wed", "thu", "fri", "sat", "sun"]) == (
+        "Monday,Tuesday,Wednesday,Thursday,Friday,Saturday,Sunday"
+    )
 
 
 # --- build_reply_settings (OOO resend, step 10) ---------------------------

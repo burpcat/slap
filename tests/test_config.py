@@ -200,6 +200,78 @@ def test_load_global_config_duplicate_day_fails_loud(tmp_path):
         load_global_config(path)
 
 
+# --- gmass.allowed_days / gmass.skip_holidays (independent of schedule.active_days) ---
+
+def test_load_global_config_gmass_allowed_days_and_skip_holidays_default_when_absent(tmp_path):
+    path = write_global_config(tmp_path)  # VALID_CONFIG_YAML's gmass: block has neither key
+    cfg = load_global_config(path)
+    assert cfg.gmass_allowed_days is None
+    assert cfg.gmass_skip_holidays is None
+
+
+def test_load_global_config_gmass_allowed_days_parsed_and_lowercased(tmp_path):
+    text = VALID_CONFIG_YAML.replace("gmass:\n  api_key_env: GMASS_API_KEY",
+                                      "gmass:\n  api_key_env: GMASS_API_KEY\n  allowed_days: [MON, Tue, wed]")
+    path = write_global_config(tmp_path, text)
+    cfg = load_global_config(path)
+    assert cfg.gmass_allowed_days == ["mon", "tue", "wed"]
+    # Independent of schedule.active_days — no cross-contamination either way.
+    assert cfg.schedule.active_days == ["mon", "tue", "wed", "thu", "fri"]
+
+
+def test_load_global_config_gmass_allowed_days_empty_list_fails_loud(tmp_path):
+    text = VALID_CONFIG_YAML.replace("gmass:\n  api_key_env: GMASS_API_KEY",
+                                      "gmass:\n  api_key_env: GMASS_API_KEY\n  allowed_days: []")
+    path = write_global_config(tmp_path, text)
+    with pytest.raises(ConfigError, match="non-empty"):
+        load_global_config(path)
+
+
+def test_load_global_config_gmass_allowed_days_invalid_day_name_fails_loud(tmp_path):
+    text = VALID_CONFIG_YAML.replace("gmass:\n  api_key_env: GMASS_API_KEY",
+                                      "gmass:\n  api_key_env: GMASS_API_KEY\n  allowed_days: [mon, funday]")
+    path = write_global_config(tmp_path, text)
+    with pytest.raises(ConfigError, match="not a valid day"):
+        load_global_config(path)
+
+
+def test_load_global_config_gmass_allowed_days_duplicate_fails_loud(tmp_path):
+    text = VALID_CONFIG_YAML.replace("gmass:\n  api_key_env: GMASS_API_KEY",
+                                      "gmass:\n  api_key_env: GMASS_API_KEY\n  allowed_days: [mon, mon]")
+    path = write_global_config(tmp_path, text)
+    with pytest.raises(ConfigError, match="duplicate"):
+        load_global_config(path)
+
+
+def test_load_global_config_gmass_skip_holidays_true(tmp_path):
+    text = VALID_CONFIG_YAML.replace("gmass:\n  api_key_env: GMASS_API_KEY",
+                                      "gmass:\n  api_key_env: GMASS_API_KEY\n  skip_holidays: true")
+    path = write_global_config(tmp_path, text)
+    cfg = load_global_config(path)
+    assert cfg.gmass_skip_holidays is True
+
+
+def test_load_global_config_gmass_skip_holidays_explicit_false_is_distinct_from_absent(tmp_path):
+    # Tri-state, not a plain bool: GMass support confirms their server-side
+    # default when skipHolidays is OMITTED is actually True — an owner who
+    # wants holidays NOT skipped must be able to send `false` explicitly,
+    # which must survive as False, not collapse to the same None the
+    # absent-key case produces.
+    text = VALID_CONFIG_YAML.replace("gmass:\n  api_key_env: GMASS_API_KEY",
+                                      "gmass:\n  api_key_env: GMASS_API_KEY\n  skip_holidays: false")
+    path = write_global_config(tmp_path, text)
+    cfg = load_global_config(path)
+    assert cfg.gmass_skip_holidays is False
+
+
+def test_load_global_config_gmass_skip_holidays_non_bool_fails_loud(tmp_path):
+    text = VALID_CONFIG_YAML.replace("gmass:\n  api_key_env: GMASS_API_KEY",
+                                      "gmass:\n  api_key_env: GMASS_API_KEY\n  skip_holidays: yesplease")
+    path = write_global_config(tmp_path, text)
+    with pytest.raises(ConfigError, match="skip_holidays must be a boolean"):
+        load_global_config(path)
+
+
 # --- discover_campaigns ---------------------------------------------------
 
 def test_discover_campaigns_finds_folders_with_campaign_yaml(tmp_path):

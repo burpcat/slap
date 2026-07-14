@@ -14,6 +14,22 @@ signature: |-
 
 gmass:
   api_key_env: GMASS_API_KEY # read from env; never store the key here
+  # Optional. Days GMass's own scheduler may fire follow-up stages for
+  # recipients queued from now on — confirmed directly by GMass support
+  # (2026-07-13) to reschedule auto follow-up stages, not just the initial
+  # send. Independent of schedule.active_days below (that key governs when
+  # SLAP's own local runner wakes up, not GMass's server-side follow-up
+  # timer) — locked in per-recipient at send time, so editing this never
+  # affects anyone already sent. Omit entirely to leave GMass fully
+  # unrestricted (no allowedDays field sent at all).
+  # allowed_days: [mon, tue, wed, thu, fri]
+  # Optional, omitted by default (NOT the same as false — see below).
+  # Independent of allowed_days: GMass's own designated-holiday calendar can
+  # fall on an otherwise-allowed weekday. GMass support confirms their
+  # server-side default when this field is left out entirely is actually
+  # TRUE (holidays already get skipped even with no config here at all) —
+  # set this to `false` explicitly if you want holidays NOT skipped.
+  # skip_holidays: false
 
 personas: # cadences are FIXED per persona
   hiring_manager: { stages: [2, 4, 6] }
