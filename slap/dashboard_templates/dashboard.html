@@ -147,15 +147,45 @@
   </div>
 
   <div class="panel full">
-    <h2>Warm but silent &mdash; clicked, no reply</h2>
+    <h2>Warm but silent &mdash; clicked, no reply
+      {% if warm_but_silent_hidden_count %}
+      <a href="{{ '/' if show_hidden else '/?show_hidden=1' }}"
+         style="font-size: 11px; text-transform: none; letter-spacing: 0; font-weight: 400;">
+        {{ 'hide dismissed rows again' if show_hidden else 'show hidden (' ~ warm_but_silent_hidden_count ~ ')' }}
+      </a>
+      {% endif %}
+    </h2>
     {% if warm_but_silent %}
     <table>
-      <tr><th>Recipient</th><th>Campaign</th><th>Stage(s) clicked</th></tr>
+      <tr><th>Recipient</th><th>Campaign</th><th>Links clicked</th><th>Actions</th></tr>
       {% for w in warm_but_silent %}
       <tr>
         <td>{{ w.recipient }}</td>
         <td>{{ w.campaign }}</td>
-        <td>{{ w.stages_clicked | join(', ') }}</td>
+        <td>
+          {% if w.clicks %}
+          <ul class="plain">
+            {% for c in w.clicks %}
+            <li>stage {{ c.stage if c.stage is not none else '—' }}:
+              <a href="{{ c.url }}" target="_blank" rel="noopener">{{ c.url }}</a></li>
+            {% endfor %}
+          </ul>
+          {% else %}
+          {# Pre-url-tracking clicks (no meta.url captured) -- fall back to bare stage numbers. #}
+          stage(s) {{ w.stages_clicked | join(', ') }}
+          {% endif %}
+        </td>
+        <td>
+          {% if w.recipient in warm_but_silent_hidden_recipients %}
+          <form class="tag-form" method="post" action="/warm-but-silent/{{ w.recipient }}/unhide">
+            <button class="tag-btn" type="submit">Unhide</button>
+          </form>
+          {% else %}
+          <form class="tag-form" method="post" action="/warm-but-silent/{{ w.recipient }}/hide">
+            <button class="tag-btn" type="submit">Hide</button>
+          </form>
+          {% endif %}
+        </td>
       </tr>
       {% endfor %}
     </table>
@@ -188,7 +218,8 @@
             <input type="date" name="resume_date" class="ooo-date" title="Return date (required for OOO)">
             <button class="tag-btn" name="tag" value="ooo"
                     onclick="return confirm('Mark {{ r.recipient }} OOO? This permanently suppresses their GMass follow-ups account-wide (every campaign, not just this one) and needs a return date entered above.');">OOO</button>
-            <button class="tag-btn" name="tag" value="not_interested">Not interested</button>
+            <button class="tag-btn" name="tag" value="not_interested"
+                    onclick="return confirm('Mark {{ r.recipient }} not interested? This permanently suppresses their GMass follow-ups account-wide (every campaign, not just this one).');">Not interested</button>
           </form>
         </td>
       </tr>

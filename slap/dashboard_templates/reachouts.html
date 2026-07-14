@@ -8,6 +8,7 @@
     --surface-1: #fcfcfb; --page: #f9f9f7;
     --text-primary: #0b0b0b; --text-secondary: #52514e; --text-muted: #898781;
     --hairline: #e1e0d9; --border: rgba(11,11,11,0.10);
+    --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
   }
   * { box-sizing: border-box; }
   body {
@@ -38,18 +39,49 @@
   th .arrow { font-size: 10px; color: var(--text-muted); }
   .muted { color: var(--text-muted); }
   .empty { color: var(--text-muted); font-style: italic; padding: 16px 0; }
+  ul.plain { list-style: none; padding: 0; margin: 0; }
+  ul.plain li { padding: 2px 0; }
   form.ooo-form { display: flex; gap: 4px; align-items: center; }
   form.ooo-form input[type="date"] { font-size: 12px; padding: 2px 4px; border: 1px solid var(--border);
                                       border-radius: 4px; }
   form.ooo-form button { font-size: 12px; padding: 3px 8px; border-radius: 4px; border: 1px solid var(--border);
                           background: var(--surface-1); cursor: pointer; white-space: nowrap; }
   form.ooo-form button:hover { background: var(--hairline); }
+  form.tag-form { display: flex; gap: 4px; margin-top: 4px; }
+  button.tag-btn { font-size: 12px; padding: 3px 8px; border-radius: 4px; border: 1px solid var(--border);
+                    background: var(--surface-1); cursor: pointer; white-space: nowrap; }
+  button.tag-btn:hover { background: var(--hairline); }
+  .warning-banner { background: #fdf3d9; border: 1px solid var(--warning); border-radius: 6px;
+                     padding: 8px 12px; margin: 12px 0; font-size: 13px; }
+  form.resend-form { display: flex; gap: 4px; align-items: center; margin-top: 4px; }
+  form.resend-form input[type="email"] { font-size: 12px; padding: 2px 4px; border: 1px solid var(--border);
+                                          border-radius: 4px; min-width: 160px; }
+  .chip { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; white-space: nowrap; }
+  .chip-critical { background: var(--critical); color: white; }
+  .chip-good { background: var(--good); color: white; }
+  .chip-serious { background: var(--serious); color: white; }
+  .chip-neutral { background: var(--hairline); color: var(--text-primary); }
+  .expand-toggle { background: none; border: none; cursor: pointer; color: var(--text-muted);
+                   font-size: 11px; padding: 0 0 0 6px; }
+  .expand-toggle:hover { color: var(--text-primary); }
+  tr.detail-row { display: none; }
+  tr.detail-row.open { display: table-row; }
+  tr.detail-row td { background: var(--page); font-size: 12px; }
+  /* OOO-paused rows fade until they actually resume -- keyed off data-status
+     (which stays 'ooo_requeued' until the resend fires), not resume_date
+     compared client-side (status can lag the resume date by up to one
+     drain cycle -- see reachouts_rows()'s own docstring). */
+  tr.row[data-status="ooo_requeued"] { opacity: 0.55; }
 </style>
 </head>
 <body>
 
 <a class="back" href="/">&larr; back to dashboard</a>
 <h1>Reach-outs</h1>
+
+{% if warning %}
+<div class="warning-banner">{{ warning }}</div>
+{% endif %}
 
 {% if total_count == 0 %}
 <p class="empty">No reach-outs yet — nothing staged or sent.</p>
@@ -144,8 +176,6 @@
       <th data-sort="campaign">Campaign <span class="arrow"></span></th>
       <th data-sort="persona">Persona <span class="arrow"></span></th>
       <th data-sort="status">Status <span class="arrow"></span></th>
-      <th data-sort="engagement">Engagement <span class="arrow"></span></th>
-      <th data-sort="reply-tag">Reply tag <span class="arrow"></span></th>
       <th data-sort="domain">Domain <span class="arrow"></span></th>
       <th data-sort="req-id">Req ID <span class="arrow"></span></th>
       <th data-sort="date">Date <span class="arrow"></span></th>
@@ -170,9 +200,12 @@
       <td>{{ r.company if r.company else '—' }}</td>
       <td>{{ r.campaign or '—' }}</td>
       <td>{{ r.persona or '—' }}</td>
-      <td>{{ r.status or '—' }}{% if r.ooo_resume_date %} <span class="muted">(resumes {{ r.ooo_resume_date }})</span>{% endif %}</td>
-      <td>{{ {'replied': 'Replied', 'clicked': 'Clicked, no reply', 'none': 'No engagement yet'}[r.engagement] }}</td>
-      <td>{{ r.reply_tag or '—' }}</td>
+      <td>
+        <span class="chip {{ 'chip-' ~ r.chip.color if r.chip.color else 'chip-neutral' }}">{{ r.chip.label }}</span>
+        {% if r.clicks or r.corrected_from or r.already_corrected_to %}
+        <button type="button" class="expand-toggle" onclick="toggleDetail(this)">&#9656; detail</button>
+        {% endif %}
+      </td>
       <td>{{ r.domain }}</td>
       <td>{{ 'Present' if r.req_id_present else 'Blank' }}</td>
       <td>{{ r.date | to_local if r.date else '—' }}</td>
@@ -183,14 +216,66 @@
           <button type="submit" name="tag" value="ooo"
                   onclick="return confirm('Mark {{ r.recipient }} OOO? This permanently suppresses their GMass follow-ups account-wide (every campaign, not just this one).');">Mark OOO</button>
         </form>
+        {% if r.engagement == 'replied' %}
+        <form class="tag-form" method="post" action="/reply/{{ r.recipient }}/tag">
+          <input type="hidden" name="redirect_to" value="reachouts">
+          <button type="submit" class="tag-btn" name="tag" value="real">Real</button>
+          <button type="submit" class="tag-btn" name="tag" value="not_interested"
+                  onclick="return confirm('Mark {{ r.recipient }} not interested? This permanently suppresses their GMass follow-ups account-wide (every campaign, not just this one).');">Not interested</button>
+        </form>
+        {% endif %}
+        {% if r.status == 'bounced' %}
+        <form class="resend-form" method="post" action="/reachouts/{{ r.recipient }}/resend">
+          <input type="email" name="corrected_email" placeholder="corrected@address.com" required>
+          <button type="submit" class="tag-btn">Resend to corrected address</button>
+        </form>
+        {% endif %}
       </td>
     </tr>
+    {% if r.clicks or r.corrected_from or r.already_corrected_to %}
+    <tr class="detail-row">
+      <td colspan="9">
+        {% if r.corrected_from %}
+        <div>&#8617; corrected from <strong>{{ r.corrected_from }}</strong></div>
+        {% endif %}
+        {% if r.already_corrected_to %}
+        <div>&#8618; already corrected to:
+          <ul class="plain">
+            {% for c in r.already_corrected_to %}
+            <li><strong>{{ c.recipient }}</strong> ({{ c.status or '—' }})</li>
+            {% endfor %}
+          </ul>
+        </div>
+        {% endif %}
+        {% if r.clicks %}
+        <ul class="plain">
+          {% for c in r.clicks %}
+          <li>stage {{ c.stage if c.stage is not none else '—' }}:
+            <a href="{{ c.url }}" target="_blank" rel="noopener">{{ c.url }}</a>
+            {% if c.click_time %}<span class="muted">({{ c.click_time }})</span>{% endif %}</li>
+          {% endfor %}
+        </ul>
+        {% endif %}
+      </td>
+    </tr>
+    {% endif %}
     {% endfor %}
   </tbody>
 </table>
 {% endif %}
 
 <script>
+// Global (referenced from inline onclick= handlers) -- toggles a row's
+// expandable detail sub-row (click links / corrected-from), which always
+// sits immediately after its owning tr.row in the DOM.
+function toggleDetail(btn) {
+  var row = btn.closest('tr');
+  var detail = row.nextElementSibling;
+  if (!detail || !detail.classList.contains('detail-row')) return;
+  var open = detail.classList.toggle('open');
+  btn.innerHTML = open ? '&#9662; detail' : '&#9656; detail';
+}
+
 (function () {
   var table = document.getElementById('reachouts-table');
   if (!table) return;  // total_count == 0 -- no table/filters rendered at all
@@ -234,6 +319,14 @@
     rows.forEach(function (row) {
       var visible = matches(row);
       row.style.display = visible ? '' : 'none';
+      // A row's detail sub-row (click links / corrected-from), if any,
+      // always immediately follows it -- force it hidden whenever its OWNER
+      // is filtered out (never force it open; that stays under the expand
+      // toggle's own control while the row itself stays visible).
+      var detail = row.nextElementSibling;
+      if (detail && detail.classList.contains('detail-row')) {
+        detail.style.display = visible ? '' : 'none';
+      }
       if (visible) shown++;
     });
     countLine.textContent = shown + ' of ' + totalCount + ' reach-outs shown';
@@ -265,8 +358,17 @@
         if (av > bv) return sortState.dir;
         return 0;
       });
+      // Moves each row's detail sub-row (if any) along with it, immediately
+      // after -- read BEFORE the move, since appendChild() re-parents `row`
+      // and would otherwise leave the detail row behind, orphaned next to
+      // whatever row happens to occupy that DOM position afterward.
       var tbody = table.querySelector('tbody');
-      sorted.forEach(function (row) { tbody.appendChild(row); });
+      sorted.forEach(function (row) {
+        var detail = row.nextElementSibling;
+        var hasDetail = detail && detail.classList.contains('detail-row');
+        tbody.appendChild(row);
+        if (hasDetail) tbody.appendChild(detail);
+      });
     });
   });
 

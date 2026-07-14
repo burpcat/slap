@@ -19,7 +19,7 @@ from pathlib import Path
 
 SLAP_PY = Path(__file__).resolve().parent.parent / "slap.py"
 ALL_COMMANDS = ["list", "send", "dashboard", "doctor", "domains", "rebuild", "runner", "sync",
-                "cleanup", "plist", "init"]
+                "cleanup", "plist", "init", "bounced"]
 
 
 def run(*args, cwd=None, env=None, input=None):
@@ -919,3 +919,131 @@ def test_send_empty_signature_renders_blank_with_no_error(tmp_path):
     manifest = json.loads((tmp_path / "workdir" / "coldpost" / recipient / "staged.json").read_text())
     assert manifest["body"] == "Body text about Acme.\n\nBest,\n"
     assert manifest["stage_bodies"][0] == "Just checking in, no news yet.\n\n"
+
+
+# --- bounced: bounce remediation (post-launch feature) ---------------------
+
+def _setup_bounced_recipient(tmp_path, *, recipient="jane@acme.com", campaign="coldpost", company="Acme"):
+    from slap.queue import stage_recipient
+    from slap.tracking import append_event, connect
+    conn = connect(tmp_path / "slap.db")
+    attachment = tmp_path / "attach.pdf"
+    attachment.write_bytes(b"%PDF-fake")
+    stage_recipient(
+        conn, campaign=campaign, recipient=recipient, persona="recruiter", cadence=[2, 3, 5],
+        subject="Hi", body="Body", stage_bodies=["s1", "s2", "s3"],
+        attachment_path=attachment, attachment_name="Resume.pdf", latex_enabled=True,
+        company=company, workdir_root=tmp_path / "workdir",
+    )
+    append_event(conn, type="sent", recipient=recipient, campaign=campaign, stage=0, gmass_campaign_id="1")
+    append_event(conn, type="bounce", recipient=recipient, campaign=campaign,
+                 meta={"bounce_reason": "550 no such user", "bounce_time": "t1", "category": "bounce"})
+    conn.close()
+
+
+def test_bounced_no_bounces_prints_message(tmp_path):
+    _setup_reuse_campaign(tmp_path)
+    result = run("bounced", cwd=tmp_path, input="")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "No bounces or blocks to fix." in result.stdout
+
+
+def test_bounced_lists_and_resends_to_corrected_address(tmp_path):
+    _setup_reuse_campaign(tmp_path)
+    _setup_bounced_recipient(tmp_path)
+
+    scripted_stdin = "\n".join([
+        "jane.doe@othercorp.com",  # corrected email (different domain -- no dedup warning)
+        "y",                       # resend confirm
+        "",
+    ])
+    result = run("bounced", cwd=tmp_path, input=scripted_stdin)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Staged jane.doe@othercorp.com" in result.stdout
+
+    from slap.tracking import connect
+    conn = connect(tmp_path / "slap.db")
+    row = conn.execute("SELECT * FROM recipients WHERE recipient = ?", ("jane.doe@othercorp.com",)).fetchone()
+    assert row is not None
+    assert row["status"] == "active"
+    events = [dict(r) for r in conn.execute(
+        "SELECT * FROM events WHERE recipient = ? AND type = 'queued'", ("jane.doe@othercorp.com",)
+    )]
+    assert json.loads(events[0]["meta"])["corrected_from"] == "jane@acme.com"
+
+
+def test_bounced_skips_on_blank_corrected_address(tmp_path):
+    _setup_reuse_campaign(tmp_path)
+    _setup_bounced_recipient(tmp_path)
+    result = run("bounced", cwd=tmp_path, input="\n")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Skipped." in result.stdout
+
+
+def test_bounced_skips_on_declined_confirm(tmp_path):
+    _setup_reuse_campaign(tmp_path)
+    _setup_bounced_recipient(tmp_path)
+    result = run("bounced", cwd=tmp_path, input="jane.doe@othercorp.com\nn\n")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Skipped." in result.stdout
+
+    from slap.tracking import connect
+    conn = connect(tmp_path / "slap.db")
+    row = conn.execute(
+        "SELECT * FROM recipients WHERE recipient = ?", ("jane.doe@othercorp.com",)
+    ).fetchone()
+    assert row is None
+
+
+def test_bounced_shows_dedup_warning_but_does_not_block(tmp_path):
+    _setup_reuse_campaign(tmp_path)
+    _setup_bounced_recipient(tmp_path)
+    _seed_prior_contact_same_domain(tmp_path, recipient="other@acme.com")  # same domain as the correction below
+
+    scripted_stdin = "\n".join(["jane.doe@acme.com", "y", ""])
+    result = run("bounced", cwd=tmp_path, input=scripted_stdin)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "SOFT WARN" in result.stdout  # informational...
+    assert "Staged jane.doe@acme.com" in result.stdout  # ...never blocking
+
+
+def test_bounced_offers_archive_picker_when_workdir_pdf_missing(tmp_path):
+    _setup_reuse_campaign(tmp_path)
+    _setup_bounced_recipient(tmp_path)
+    (tmp_path / "workdir" / "coldpost" / "jane@acme.com" / "Resume.pdf").unlink()  # simulate cleanup
+
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    archived_pdf = tmp_path / "archived.pdf"
+    _write_valid_pdf(archived_pdf)
+    (archive_dir / "acme-swe-2026-01-01.pdf").symlink_to(archived_pdf)
+
+    env = {**os.environ, "RESUME_ARCHIVE_DIR": str(archive_dir)}
+    # email, resend confirm, archive picker choice (1 = the one match)
+    scripted_stdin = "\n".join(["jane.doe@othercorp.com", "y", "1", ""])
+    result = run("bounced", cwd=tmp_path, input=scripted_stdin, env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Staged jane.doe@othercorp.com" in result.stdout
+
+    resumed_pdf = tmp_path / "workdir" / "coldpost" / "jane.doe@othercorp.com" / "Resume.pdf"
+    assert resumed_pdf.read_bytes() == archived_pdf.read_bytes()
+
+
+def test_bounced_skips_recipient_when_archive_picker_declined(tmp_path):
+    _setup_reuse_campaign(tmp_path)
+    _setup_bounced_recipient(tmp_path)
+    (tmp_path / "workdir" / "coldpost" / "jane@acme.com" / "Resume.pdf").unlink()
+
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    archived_pdf = tmp_path / "archived.pdf"
+    _write_valid_pdf(archived_pdf)
+    (archive_dir / "acme-swe-2026-01-01.pdf").symlink_to(archived_pdf)
+
+    env = {**os.environ, "RESUME_ARCHIVE_DIR": str(archive_dir)}
+    # email, resend confirm, "0" declines the archive reuse offer
+    scripted_stdin = "\n".join(["jane.doe@othercorp.com", "y", "0", ""])
+    result = run("bounced", cwd=tmp_path, input=scripted_stdin, env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "no résumé chosen, nothing staged" in result.stdout
+    assert not (tmp_path / "workdir" / "coldpost" / "jane.doe@othercorp.com").exists()
