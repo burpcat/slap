@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}slap dashboard — engagement{% endblock %}
+{% block content %}
+
+<div class="panels">
+
+  <div class="panel full">
+    <h2>Engagement intelligence</h2>
+    {% if engagement.has_data %}
+    <div class="panels">
+      <div>
+        <table>
+          <tr><th>Persona</th><th class="num">Reply rate</th></tr>
+          {% for persona, rate in engagement.reply_rate_by_persona.items() %}
+          <tr><td>{{ persona }}</td><td class="num">{{ rate }}%</td></tr>
+          {% else %}
+          <tr><td colspan="2" class="empty">no data yet</td></tr>
+          {% endfor %}
+        </table>
+      </div>
+      <div>
+        <table>
+          <tr><th>Stage</th><th class="num">Replies</th><th class="num">Clicks</th></tr>
+          {% for stage in [0, 1, 2, 3] %}
+          <tr>
+            <td>{{ 'initial' if stage == 0 else 'stage ' + stage|string }}</td>
+            <td class="num">{{ engagement.reply_by_stage.get(stage|string, 0) }}</td>
+            <td class="num">{{ engagement.click_by_stage.get(stage|string, 0) }}</td>
+          </tr>
+          {% endfor %}
+        </table>
+      </div>
+      <div>
+        <table>
+          <tr><th>Time to first reply</th><th class="num">Count</th></tr>
+          <tr><td>Same day</td><td class="num">{{ engagement.time_to_first_reply.same_day }}</td></tr>
+          <tr><td>1-2 days</td><td class="num">{{ engagement.time_to_first_reply['1_2_days'] }}</td></tr>
+          <tr><td>3-7 days</td><td class="num">{{ engagement.time_to_first_reply['3_7_days'] }}</td></tr>
+          <tr><td>8+ days</td><td class="num">{{ engagement.time_to_first_reply['8_plus_days'] }}</td></tr>
+        </table>
+      </div>
+    </div>
+    {% else %}
+    <p class="empty">no engagement data yet</p>
+    {% endif %}
+  </div>
+
+  <div class="panel full">
+    <h2>Warm but silent &mdash; clicked, no reply
+      {% if warm_but_silent_hidden_count %}
+      <a href="{{ url_for('engagement_page') if show_hidden else url_for('engagement_page', show_hidden=1) }}"
+         style="font-size: 11px; text-transform: none; letter-spacing: 0; font-weight: 400;">
+        {{ 'hide dismissed rows again' if show_hidden else 'show hidden (' ~ warm_but_silent_hidden_count ~ ')' }}
+      </a>
+      {% endif %}
+    </h2>
+    {% if warm_but_silent %}
+    <table>
+      <tr><th>Recipient</th><th>Campaign</th><th>Links clicked</th><th>Actions</th></tr>
+      {% for w in warm_but_silent %}
+      <tr>
+        <td>{{ w.recipient }}</td>
+        <td>{{ w.campaign }}</td>
+        <td>
+          {% if w.clicks %}
+          <ul class="plain">
+            {% for c in w.clicks %}
+            <li>stage {{ c.stage if c.stage is not none else '—' }}:
+              <a href="{{ c.url }}" target="_blank" rel="noopener">{{ c.url }}</a></li>
+            {% endfor %}
+          </ul>
+          {% else %}
+          {# Pre-url-tracking clicks (no meta.url captured) -- fall back to bare stage numbers. #}
+          stage(s) {{ w.stages_clicked | join(', ') }}
+          {% endif %}
+        </td>
+        <td>
+          {% if w.recipient in warm_but_silent_hidden_recipients %}
+          <form class="tag-form" method="post" action="/warm-but-silent/{{ w.recipient }}/unhide">
+            <button class="tag-btn" type="submit">Unhide</button>
+          </form>
+          {% else %}
+          <form class="tag-form" method="post" action="/warm-but-silent/{{ w.recipient }}/hide">
+            <button class="tag-btn" type="submit">Hide</button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <p class="empty">Nobody yet.</p>
+    {% endif %}
+  </div>
+
+</div>
+{% endblock %}
