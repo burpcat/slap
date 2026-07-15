@@ -51,6 +51,9 @@
   button.tag-btn { font-size: 12px; padding: 3px 8px; border-radius: 4px; border: 1px solid var(--border);
                     background: var(--surface-1); cursor: pointer; white-space: nowrap; }
   button.tag-btn:hover { background: var(--hairline); }
+  form.stop-form { display: flex; gap: 4px; margin-top: 4px; }
+  button.tag-btn.danger { border-color: var(--critical); color: var(--critical); }
+  button.tag-btn.danger:hover { background: var(--critical); color: white; }
   .warning-banner { background: #fdf3d9; border: 1px solid var(--warning); border-radius: 6px;
                      padding: 8px 12px; margin: 12px 0; font-size: 13px; }
   form.resend-form { display: flex; gap: 4px; align-items: center; margin-top: 4px; }
@@ -134,6 +137,7 @@
     <select id="f-reply-tag">
       <option value="">Any</option>
       <option value="real">Real</option>
+      <option value="unreal">Unreal</option>
       <option value="ooo">OOO</option>
       <option value="not_interested">Not interested</option>
       <option value="untagged">Untagged</option>
@@ -223,12 +227,21 @@
           <button type="submit" class="tag-btn" name="tag" value="real">Real</button>
           <button type="submit" class="tag-btn" name="tag" value="not_interested"
                   onclick="return confirm('Mark {{ r.recipient }} not interested? This permanently suppresses their GMass follow-ups account-wide (every campaign, not just this one).');">Not interested</button>
+          {% if r.reply_tag == 'real' %}
+          <button type="submit" class="tag-btn" name="tag" value="unreal">Unreal</button>
+          {% endif %}
         </form>
         {% endif %}
         {% if r.status == 'bounced' %}
         <form class="resend-form" method="post" action="/reachouts/{{ r.recipient }}/resend">
           <input type="email" name="corrected_email" placeholder="corrected@address.com" required>
           <button type="submit" class="tag-btn">Resend to corrected address</button>
+        </form>
+        {% endif %}
+        {% if not r.stopped %}
+        <form class="stop-form" method="post" action="/reachouts/{{ r.recipient }}/stop">
+          <button type="submit" class="tag-btn danger"
+                  onclick="return confirm('Stop outreach to {{ r.recipient }}? This permanently suppresses their GMass follow-ups account-wide (every campaign, not just this one) and cannot be undone.');">Stop outreach</button>
         </form>
         {% endif %}
       </td>

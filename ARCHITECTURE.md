@@ -36,7 +36,7 @@ independently reviewed against a written spec and a fixed set of design invarian
 moving to the next. Several real bugs were caught this way rather than in later
 integration — see "Notable bugs found," below.
 
-**Testing.** 595 fast tests (a few seconds total, grown well past the original 13-stage
+**Testing.** 714 fast tests (a few seconds total, grown well past the original 13-stage
 build via the post-launch features documented in `SLAP_PROJECT_CONTEXT.md`) plus 8 tests
 marked `slow` (real `xelatex` subprocess compiles, and one test that spins up a real
 threaded HTTP server) kept out of the default run for dev-loop speed. No test suite makes
@@ -217,3 +217,39 @@ stage) and deliberately deferred rather than silently left undocumented:
   project treats as load-bearing everywhere else. Also caught by audit, not by a test that
   happened to exercise it; fixed the same way, with a regression test confirmed to fail
   without the fix before being trusted.
+- **A schema migration that claimed to be atomic but wasn't, for a subtle reason specific
+  to Python's `sqlite3` module.** Stop outreach needed a genuinely new event type
+  (`'stopped'`), which meant — for the first time in this project — actually taking on
+  the live rename-recreate-copy-drop migration every prior post-launch feature had
+  deliberately avoided (see "Template reload," above, and the reload/bounce-block design
+  notes in `SLAP_PROJECT_CONTEXT.md`). The first version drove that sequence through a
+  mix of `conn.execute()` and `conn.executescript()`; `executescript()` turns out to
+  force-commit any pending transaction the instant it runs, REGARDLESS of whether an
+  explicit `BEGIN` was already open — so the rename step committed durably on its own,
+  no matter what wrapped it. A crash between the rename and the final drop would have
+  permanently stranded the entire event log in the renamed table while leaving a fresh,
+  empty table in its place — one that would look "already migrated" to every future
+  connection, since the only check performed was whether the new type already appeared
+  in the live table's schema text. Nothing in the original test suite could have caught
+  this: every test exercised either a clean success or a clean no-op, never an
+  interruption mid-migration. Fixed by never calling `executescript()` anywhere inside
+  the migration and running every step through `conn.execute()` inside one real, explicit
+  transaction instead — SQLite itself fully supports transactional DDL; the module just
+  needs to not be given a chance to force-commit around it. Verified by forcing a
+  mid-migration failure with a test-only `Connection` subclass and confirming the
+  database came back in its original, unmigrated state rather than a stranded one.
+- **A "stopped" check read from a column that a later, unrelated event could quietly
+  overwrite.** The Active Leads/follow-up-reminder widgets and the Reach-outs status chip
+  all originally asked "is `recipients.status` equal to `'stopped'`?" — but this
+  dashboard already re-polls GMass for bounces/replies on every open regardless of any
+  local stop, and that existing sync path has no reason to know or care that a recipient
+  was ever stopped; a bounce or reply landing afterward just overwrites the column like
+  it always has. The practical effect: a recipient the owner had deliberately stopped
+  contacting could silently reappear as a live lead, or lose its "Stopped" indicator
+  entirely, days later. The actual guarantee that matters most (never send this recipient
+  anything else) was never at risk either way — the queries that gate real sends already
+  only admit two specific status values, neither of which this could produce — but the
+  *display* would have been quietly wrong. Fixed by checking the append-only event log's
+  own existence of a `stopped` event instead of the mutable cache column, the same
+  "durable set built straight from a real event" pattern this app already used elsewhere
+  for a different purpose (tracking who has ever clicked a link).

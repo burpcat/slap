@@ -318,6 +318,9 @@ Opens `http://127.0.0.1:5050`. Panels, top to bottom:
     GMass's own conversation auto-detection. (GMass usually filters real auto-responders
     itself; this is a manual safety net for the ones that slip through.)
   - **not interested** — pure bookkeeping; stops the row from showing as needing triage.
+  - **unreal** — Reach-outs-only (see below), for a Real-tagged reply that later went
+    cold. Not offered here since a recipient only reaches this widget while their reply
+    is still untagged.
 - **Bounces & blocks** — every delivery failure GMass reports back, tagged **Bounced** or
   **Blocked**. GMass tracks these as two separate categories (different report endpoints,
   different reasons) — both are shown here rather than one blended into the other, so a
@@ -326,6 +329,15 @@ Opens `http://127.0.0.1:5050`. Panels, top to bottom:
   each one (truncated in the table; hover for the full text) — no more guessing why
   something bounced from the Bounced/Blocked label alone. The same reason text shows up
   next to a recipient's status on the Reach-outs page too.
+- **Active leads** — a roster of every recipient currently tagged Real: company,
+  campaign, persona, and when you marked them real. This is a live "who's actually a
+  real opportunity right now" list, separate from the triage widget above (which is
+  about *tagging* a reply, not tracking it afterward).
+- **Follow-up reminders** — the same Active Leads recipients, but framed as a nag: how
+  many days since you marked each one Real, worst-first. Once someone's marked Real,
+  GMass's own automated follow-ups have already stopped for them (it stops firing on any
+  reply) — this is the one place that reminds you to personally follow up, since nothing
+  else on the dashboard tracks that.
 - **Companies contacted** — a rollup by company domain.
 - **Pipeline** — who's mid-sequence at which stage, and what's scheduled to fire today/tomorrow.
 - **Today's runs** — each drain that actually did something today (fired, sent, failed
@@ -343,10 +355,29 @@ It disappears again once a later `template-reload` run comes back clean.
 http://127.0.0.1:5050/reachouts
 ```
 
-A separate, read-only page: one row per recipient across every campaign, filterable and
-sortable, for when you want to slice "everyone I've contacted" by whatever you care about
-that day instead of hunting through per-campaign panels. No reply-tagging here — that
-stays on the main dashboard.
+One row per recipient across every campaign, filterable and sortable, for when you want
+to slice "everyone I've contacted" by whatever you care about that day instead of hunting
+through per-campaign panels. Never makes a GMass call on its own — everything here is
+already-synced local data.
+
+Each row's Actions column also offers, as applicable: **Mark OOO** (always available),
+**Real / Not interested** (only once that recipient has actually replied), **Resend to
+corrected address** (only on a bounced row), and two more:
+
+- **Unreal** — shown only once a recipient is already tagged Real (sits right next to
+  the Real/Not interested buttons). Use it when a Real lead goes cold later — the deal
+  fell through, they stopped responding, whatever. It's local-only: no GMass call, no
+  suppression, nothing sent. The recipient drops out of the Active Leads / Follow-up
+  reminders widgets on the main dashboard, but their reply-tag history isn't erased —
+  it's recorded as its own event, same as every tag change here.
+- **Stop outreach** — on every row. Permanently halts further follow-ups to *this one
+  recipient* (e.g. you got rejected for the specific role they were contacted about).
+  This is a real, irreversible suppression — same account-wide GMass unsubscribe Mark
+  OOO/Not interested use — so it asks for confirmation first, the same way those do.
+  Once stopped, the row shows a **Stopped** chip and the button disappears (nothing left
+  to stop); the recipient also drops out of the follow-up-reminder/Active-Leads widgets
+  if they were in one. This only ever affects the one recipient you clicked it on — it
+  does NOT stop the whole campaign or every contact at that company.
 
 Filter controls (all combine with AND — narrowing by campaign AND status AND date range,
 for instance, not any of them):
