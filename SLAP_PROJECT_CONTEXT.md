@@ -364,18 +364,22 @@ backward-compatibility note above) — never guessed. `reachouts_rows()` and
 `filter_reachouts()` in `slap/dashboard.py` are pure, fully-tested Python; the actual
 `/reachouts` route renders every row unfiltered in one response, and a hand-written
 vanilla-JS block in `reachouts.html` mirrors `filter_reachouts()`'s semantics for real
-client-side interaction (this is the one place in the whole dashboard with any
-JavaScript at all).
+client-side interaction. (No longer the ONLY JS in the dashboard as of the multi-page
+redesign below — `base.html` adds a ~15-line theme-toggle script, shared by every page —
+but still the only place with any *data* interaction logic.)
 
 **Dashboard — current shipped state, not a wishlist (see §8 for full detail).** The
-"dashboard reorg + new widgets" this doc's older draft called "pending" shipped well
-before this revision. Confirm any future dashboard claim against
-`slap/dashboard_templates/dashboard.html` directly rather than this doc's prose, but as
-of this snapshot the panels are: Metrics (today/week merged), Next drain, Engagement
-intelligence, Warm but silent, Replies needing triage, Bounces & blocks, Active leads,
-Follow-up reminders, Companies contacted, Pipeline, Today's runs — plus a link to
-`/reachouts`, and, only while at least one unresolved `template-reload` failure exists, a
-link to `/template-failures` (see this section's `template-reload` entry).
+single-scrolling-page layout this doc described through the multi-page redesign (below)
+is gone — confirm any future dashboard claim against `slap/dashboard_templates/*.html`
+directly rather than this doc's prose. As of this snapshot the dashboard is five pages
+sharing one `base.html` layout (nav, theme toggle, sync/cache-status banner): **Home**
+(`/`: Metrics, Replies needing triage, Next drain, Today's runs), **Pipeline**
+(`/pipeline`: Active leads, Follow-up reminders, Pipeline, Companies contacted, zero
+GMass-cache dependency), **Engagement** (`/engagement`: Engagement intelligence, Warm but
+silent), **Deliverability** (`/deliverability`: Bounces & blocks, Stopped outreach), plus
+`/reachouts` and, only while at least one unresolved `template-reload` failure exists,
+`/template-failures` (see this section's `template-reload` entry and the "Dashboard
+multi-page redesign" entry below).
 
 **Bounces vs. blocks — a real, fixed bug, not an open item.** GMass reports bounces and
 blocks as two separate report categories (`/api/reports/{id}/bounces` vs. `.../blocks`,
@@ -549,6 +553,58 @@ existed before the audit:**
   "durable set built straight from a real event type" pattern `_clicked_recipients()`
   already established — never the mutable status cache.
 
+**Dashboard multi-page redesign — shipped, not still the single-scrolling-page layout.**
+A design-first pass (a written IA plan + a standalone reference-page mockup, reviewed and
+approved before anything was built) split the one ever-growing dashboard page into five,
+sharing one `base.html` layout: **Home** (`/`) keeps only the operational pulse + the one
+widget that demands a same-visit decision (`actionable_replies`, Replies needing triage) —
+kept here even though it shares a Redis-cached blob with Engagement's widgets, precisely
+so it's never buried on a page shared with lagging-indicator analytics. **Pipeline**
+(`/pipeline`: Active leads, Follow-up reminders, Pipeline, Companies contacted) is the one
+specialized page with zero GMass-cache dependency at all — every widget on it is a plain
+uncached SQLite read, so it's always instant and never shows a stale-cache banner.
+**Engagement** (`/engagement`: Engagement intelligence, Warm but silent) inherited the
+hide/unhide-related block moved verbatim out of the old `index()` — the one real route-
+behavior change in the whole redesign: `hide_warm_but_silent()`/`unhide_warm_but_silent()`
+now redirect to `engagement_page` instead of `index`. **Deliverability**
+(`/deliverability`: Bounces & blocks, plus a brand-new **Stopped outreach** roster) is
+where `stopped_outreach_roster()` lives — modeled on `bounces()`'s exact shape but sourced
+from `_stopped_recipients()` (the same append-only read Stop outreach's own entry above
+already established), not `recipients.status`, for the identical reason: a later bounce/
+reply can overwrite that column, and this roster must keep listing a recipient regardless.
+`/reachouts` and `/template-failures` kept their exact routes/logic, just folded into the
+shared nav — Reachouts additionally got a real visual change, its row Actions column
+(previously ~5 conditional inline button forms) collapsed into one unified `<details
+class="row-menu">` disclosure (native HTML, zero new JS dependency), gated on the exact
+same conditions as before.
+
+Splitting `bounces`/`companies_contacted`/`pipeline()` was NOT done along the cache-vs-
+uncached boundary (an initial pass tried that, then was rejected): "cached vs. uncached"
+is an implementation detail, not a category a daily human thinks in, and it would have
+stranded `actionable_replies` away from daily-glance visibility on Home. `bounces` also
+moved off an initially-proposed "Leads" grouping onto its own Deliverability page — a
+bounce is the opposite of a lead, and grouping "who's alive" with "whose address is dead"
+under one label read wrong at a glance.
+
+This is also the app's first CSS custom-property-driven dark mode (`prefers-color-scheme`
+auto + a manual toggle, persisted in `localStorage`) and its first static asset
+(`slap/static/dashboard.css` — `create_app()` needed zero changes, since Flask's default
+static-folder convention already resolves it once the directory exists). Two computed (not
+eyeballed) fixes rode along: `chip-good`/`chip-serious` previously used white label text
+that failed WCAG contrast (2.64:1 / 3.36:1 against the 4.5:1 requirement) in BOTH light and
+dark mode — the fill hex never changes between themes — now dark ink (5.86:1 / 7.46:1); and
+the Metrics panel's daily-cap gauge track now tints toward the same severity color as its
+fill (via CSS `color-mix()` against the live surface) instead of a flat neutral gray,
+matching the "unfilled track is a lighter step of the same ramp" meter convention the rest
+of this app's palette already follows.
+
+An iron-audit found no blockers. Three NITs, none fixed yet: the shared "Refresh now"
+button (in `base.html`'s banner) always redirects to Home regardless of which page it was
+clicked from, since it predates the multi-page split; `engagement_page()` reimplements the
+hidden-row filter inline instead of reusing `visible_warm_but_silent()` (moved verbatim
+from the old `index()`, not a new drift risk, just an unreduced duplication); and this doc
+itself needed the sync pass you're reading now.
+
 ---
 
 ## 6. Real GMass API facts (probe-verified — these OVERRIDE the build brief's assumptions)
@@ -700,6 +756,12 @@ don't assume a feature landed just because a task once existed for it):
   type + live CHECK-constraint migration (`slap.tracking._migrate_events_check_
   constraint()`) — see §5's dedicated entry for the two real bugs (a non-atomic migration,
   and "stopped" being read from the wrong source) an iron-audit caught before shipping.
+- **Dashboard multi-page redesign** — real five-page split (Home/Pipeline/Engagement/
+  Deliverability/Reach-outs, plus Template Failures), a shared `base.html`/
+  `slap/static/dashboard.css` (the app's first static asset), its first dark mode, and a
+  new `stopped_outreach_roster()` widget — see §5's dedicated entry for the full IA
+  rationale, the two computed contrast/gauge fixes, and the iron-audit's three NITs (none
+  blocking, none fixed yet).
 
 **Genuinely still pending / unproven:**
 
