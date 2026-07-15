@@ -231,7 +231,7 @@ CREATE TABLE events (
     campaign TEXT,
     type TEXT NOT NULL CHECK (type IN (
         'queued','draft_created','sent','click','reply','bounce','ooo_tagged','requeued',
-        'reply_reviewed','run_started','run_completed','send_failed','run_failed'
+        'reply_reviewed','run_started','run_completed','send_failed','run_failed','stopped'
     )),
     stage INTEGER,
     gmass_campaign_id TEXT,         -- stored as TEXT; coerced to int only when building the
@@ -244,7 +244,7 @@ CREATE TABLE recipients (            -- derived cache, rebuildable via `rebuild`
     recipient TEXT PRIMARY KEY,
     campaign TEXT,
     persona TEXT,
-    status TEXT,                    -- REAL values only: active | done | replied | bounced | ooo_requeued
+    status TEXT,                    -- REAL values only: active | done | replied | bounced | ooo_requeued | stopped
                                      -- (there is deliberately no "queued"/"failed"/"sent" status — see below)
     current_stage INTEGER,
     last_gmass_campaign_id TEXT,
@@ -266,6 +266,14 @@ discriminator, its per-recipient failure reports live entirely outside `events`,
 small JSON file (`template_reload_failures.json`, §4) that's disposable by design (fully
 overwritten every run, never a second source of durable truth) — a legitimate escape
 hatch for diagnostic-only state that was never going to need replaying anyway.
+**Stop outreach (§8) is the one post-launch feature that actually took the live-data
+migration on**, rather than dodging it like the two above — `'stopped'` is a genuinely
+new state transition (it has to remove a recipient from every active-only query, which
+only a real new status value can do), not a sub-category of an existing type, so neither
+escape hatch fit. `slap.tracking._migrate_events_check_constraint()` does the rename-
+recreate-copy-drop dance automatically inside `connect()`, detected by reading the
+constraint text straight back out of `sqlite_master` — see §8 for the real atomicity bug
+this caught before shipping.
 
 **`meta` JSON shape by event type** (additive/backward-compatible — a reader always
 treats a missing key as blank/unknown, never fabricates one):
@@ -286,16 +294,32 @@ treats a missing key as blank/unknown, never fabricates one):
   text surfacing described below — `_latest_bounce_category()` doesn't exist anymore,
   replaced when that shipped). `bounce_reason` itself was captured from day one but sat
   unused until a later fix actually displayed it — see "Bounce/block reason text" below.
-- `reply_reviewed`: `{"tag": "real" | "ooo" | "not_interested"}` — the precedent the
-  bounce/block `category` discriminator above deliberately copied.
+- `reply_reviewed`: `{"tag": "real" | "not_interested" | "unreal"}` — the precedent the
+  bounce/block `category` discriminator above deliberately copied. (Correction to this
+  doc's own prior draft: OOO does NOT write a `reply_reviewed` tag — it's a fully separate
+  event type, `ooo_tagged`, below.) `"unreal"` (§8: Active Leads) is a fourth, purely
+  additive value — a Real-tagged reply going cold afterward is real history, not
+  something to unwind, so it's one more `reply_reviewed` event, never a rewrite of the
+  original `"real"` one.
+- `stopped`: `{"scope": "recipient"}` (§8: Stop outreach) — `scope` rides in the event
+  itself so a wider scope, if one is ever actually built, stays distinguishable from this
+  one in the log; per-recipient is the ONLY scope that exists today; a whole-persona/
+  campaign scope and a per-company scope were both explicitly considered and rejected,
+  not merely deferred.
 - `ooo_tagged`/`requeued`/`draft_created`/`run_*`: no meaningful meta beyond the
   event-level columns.
 
 **Real `recipients.status` vocabulary is `active`/`done`/`replied`/`bounced`/
-`ooo_requeued` only** — there is no `queued`/`sent`/`failed` status. "Queued" (staged,
-never actually sent) is *derived*, not stored: `status = 'active' AND first_sent_at IS
-NULL`. There is deliberately no `failed` status either — `send_failed` is a transient
-per-attempt event, always retried by the next drain, never a durable resting state.
+`ooo_requeued`/`stopped` only** — there is no `queued`/`sent`/`failed` status. "Queued"
+(staged, never actually sent) is *derived*, not stored: `status = 'active' AND
+first_sent_at IS NULL`. There is deliberately no `failed` status either — `send_failed`
+is a transient per-attempt event, always retried by the next drain, never a durable
+resting state. `stopped` (§8: Stop outreach) is the newest addition — it's what actually
+removes a recipient from `due_recipients()`/`due_for_ooo_resend()`/`pipeline()`'s
+followups_scheduled (all three already filter FOR `active`/`ooo_requeued`, so nothing
+about those queries had to change), but it is NOT what the dashboard's Active Leads/
+follow-up-reminder widgets or the Reach-outs chip check — see §8 for why that mutable
+column can't be trusted for "was this ever stopped" and what they check instead.
 
 **Domain/recipient dedup:** derived live by querying the `recipients` cache (itself
 derived from `events` — no third store). Exact-recipient → hard warn (always, even on a
@@ -348,10 +372,10 @@ JavaScript at all).
 before this revision. Confirm any future dashboard claim against
 `slap/dashboard_templates/dashboard.html` directly rather than this doc's prose, but as
 of this snapshot the panels are: Metrics (today/week merged), Next drain, Engagement
-intelligence, Warm but silent, Replies needing triage, Bounces & blocks, Companies
-contacted, Pipeline, Today's runs — plus a link to `/reachouts`, and, only while at least
-one unresolved `template-reload` failure exists, a link to `/template-failures` (see this
-section's `template-reload` entry).
+intelligence, Warm but silent, Replies needing triage, Bounces & blocks, Active leads,
+Follow-up reminders, Companies contacted, Pipeline, Today's runs — plus a link to
+`/reachouts`, and, only while at least one unresolved `template-reload` failure exists, a
+link to `/template-failures` (see this section's `template-reload` entry).
 
 **Bounces vs. blocks — a real, fixed bug, not an open item.** GMass reports bounces and
 blocks as two separate report categories (`/api/reports/{id}/bounces` vs. `.../blocks`,
@@ -462,6 +486,68 @@ it. See CONTROL_SHEET.md's dedicated write-up for the full investigation. If pau
 follow-ups over weekends is ever wanted, `active_days` cannot do it — that would need a
 real design decision (GMass-side controls, if any exist, or accepting the current
 behavior), not something this investigation decided unilaterally.
+
+**Active Leads / Unreal / Stop outreach — shipped, not still pending.** A Real-tagged
+reply used to have exactly one consequence: nothing (pure bookkeeping, per the
+`reply_reviewed` note above). Two dashboard widgets change that without touching the
+reply-tag machinery itself: `active_leads()` is a roster — every recipient whose reply-
+tag currently resolves to `"real"`, with their company/campaign/persona and when they
+were marked real; `follow_up_reminders()` is the exact same underlying set, plus a
+`days_since` field, sorted most-overdue-first instead of most-recent-first. Deliberately
+two separate widgets, not one query rendered two ways — they answer different questions
+("who's live right now" vs. "who needs a nudge"), but both built on the identical
+real-tag-plus-not-stopped definition (`active_leads()` itself; `follow_up_reminders()`
+calls it directly) so the two can never disagree about membership, only about ordering.
+"Unreal" (a Reach-outs row action, shown only once a recipient is already tagged Real) is
+the fourth `reply_reviewed` tag value described above — local-only by hard design
+constraint, same as `"real"` itself: unlike `ooo`/`not_interested`, tagging real or unreal
+never calls GMass.
+
+**Stop outreach** is the one new *suppression* action added alongside these: a
+per-recipient, permanent halt to further follow-ups (e.g. the owner got rejected for the
+specific role a recipient was contacted about). **Scoped to exactly ONE recipient —
+confirmed with the owner before writing any firing logic, not assumed.** A whole-persona/
+campaign version and a per-company version were both explicitly proposed and explicitly
+rejected given the blast radius (a "campaign" in this app's vocabulary is an entire
+persona bundle spanning every company ever contacted — nowhere near "stop emailing about
+this one role"); do not read either as a deferred future option, they were a considered
+no. Same GMass-suppression-first ordering as `tag_reply()`'s OOO/not_interested (above):
+`gmass.unsubscribe_recipient` fires before any local write, and a failure there leaves
+nothing recorded locally. `slap.dashboard.stop_outreach()` is the function; `recipients.
+status` flips to the new `'stopped'` value, which alone is what removes the recipient
+from `due_recipients()`/`due_for_ooo_resend()`/`pipeline()`'s `followups_scheduled` — see
+the schema section above for why this needed a real CHECK-constraint migration rather
+than reusing an existing type's discriminator.
+
+**Two real bugs an iron-audit caught before this shipped, neither found by any test that
+existed before the audit:**
+- **The migration wasn't actually atomic despite its own docstring claiming it was.** The
+  first version drove RENAME → CREATE → COPY → DROP through a mix of `conn.execute()` and
+  `conn.executescript()` — and Python's `sqlite3` module force-commits any pending
+  transaction the instant `executescript()` runs, regardless of whether an explicit
+  `BEGIN` was already open (verified live, not just reasoned about). A crash between the
+  RENAME and the final `DROP` would durably strand the entire event log in the renamed
+  table, while a brand-new EMPTY `events` table — already containing `'stopped'` in its
+  own schema text — would make the very next `connect()` conclude "already migrated" and
+  never look for it. Fixed by never calling `executescript()` anywhere inside the
+  migration: every step goes through `conn.execute()` inside one real explicit
+  `BEGIN`/`COMMIT`, which SQLite's own transactional DDL support handles correctly once
+  Python's module isn't fighting it. Confirmed by forcing a mid-migration failure via a
+  test-only `sqlite3.Connection` subclass and checking the db comes back in its original,
+  unmigrated state, ready for a clean retry — not just asserted to work.
+- **"Stopped" was being read from the wrong source.** `active_leads()`/
+  `follow_up_reminders()`/the Reach-outs status chip originally checked
+  `recipients.status == 'stopped'` directly — but `sync_reports()` re-polls every known
+  campaign on every dashboard open regardless of any local stop, so a real bounce or
+  reply landing AFTER a stop silently overwrites that column to `'bounced'`/`'replied'`,
+  re-admitting a should-stay-stopped recipient back into the roster and dropping the
+  "Stopped" chip. The send-side guarantee was never actually at risk either way (neither
+  `'bounced'` nor `'replied'` is `'active'`/`'ooo_requeued'`, so `due_recipients()`/
+  `due_for_ooo_resend()` still correctly exclude them regardless) — but the *display*
+  would have silently lied. Fixed by deriving "is this recipient stopped" from
+  `_stopped_recipients()`, the append-only `stopped` event's own existence — the same
+  "durable set built straight from a real event type" pattern `_clicked_recipients()`
+  already established — never the mutable status cache.
 
 ---
 
@@ -608,6 +694,12 @@ don't assume a feature landed just because a task once existed for it):
   real feature, re-renders not-yet-sent recipients against edited templates; see §5's
   dedicated entry for the two things confirmed against real code before it was built and
   the open-draft edge case an iron-audit caught before shipping.
+- **Active Leads / Follow-up reminders / Unreal / Stop outreach** — real dashboard
+  widgets (`slap.dashboard.active_leads()`/`follow_up_reminders()`) and real Reach-outs
+  row actions (Unreal, Stop outreach), the latter backed by a genuine `'stopped'` event
+  type + live CHECK-constraint migration (`slap.tracking._migrate_events_check_
+  constraint()`) — see §5's dedicated entry for the two real bugs (a non-atomic migration,
+  and "stopped" being read from the wrong source) an iron-audit caught before shipping.
 
 **Genuinely still pending / unproven:**
 

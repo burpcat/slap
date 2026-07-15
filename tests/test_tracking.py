@@ -6,7 +6,9 @@ import sqlite3
 
 import pytest
 
-from slap.tracking import TrackingError, append_event, connect, latest_open_draft_id, rebuild
+from slap.tracking import (
+    TrackingError, _migrate_events_check_constraint, append_event, connect, latest_open_draft_id, rebuild,
+)
 
 
 @pytest.fixture
@@ -373,6 +375,160 @@ def test_rebuild_fixes_a_corrupted_first_write_wins_field(conn):
 
     rebuild(conn)
     assert recipient_row(conn, "a@x.com") == correct
+
+
+def test_stopped_sets_stopped_status(conn):
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0)
+    append_event(conn, type="stopped", recipient="a@x.com", campaign="c", meta={"scope": "recipient"})
+    assert recipient_row(conn, "a@x.com")["status"] == "stopped"
+
+
+def test_stopped_removes_recipient_from_active_status(conn):
+    # 'stopped' must actually flip status away from 'active' — this alone is
+    # what removes a stopped recipient from due_recipients()/
+    # due_for_ooo_resend() (both require status IN ('active', 'ooo_requeued'))
+    # and pipeline()'s followups_scheduled (status == 'active'), with no
+    # changes needed to any of those queries.
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter"})
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=0, gmass_campaign_id="1")
+    assert recipient_row(conn, "a@x.com")["status"] == "active"
+    append_event(conn, type="stopped", recipient="a@x.com", campaign="c", meta={"scope": "recipient"})
+    row = recipient_row(conn, "a@x.com")
+    assert row["status"] == "stopped"
+    assert row["current_stage"] == 0  # unrelated fields untouched
+
+
+# --- 'stopped' event type: migration for a pre-existing db --------------
+
+def _old_events_table_sql():
+    # The events table's CREATE statement exactly as it looked before the
+    # 'stopped' literal was added to the CHECK constraint — used to build a
+    # fixture db that looks like a real owner's already-existing slap.db.
+    return """
+    CREATE TABLE events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        recipient TEXT,
+        campaign TEXT,
+        type TEXT NOT NULL CHECK (type IN (
+            'queued','draft_created','sent','click','reply','bounce','ooo_tagged','requeued',
+            'reply_reviewed','run_started','run_completed','send_failed','run_failed'
+        )),
+        stage INTEGER,
+        gmass_campaign_id TEXT,
+        gmass_draft_id TEXT,
+        meta TEXT
+    );
+    """
+
+
+def test_connect_migrates_a_pre_existing_db_missing_the_stopped_type(tmp_path):
+    path = tmp_path / "old.db"
+    raw = sqlite3.connect(path)
+    raw.executescript(_old_events_table_sql())
+    raw.execute(
+        "INSERT INTO events (timestamp, recipient, campaign, type, stage) VALUES (?, ?, ?, ?, ?)",
+        ("2026-01-01T00:00:00+00:00", "a@x.com", "c", "queued", 0),
+    )
+    raw.commit()
+    raw.close()
+
+    # A raw insert of 'stopped' against the OLD db would be rejected —
+    # confirms the fixture really does reproduce the pre-migration schema.
+    raw = sqlite3.connect(path)
+    with pytest.raises(sqlite3.IntegrityError):
+        raw.execute(
+            "INSERT INTO events (timestamp, recipient, campaign, type) VALUES (?, ?, ?, ?)",
+            ("2026-01-01T00:00:00+00:00", "a@x.com", "c", "stopped"),
+        )
+    raw.close()
+
+    migrated = connect(path)
+    # Pre-existing history survived the migration untouched.
+    rows = all_events(migrated)
+    assert len(rows) == 1
+    assert rows[0]["type"] == "queued" and rows[0]["recipient"] == "a@x.com"
+
+    # 'stopped' now works, and the recipients cache still reflects it.
+    append_event(migrated, type="stopped", recipient="a@x.com", campaign="c",
+                 meta={"scope": "recipient"})
+    assert recipient_row(migrated, "a@x.com")["status"] == "stopped"
+
+
+def test_connect_migration_is_idempotent(tmp_path):
+    path = tmp_path / "old.db"
+    raw = sqlite3.connect(path)
+    raw.executescript(_old_events_table_sql())
+    raw.commit()
+    raw.close()
+
+    connect(path).close()
+    connect(path).close()  # second connect on an already-migrated db must not raise
+
+
+class _FlakyConnection(sqlite3.Connection):
+    """Test-only sqlite3.Connection subclass (a bare instance can't have
+    `.execute` monkeypatched — it's a read-only attribute on the built-in
+    C type) that raises on demand for one specific statement, so a
+    mid-migration failure can be forced and observed deterministically."""
+    fail_on_prefix = None
+
+    def execute(self, sql, *args, **kwargs):
+        if self.fail_on_prefix and sql.strip().upper().startswith(self.fail_on_prefix):
+            raise RuntimeError("simulated crash mid-migration")
+        return super().execute(sql, *args, **kwargs)
+
+
+def test_migration_rolls_back_cleanly_on_a_mid_migration_failure(tmp_path):
+    # An iron-audit BLOCKER fix: the migration must be genuinely atomic (a
+    # real explicit transaction, never touched by conn.executescript()'s
+    # own implicit-commit-before-DDL behavior — see
+    # _migrate_events_check_constraint's own docstring for why that
+    # combination silently stranded the entire event log before this fix).
+    # Forces a failure AFTER the RENAME has already run (the single most
+    # dangerous point — RENAME is DDL and, per that same docstring, used to
+    # commit durably on its own) and confirms: (1) the exception propagates
+    # rather than being swallowed, (2) the db is left in the ORIGINAL,
+    # unmigrated state — not stranded with an empty new `events` table and
+    # a hidden `events_pre_stopped_migration` — and (3) a real retry
+    # afterward succeeds and preserves every pre-existing row.
+    path = tmp_path / "old.db"
+    raw = sqlite3.connect(path)
+    raw.executescript(_old_events_table_sql())
+    raw.execute(
+        "INSERT INTO events (timestamp, recipient, campaign, type, stage) VALUES (?, ?, ?, ?, ?)",
+        ("2026-01-01T00:00:00+00:00", "a@x.com", "c", "queued", 0),
+    )
+    raw.commit()
+    raw.close()
+
+    conn = sqlite3.connect(path, factory=_FlakyConnection)
+    conn.row_factory = sqlite3.Row
+    conn.fail_on_prefix = "INSERT INTO EVENTS"
+    with pytest.raises(RuntimeError, match="simulated crash mid-migration"):
+        _migrate_events_check_constraint(conn)
+    conn.close()
+
+    # The db must show the ORIGINAL, unmigrated table — not a half-renamed
+    # mess — confirming the RENAME itself was rolled back, not just the
+    # failed INSERT.
+    inspect = sqlite3.connect(path)
+    tables = {r[0] for r in inspect.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    assert tables == {"events", "sqlite_sequence"}
+    events_sql = inspect.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'"
+    ).fetchone()[0]
+    assert "'stopped'" not in events_sql
+    inspect.close()
+
+    # A real (unpatched) retry succeeds and preserves the pre-existing row.
+    retry = connect(path)
+    rows = all_events(retry)
+    assert len(rows) == 1
+    assert rows[0]["type"] == "queued" and rows[0]["recipient"] == "a@x.com"
+    append_event(retry, type="stopped", recipient="a@x.com", campaign="c", meta={"scope": "recipient"})
+    assert recipient_row(retry, "a@x.com")["status"] == "stopped"
 
 
 def test_rebuild_removes_a_stale_recipient_row_with_no_backing_events(conn):

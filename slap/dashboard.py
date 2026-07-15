@@ -465,6 +465,19 @@ def tag_reply(conn, recipient: str, tag: str, *, resume_date: date = None, api_k
     bookkeeping with no side effect — a genuinely engaged reply should never
     be touched.
 
+    'unreal' (post-launch: the Reach-outs "Unreal" action — the deal died
+    after being marked Real) is local-only, same as 'real', and for the
+    exact same reason: it's a hard requirement of this feature that
+    Real/Unreal never touch GMass at all (no call, no send, no suppression)
+    — going cold isn't a delivery/compliance signal the way OOO/not-
+    interested are, it's pure pipeline bookkeeping the owner's dashboard
+    alone cares about. Recorded as its OWN reply_reviewed tag value rather
+    than deleting/rewriting the original 'real' event — "was a lead, then
+    wasn't" is real history (§5 append-only), and reply_tags()'s existing
+    last-write-wins resolution already makes a later 'unreal' correctly
+    supersede an earlier 'real' with no extra logic (see that function's
+    own docstring).
+
     `unsubscribe_fn` defaults to None and is resolved to
     `gmass.unsubscribe_recipient` INSIDE this function body, not as a bound
     default parameter — a default parameter value is captured once, at
@@ -473,8 +486,8 @@ def tag_reply(conn, recipient: str, tag: str, *, resume_date: date = None, api_k
     replaces the module attribute; a stale bound-at-def-time reference never
     sees it). Resolving it here instead means every call always sees
     whatever `gmass.unsubscribe_recipient` currently is."""
-    if tag not in ("real", "ooo", "not_interested"):
-        raise ValueError(f"unknown tag {tag!r} — must be 'real', 'ooo', or 'not_interested'")
+    if tag not in ("real", "ooo", "not_interested", "unreal"):
+        raise ValueError(f"unknown tag {tag!r} — must be 'real', 'ooo', 'not_interested', or 'unreal'")
     if tag == "ooo":
         if resume_date is None:
             raise ValueError("resume_date is required when tag='ooo'")
@@ -486,6 +499,59 @@ def tag_reply(conn, recipient: str, tag: str, *, resume_date: date = None, api_k
     row = conn.execute("SELECT campaign FROM recipients WHERE recipient = ?", (recipient,)).fetchone()
     campaign = row["campaign"] if row else None
     append_event(conn, type="reply_reviewed", recipient=recipient, campaign=campaign, meta={"tag": tag})
+
+
+def stop_outreach(conn, recipient: str, *, api_key: str = None, unsubscribe_fn=None) -> None:
+    """"Stop outreach" (Part 2, post-launch): a permanent, one-recipient halt
+    to further follow-ups — e.g. the owner was rejected for the specific
+    role this recipient was contacted about and doesn't want GMass's
+    remaining cadence stages to keep firing at them. **Scoped to exactly
+    this ONE recipient — confirmed with the owner.** A "stop the whole
+    campaign" reading of the original request was considered and explicitly
+    rejected: in this app a "campaign" is an entire persona bundle (e.g.
+    every recruiter at every company ever contacted), so a literal
+    stop-the-campaign action would suppress outreach to EVERYONE in that
+    persona the instant one company's role fell through — almost certainly
+    not what's wanted, and a per-company variant was likewise decided
+    against in favor of keeping this to the smallest, least-surprising
+    blast radius: the one row the owner actually clicked.
+
+    Treated exactly like OOO/not_interested (tag_reply, above) — same real
+    suppression action, same ordering: calls `unsubscribe_fn`
+    (slap.gmass.unsubscribe_recipient, the only suppression lever confirmed
+    to actually register — a per-campaign variant was disproven, see that
+    function's own docstring) FIRST, before any local write. If it raises,
+    this function raises too and NOTHING is recorded locally — a
+    locally-recorded stop with no working GMass-side suppression would look
+    "handled" on the dashboard while GMass's native timer stayed fully live,
+    the identical failure mode tag_reply's own docstring already rejects for
+    OOO/not_interested.
+
+    Only on success does this append the `stopped` event
+    (`meta={"scope": "recipient"}` — the scope rides in the event itself so
+    a future wider scope, if ever built, is still distinguishable from this
+    one in the append-only log rather than silently indistinguishable).
+    `_apply_event_to_cache` flips `recipients.status` to `'stopped'` — the
+    SAME single-status-column mechanism `'bounced'`/`'done'` already use —
+    which alone is what removes this recipient from
+    `due_recipients()`/`due_for_ooo_resend()` (both require status IN
+    ('active', 'ooo_requeued')) and from `pipeline()`'s
+    `followups_scheduled` (status == 'active'), with zero changes needed to
+    any of those queries — this holds even if a LATER bounce/reply event
+    for the same recipient overwrites `recipients.status` again afterward
+    (see `_stopped_recipients()`'s own docstring), since neither
+    'bounced' nor 'replied' is 'active'/'ooo_requeued' either.
+    `active_leads()`/`follow_up_reminders()`/the Reach-outs chip instead
+    check `_stopped_recipients()` — the append-only `stopped` event's own
+    existence, NOT the mutable `recipients.status` column — since a stopped
+    recipient's reply-tag can independently still resolve to 'real' forever
+    (append-only — this never rewrites the Real/Unreal tag), and the
+    status column alone can't be trusted to still say 'stopped' by the time
+    any of those later read it."""
+    (unsubscribe_fn or gmass.unsubscribe_recipient)(api_key, recipient)
+    row = conn.execute("SELECT campaign FROM recipients WHERE recipient = ?", (recipient,)).fetchone()
+    campaign = row["campaign"] if row else None
+    append_event(conn, type="stopped", recipient=recipient, campaign=campaign, meta={"scope": "recipient"})
 
 
 def _followups_scheduled(conn, global_config, *, today: date = None) -> dict:
@@ -802,9 +868,50 @@ def _clicked_recipients(conn) -> set:
     return {r["recipient"] for r in conn.execute("SELECT DISTINCT recipient FROM events WHERE type = 'click'")}
 
 
+def _stopped_recipients(conn) -> set:
+    """Every recipient with at least one 'stopped' event, ever (Stop
+    outreach, Part 2) — the append-only EVENT LOG itself as the source of
+    truth for "was this recipient ever stopped," same pattern as
+    _clicked_recipients() above. Deliberately NOT `recipients.status ==
+    'stopped'` (an iron-audit SHOULD-FIX): `sync_reports()` re-polls every
+    known GMass campaign on every dashboard open regardless of any local
+    stop, so a bounce/reply for an already-stopped recipient can arrive
+    LATER and unconditionally overwrite `recipients.status` away from
+    'stopped' to 'bounced'/'replied' (`_apply_event_to_cache`'s existing
+    bounce/reply handlers have no reason to know or care about a prior
+    stop). The hard no-further-SLAP-send guarantee never actually depended
+    on the literal 'stopped' status value surviving that (due_recipients()/
+    due_for_ooo_resend() only admit 'active'/'ooo_requeued', which
+    'bounced'/'replied' are excluded from just as much as 'stopped' is) —
+    but active_leads()/follow_up_reminders()/the Reach-outs chip all need
+    to keep answering "was this deliberately halted" correctly even after
+    such a later event, which only a durable, append-only read can do."""
+    return {r["recipient"] for r in conn.execute("SELECT DISTINCT recipient FROM events WHERE type = 'stopped'")}
+
+
+def _latest_reply_lifecycle_events(conn) -> dict:
+    """Per recipient, the single most recent event among reply/ooo_tagged/
+    reply_reviewed (raw `events` row, not yet reduced to a tag label) —
+    "last write wins" per recipient, via `ORDER BY id ASC` + dict overwrite
+    (later rows replace earlier ones for the same key). Factored out of
+    reply_tags() (below) so active_leads()/_real_tagged_at() can reuse the
+    EXACT same "what's this recipient's current resolved reply state"
+    resolution — a fresh, slightly-different re-query of the same three
+    event types is exactly the kind of thing that could silently disagree
+    with reply_tags() about which recipients currently count as 'real'."""
+    rows = conn.execute(
+        "SELECT recipient, type, timestamp, meta FROM events WHERE type IN "
+        "('reply', 'ooo_tagged', 'reply_reviewed') ORDER BY id ASC"
+    ).fetchall()
+    latest: dict = {}
+    for row in rows:
+        latest[row["recipient"]] = row  # ORDER BY id ASC -> last write per recipient wins
+    return latest
+
+
 def reply_tags(conn) -> dict:
     """Every recipient's resolved reply-tag status — 'untagged' (replied,
-    pending triage), 'ooo', 'real', or 'not_interested' — keyed by
+    pending triage), 'ooo', 'real', 'not_interested', or 'unreal' — keyed by
     recipient; a recipient who has never replied at all is simply absent
     from this dict (there's nothing to tag). Mirrors needs_triage()'s exact
     "latest of reply/ooo_tagged/reply_reviewed event wins" resolution rule
@@ -814,14 +921,14 @@ def reply_tags(conn) -> dict:
     than a refactor of needs_triage() itself, to avoid touching that
     already-tested query for an unrelated feature — test_dashboard.py pins
     that a recipient in needs_triage()'s result always maps to 'untagged'
-    here, and vice versa, so the two can never silently drift apart."""
-    rows = conn.execute(
-        "SELECT recipient, type, meta FROM events WHERE type IN ('reply', 'ooo_tagged', 'reply_reviewed') "
-        "ORDER BY id ASC"
-    ).fetchall()
-    latest: dict = {}
-    for row in rows:
-        latest[row["recipient"]] = row  # ORDER BY id ASC -> last write per recipient wins
+    here, and vice versa, so the two can never silently drift apart.
+
+    'unreal' (post-launch: the Reach-outs "Unreal" action) needs no special
+    case here — it's just a fourth `reply_reviewed` `meta["tag"]` value, and
+    a later `unreal` event naturally outranks an earlier `real` one via the
+    same last-write-wins resolution every other tag transition already
+    uses (see slap.tracking's module docstring)."""
+    latest = _latest_reply_lifecycle_events(conn)
     tags = {}
     for recipient, row in latest.items():
         if row["type"] == "reply":
@@ -832,6 +939,109 @@ def reply_tags(conn) -> dict:
             meta = json.loads(row["meta"]) if row["meta"] else {}
             tags[recipient] = meta.get("tag")
     return tags
+
+
+def _real_tagged_at(conn) -> dict:
+    """Per recipient CURRENTLY resolved to reply_tags()=='real', the ISO
+    timestamp of the event that put them there — reuses
+    _latest_reply_lifecycle_events() (the exact same resolution reply_tags()
+    itself is built on) rather than a second query, so this can never
+    disagree with reply_tags() about WHICH recipients are 'real' right now.
+    Absent for anyone else (never replied, or resolved to any other tag) —
+    same "never fabricated" convention every other per-recipient lookup in
+    this module already follows."""
+    latest = _latest_reply_lifecycle_events(conn)
+    result = {}
+    for recipient, row in latest.items():
+        if row["type"] != "reply_reviewed":
+            continue
+        meta = json.loads(row["meta"]) if row["meta"] else {}
+        if meta.get("tag") == "real":
+            result[recipient] = row["timestamp"]
+    return result
+
+
+def active_leads(conn) -> list:
+    """Active Leads (post-launch): every recipient currently a live
+    opportunity — reply_tags()=='real' (the owner tagged their reply Real)
+    AND not in _stopped_recipients() (Stop outreach, Part 2 of the same
+    feature, is a SEPARATE axis from the Real/Unreal reply-tag: it's an
+    owner decision to halt further contact, e.g. rejected for the specific
+    role, and must pull a recipient out of this roster even though their
+    reply-tag stays 'real' forever — append-only, Stop outreach never
+    rewrites it). A recipient later tagged Unreal (reply_tags() moves off
+    'real' entirely) falls out of this roster automatically with no extra
+    check needed — see reply_tags()'s own docstring.
+
+    Checks the append-only `stopped` EVENT's existence
+    (_stopped_recipients()), not `recipients.status == 'stopped'` — an
+    iron-audit SHOULD-FIX: a later bounce/reply for an already-stopped
+    recipient (sync_reports() re-polls every known campaign regardless of
+    any local stop) unconditionally overwrites `recipients.status` away
+    from 'stopped', which would otherwise silently re-admit a
+    should-stay-stopped recipient back into this roster. See
+    _stopped_recipients()'s own docstring for why the hard send-side
+    guarantee itself was never at risk either way.
+
+    Deliberately a distinct roster from follow_up_reminders() (below), NOT
+    a shared "one query, two renderings" — see this feature's own design
+    note: the reminder widget is time-pressure to act (sorted most-overdue
+    first), this one is a plain "who's live right now" roster (sorted most-
+    recently-identified first). Both are built on the exact same
+    real-tag + not-stopped definition (this function), so the two can never
+    disagree about WHO counts as an active lead, only about how that same
+    set is ordered/framed."""
+    real_tagged_at = _real_tagged_at(conn)
+    if not real_tagged_at:
+        return []
+    stopped = _stopped_recipients(conn)
+    drop_meta = _recipient_drop_meta(conn)
+    placeholders = ",".join("?" * len(real_tagged_at))
+    rows = conn.execute(
+        f"SELECT recipient, campaign, persona FROM recipients WHERE recipient IN ({placeholders})",
+        list(real_tagged_at.keys()),
+    ).fetchall()
+    result = []
+    for row in rows:
+        if row["recipient"] in stopped:
+            continue
+        meta = drop_meta.get(row["recipient"], {"company": "", "role": "", "req_id": ""})
+        result.append({
+            "recipient": row["recipient"],
+            "campaign": row["campaign"],
+            "persona": row["persona"],
+            "company": meta["company"],
+            "role": meta["role"],
+            "real_tagged_at": real_tagged_at[row["recipient"]],
+        })
+    return sorted(result, key=lambda e: e["real_tagged_at"], reverse=True)
+
+
+def follow_up_reminders(conn, *, today: date = None) -> list:
+    """The "-N days, follow up" nag (post-launch): active_leads() (the exact
+    same real-tag + not-stopped roster, reused rather than re-derived — see
+    that function's own docstring for why the two must never disagree about
+    WHO counts), each with `days_since` (today minus the local calendar date
+    they were marked Real — converted via _local_date() same as every other
+    "bucket events by day" computation in this module, §5) and sorted MOST
+    OVERDUE first — the opposite ordering from active_leads()'s own
+    recency-first roster, since this widget's whole point is time pressure,
+    not "what's live."
+
+    Once someone is marked Real, GMass's own automated cadence has already
+    stopped firing for them (stop-on-reply, §3) — any further follow-up is
+    now a manual, human action, which is exactly the gap this widget nags
+    about (the existing Pipeline "follow-ups firing today/tomorrow" panel
+    only ever covers recipients GMass is STILL automatically cadencing,
+    status=='active' — a replied/Real recipient's status flips to 'replied'
+    and they fall out of that panel entirely, so nothing else on this
+    dashboard reminds the owner to personally follow up with a live lead)."""
+    today = today or date.today()
+    result = []
+    for lead in active_leads(conn):
+        tagged_date = _local_date(lead["real_tagged_at"])
+        result.append({**lead, "days_since": (today - tagged_date).days})
+    return sorted(result, key=lambda e: e["days_since"], reverse=True)
 
 
 def _recipient_drop_meta(conn) -> dict:
@@ -900,7 +1110,7 @@ def _already_corrected_to(conn) -> dict:
 
 
 def _status_chip(*, status: str, engagement: str, reply_tag, bounce_category, bounce_reason,
-                  ooo_resume_date, num_clicks: int) -> dict:
+                  ooo_resume_date, num_clicks: int, stopped: bool = False) -> dict:
     """One computed `{color, label}` per Reach-outs row — folds status,
     engagement, reply_tag, and bounce category/reason into a single display
     value (see the Reach-outs layout redesign) instead of several columns
@@ -917,7 +1127,27 @@ def _status_chip(*, status: str, engagement: str, reply_tag, bounce_category, bo
     `bounce_category`/`bounce_reason` come straight from _latest_bounce_meta()
     (the raw event meta) — `bounce_category` defaults to "bounce" the same
     way bounces() already does, `bounce_reason` is None/falsy when GMass
-    gave no reason text, never fabricated."""
+    gave no reason text, never fabricated.
+
+    `stopped` (Stop outreach, Part 2) is checked FIRST, before even
+    bounced — same reasoning as bounced's own precedence note above: "why
+    has nothing progressed on this row" is the single most decision-
+    relevant fact regardless of any PRIOR OR LATER engagement (a recipient
+    CAN be both 'stopped' and previously 'replied', or even 'bounced' via a
+    LATER bounce event that arrives after the stop — e.g. stopped after
+    already replying once the role fell through, or a since-stopped
+    address that later hard-bounces on GMass's own polling — that history
+    isn't lost, it's just not what the chip leads with). Deliberately a
+    separate boolean parameter, NOT `status == 'stopped'`: the caller
+    (reachouts_rows(), below) passes `_stopped_recipients()`'s durable,
+    append-only answer rather than `recipients.status`, because that
+    mutable column can flip AWAY from 'stopped' the moment a later
+    bounce/reply event lands for the same recipient (see
+    _stopped_recipients()'s own docstring) — this chip must keep saying
+    "Stopped" regardless."""
+    if stopped:
+        return {"color": "critical", "label": "Stopped"}
+
     if status == "bounced":
         label = "Blocked" if bounce_category == "block" else "Bounced"
         if bounce_reason:
@@ -1038,6 +1268,7 @@ def reachouts_rows(conn) -> list:
       legitimately need a second correction).
     """
     clicked = _clicked_recipients(conn)
+    stopped_recipients = _stopped_recipients(conn)
     tags = reply_tags(conn)
     drop_meta = _recipient_drop_meta(conn)
     click_details = _click_details(conn)
@@ -1075,6 +1306,7 @@ def reachouts_rows(conn) -> list:
         meta = drop_meta.get(recipient, {"company": "", "role": "", "req_id": ""})
         row_date = row["first_sent_at"] or row["last_event_at"]
         clicks = click_details.get(recipient, [])
+        is_stopped = recipient in stopped_recipients
 
         result.append({
             "recipient": recipient,
@@ -1093,10 +1325,18 @@ def reachouts_rows(conn) -> list:
             "corrected_from": corrected_from_map.get(recipient),
             "already_corrected_to": already_corrected_map.get(recipient, []),
             "clicks": clicks,
+            # stopped (Stop outreach, Part 2): from _stopped_recipients()'s
+            # durable, append-only read — NOT `status == 'stopped'` — so a
+            # later bounce/reply event can never silently un-mark this row
+            # (see _stopped_recipients()'s own docstring). Drives both the
+            # chip precedence below and reachouts.html's "hide the Stop
+            # outreach button once already stopped" gate.
+            "stopped": is_stopped,
             "chip": _status_chip(status=status, engagement=engagement, reply_tag=tags.get(recipient),
                                   bounce_category=bounce_category, bounce_reason=bounce_reason,
                                   ooo_resume_date=ooo_resume_date,
-                                  num_clicks=len(clicks) or (1 if engagement == "clicked" else 0)),
+                                  num_clicks=len(clicks) or (1 if engagement == "clicked" else 0),
+                                  stopped=is_stopped),
             # Precomputed LOCAL calendar date (YYYY-MM-DD), reusing the same
             # _local_date() conversion todays_runs()/companies_contacted()
             # already use — so the client-side date-range filter (reachouts.
@@ -1404,6 +1644,14 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
             runs=todays_runs(conn),
             companies=companies_contacted(conn, consumer_domains),
             next_drain=next_drain(conn, global_config),
+            # Active Leads / follow-up reminders (post-launch): plain,
+            # uncached SQLite reads, same as pipeline/companies_contacted
+            # above — neither depends on GMass report data (see
+            # compute_gmass_dependent_data's own module docstring for the
+            # only four widgets that do), so both are computed fresh on
+            # every load rather than routed through the Redis cache.
+            active_leads=active_leads(conn),
+            follow_up_reminders=follow_up_reminders(conn),
             # Deliberately different from this dashboard's usual "show an
             # honest empty state" default (see reachouts_rows/reply_tags for
             # that default elsewhere): the Template Failures nav link itself
@@ -1492,15 +1740,36 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
             # Both 'ooo' and 'not_interested' hit this path now (both call
             # unsubscribe_fn first) — the message stays tag-generic.
             return f"could not tag {recipient} ({tag!r}) — GMass suppression call failed, nothing was recorded: {e}", 502
-        # Any successful tag can change actionable_replies()'s output (all
-        # three tags resolve needs_triage()) — invalidate rather than let
-        # the owner's own action sit invisible in a stale cache for up to
-        # an hour. Forces the next dashboard load to take the same
+        # Any successful tag can change actionable_replies()'s output (any
+        # of the four tags resolves needs_triage()) — invalidate rather than
+        # let the owner's own action sit invisible in a stale cache for up
+        # to an hour. Forces the next dashboard load to take the same
         # stale/missing-cache fallback path as any other cache miss, never
         # a separate "partial update" mechanism.
         gmass_cache.invalidate(redis_client)
         redirect_to = request.form.get("redirect_to", "index")
         return redirect(url_for("reachouts" if redirect_to == "reachouts" else "index"))
+
+    @app.route("/reachouts/<string:recipient>/stop", methods=["POST"])
+    def stop_outreach_route(recipient):
+        # Stop outreach (Part 2, post-launch): per-recipient only (confirmed
+        # with the owner — see stop_outreach()'s own docstring for why a
+        # wider, company/persona scope was explicitly ruled out). Not routed
+        # through actionable_replies()/needs_triage() at all — unlike
+        # reply_tag above, a stop can apply to a recipient who never replied
+        # (mid-cadence, role fell through) just as easily as one who did, so
+        # there's no cached widget this needs to invalidate (active_leads()/
+        # follow_up_reminders()/pipeline() are all plain, uncached SQLite
+        # reads computed fresh on every index() load, same as before this
+        # feature — see compute_gmass_dependent_data's own module docstring
+        # for exactly which four widgets DO depend on the Redis cache; this
+        # isn't one of them).
+        try:
+            stop_outreach(get_conn(), recipient, api_key=api_key)
+        except Exception as e:
+            return (f"could not stop outreach to {recipient} — GMass suppression call failed, "
+                    f"nothing was recorded: {e}", 502)
+        return redirect(url_for("reachouts"))
 
     @app.route("/reachouts/<string:recipient>/resend", methods=["POST"])
     def resend(recipient):

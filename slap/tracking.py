@@ -65,6 +65,36 @@ CONTROL_SHEET.md, revisit when steps 6/9/10 wire in real callers):
   `bounce` + a `meta["category"]` discriminator instead of a new `block`
   type). `slap.reload` instead writes a small JSON file, fully overwritten
   on every run.
+- `reply_reviewed`'s `meta["tag"]` vocabulary grew a third value, `"unreal"`
+  (post-launch: the Reach-outs "Unreal" action, `slap.dashboard.tag_reply`).
+  A Real-tagged recipient going cold is real history, not a mistake to
+  unwind — so this is a fourth, purely-additive tag value on the SAME
+  cache-inert event type, not a rewrite of the original `reply_reviewed(tag=
+  real)` event, exactly like `not_interested` before it never rewrote a
+  prior `real`. `slap.dashboard.reply_tags()`'s existing "latest reply-
+  lifecycle event wins" resolution already handles it with zero changes —
+  a later `unreal` simply outranks the earlier `real` the same way any
+  later reply_reviewed already outranks an earlier one.
+- `stopped` (post-launch, "Stop outreach" — `slap.dashboard.stop_outreach`)
+  is a genuinely NEW state transition, unlike `unreal` above: it must
+  actually remove a recipient from every active-only query
+  (`slap.queue.due_recipients`/`due_for_ooo_resend`,
+  `slap.dashboard.pipeline`'s followups_scheduled) the same way `bounced`/
+  `done` already do, which only a real `recipients.status` value can do —
+  a cache-inert meta discriminator on an existing type (the `reply_reviewed`
+  precedent above, or bounce/block's `meta["category"]` below) was never a
+  fit here, since neither of those event types' handlers touch `status` in
+  the one way this needs. That means it — unlike template-reload's
+  diagnostic above — genuinely needs a new CHECK-constraint literal, so
+  `connect()` runs a one-time, idempotent migration
+  (`_migrate_events_check_constraint`, below) that rebuilds `events` in
+  place for any already-existing db still missing it, rather than reusing
+  an existing type just to dodge that migration. Scoped to exactly ONE
+  recipient (`meta["scope"] = "recipient"`, confirmed with the owner — a
+  literal whole-persona/campaign stop was explicitly ruled out given the
+  blast radius) — see `stop_outreach()`'s own docstring for the full
+  rationale and its GMass-suppression-first ordering, identical to
+  `ooo`/`not_interested` above.
 """
 from __future__ import annotations
 
@@ -78,12 +108,18 @@ DB_PATH = Path("slap.db")
 EVENT_TYPES = {
     "queued", "draft_created", "sent", "click", "reply", "bounce", "ooo_tagged",
     "requeued", "reply_reviewed", "run_started", "run_completed", "send_failed", "run_failed",
+    "stopped",
 }
 # Event types describing a runner/drain's own lifecycle, not a specific
 # recipient — appended to the log but never applied to the recipients cache.
 RUN_LEVEL_TYPES = {"run_started", "run_completed", "run_failed"}
 
-_SCHEMA = """
+# Kept as its own constant (not inlined into _SCHEMA) so
+# _migrate_events_check_constraint() can rebuild an old `events` table
+# against the EXACT same CREATE TABLE text a fresh db gets from _SCHEMA
+# below — one source of truth for what the table should look like, never
+# two definitions that could quietly drift apart.
+_EVENTS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TEXT NOT NULL,
@@ -91,14 +127,16 @@ CREATE TABLE IF NOT EXISTS events (
     campaign TEXT,
     type TEXT NOT NULL CHECK (type IN (
         'queued','draft_created','sent','click','reply','bounce','ooo_tagged','requeued',
-        'reply_reviewed','run_started','run_completed','send_failed','run_failed'
+        'reply_reviewed','run_started','run_completed','send_failed','run_failed','stopped'
     )),
     stage INTEGER,
     gmass_campaign_id TEXT,
     gmass_draft_id TEXT,
     meta TEXT
 );
+"""
 
+_SCHEMA = _EVENTS_TABLE_SQL + """
 CREATE TABLE IF NOT EXISTS recipients (
     recipient TEXT PRIMARY KEY,
     campaign TEXT,
@@ -127,10 +165,93 @@ class TrackingError(Exception):
     """Raised on fail-loud tracking-store misuse (e.g. an unknown event type)."""
 
 
+def _migrate_events_check_constraint(conn: sqlite3.Connection) -> None:
+    """One-time additive migration for the `stopped` event type (Stop
+    outreach, post-launch — see this module's own docstring for why it
+    genuinely needed a new CHECK-constraint literal instead of reusing an
+    existing type). A brand-new `slap.db` never hits this at all — its
+    `events` table doesn't exist yet, so `_SCHEMA`'s own `CREATE TABLE IF
+    NOT EXISTS` below creates it correctly, already including `'stopped'`,
+    with zero migration involved. An already-existing, already-populated db
+    file has the OLD constraint baked in permanently instead — `CREATE
+    TABLE IF NOT EXISTS` is a no-op against it, and SQLite has no `ALTER
+    TABLE ... ADD CHECK VALUE` (the identical limitation
+    `slap.dashboard._sync_blocks()` sidestepped by reusing `bounce` instead
+    of adding a `block` type — not an option here, see the module docstring).
+
+    Detects which case applies by reading the table's OWN recorded CREATE
+    TABLE text back from `sqlite_master` and checking for the literal
+    `'stopped'` value already in it — idempotent and safe to call on every
+    `connect()`, no separate schema-version table needed (this app has never
+    had one, and a single additive migration doesn't justify introducing
+    one now).
+
+    Migrates by the standard SQLite "12-step" rename-recreate-copy-drop
+    dance: every existing row (append-only, so every row is real history —
+    §5) is copied across verbatim, including `id`, so no event silently
+    changes identity or ordering.
+
+    **Must actually be atomic — an iron-audit BLOCKER fix.** An earlier
+    version of this function claimed to run "inside one transaction" but
+    didn't: it drove the RENAME/CREATE/COPY/DROP sequence via a mix of
+    `conn.execute()` and `conn.executescript()`, and `executescript()` (per
+    Python's own sqlite3 docs) issues an implicit `COMMIT` of any pending
+    transaction before it runs its script — durably committing the RENAME
+    (and, separately, the CREATE) the instant each ran, regardless of
+    whether `conn.commit()` was ever reached. A crash between the RENAME
+    and the final `DROP TABLE` left `events_pre_stopped_migration` holding
+    every real historical event while a brand-new, EMPTY `events` table
+    (already containing `'stopped'` in its schema text) sat next to it —
+    and since the guard below only ever inspects the live `events` table's
+    own SQL, the very next `connect()` would read that empty table, see
+    `'stopped'` already present, and conclude "already migrated" —
+    silently and permanently stranding the entire event log. Verified live
+    (not just reasoned about): `conn.executescript()` force-commits even a
+    transaction this function had ALREADY opened itself via `BEGIN`, so
+    simply adding an explicit `BEGIN` around the old code would not have
+    fixed it either — `executescript()` cannot be used anywhere inside this
+    function at all.
+
+    Fixed by driving every step through `conn.execute()` (never
+    `executescript()`) inside one explicit `BEGIN`/`COMMIT` — SQLite itself
+    fully supports transactional DDL (CREATE/ALTER/DROP TABLE all roll back
+    cleanly), it's specifically Python's sqlite3 module that force-commits
+    around non-DML statements unless an explicit transaction is already
+    open AND nothing inside it calls `executescript()`. With this fix, a
+    real interrupted migration (process killed, power loss, an unrelated
+    exception mid-copy) is rolled back by SQLite's own crash-recovery
+    (WAL/journal replay) on the very next open — no special-case "leftover
+    migration table" detection needed, and none is present here on
+    purpose: there is never a moment where a half-migrated state is
+    durably observable to a later `connect()` call, so there is nothing
+    for such a check to find."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'"
+    ).fetchone()
+    if row is None or row[0] is None or "'stopped'" in row[0]:
+        return  # fresh db (nothing to migrate yet) or already migrated
+    conn.execute("BEGIN")
+    try:
+        conn.execute("ALTER TABLE events RENAME TO events_pre_stopped_migration")
+        conn.execute(_EVENTS_TABLE_SQL)  # a single CREATE TABLE statement — execute(), never executescript()
+        conn.execute(
+            "INSERT INTO events (id, timestamp, recipient, campaign, type, stage, "
+            "gmass_campaign_id, gmass_draft_id, meta) "
+            "SELECT id, timestamp, recipient, campaign, type, stage, gmass_campaign_id, "
+            "gmass_draft_id, meta FROM events_pre_stopped_migration"
+        )
+        conn.execute("DROP TABLE events_pre_stopped_migration")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def connect(path: Path = DB_PATH) -> sqlite3.Connection:
     """Open (creating if needed) the tracking DB with the schema applied."""
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
+    _migrate_events_check_constraint(conn)
     conn.executescript(_SCHEMA)
     conn.commit()
     return conn
@@ -288,3 +409,12 @@ def _apply_event_to_cache(conn: sqlite3.Connection, event: dict) -> None:
                            last_gmass_campaign_id=event["gmass_campaign_id"], last_event_at=ts)
     elif etype == "reply_reviewed":
         return  # audit/triage marker only (step 11) — no recipients-cache-visible state change
+    elif etype == "stopped":
+        # Unlike reply_reviewed, this DOES change recipients-cache-visible
+        # state (see this module's own docstring for why 'stopped' needed a
+        # real event type rather than a meta discriminator): flipping status
+        # here is what actually removes this recipient from every active-
+        # only query (due_recipients/due_for_ooo_resend/pipeline's
+        # followups_scheduled) with no changes needed to any of them, the
+        # same single-status-column mechanism 'bounced'/'done' already use.
+        _upsert_recipient(conn, recipient, campaign=campaign, status="stopped", last_event_at=ts)

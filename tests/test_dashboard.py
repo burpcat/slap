@@ -19,11 +19,11 @@ from slap.config import GlobalConfig, ScheduleConfig
 from slap import gmass_cache, ui_state
 from slap.queue import stage_recipient
 from slap.dashboard import (
-    _click_details, _clicked_recipients, _recipient_drop_meta, actionable_replies, bounces,
-    companies_contacted, compute_gmass_dependent_data, create_app, engagement_intelligence,
-    filter_reachouts, get_gmass_dependent_data, needs_triage, next_drain, pipeline, reachouts_rows,
-    reply_tags, sync_reports, tag_reply, template_failures, this_week, today_strip, todays_runs,
-    visible_warm_but_silent, warm_but_silent,
+    _click_details, _clicked_recipients, _recipient_drop_meta, active_leads, actionable_replies,
+    bounces, companies_contacted, compute_gmass_dependent_data, create_app, engagement_intelligence,
+    filter_reachouts, follow_up_reminders, get_gmass_dependent_data, needs_triage, next_drain,
+    pipeline, reachouts_rows, reply_tags, stop_outreach, sync_reports, tag_reply, template_failures,
+    this_week, today_strip, todays_runs, visible_warm_but_silent, warm_but_silent,
 )
 from slap.reload import ReloadFailure, write_failures
 from slap.tracking import append_event, connect
@@ -1864,6 +1864,250 @@ def test_reply_tags_agrees_with_needs_triage_on_who_is_still_open(conn):
     assert tags["resolved@x.com"] == "real"
 
 
+# --- tag_reply: unreal -------------------------------------------------------
+
+def test_tag_reply_unreal_writes_reply_reviewed_and_never_calls_unsubscribe(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
+    tag_reply(conn, "a@x.com", "real")
+
+    def boom(api_key, email):
+        raise AssertionError("unreal must never call GMass")
+
+    tag_reply(conn, "a@x.com", "unreal", unsubscribe_fn=boom)
+    assert reply_tags(conn) == {"a@x.com": "unreal"}
+
+
+def test_tag_reply_unreal_supersedes_real(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
+    tag_reply(conn, "a@x.com", "real")
+    assert reply_tags(conn) == {"a@x.com": "real"}
+    tag_reply(conn, "a@x.com", "unreal")
+    assert reply_tags(conn) == {"a@x.com": "unreal"}
+
+
+# --- active_leads / follow_up_reminders --------------------------------------
+
+def test_active_leads_lists_real_tagged_recipients(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter", company="Acme")
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
+    tag_reply(conn, "a@x.com", "real")
+
+    leads = active_leads(conn)
+    assert len(leads) == 1
+    assert leads[0]["recipient"] == "a@x.com"
+    assert leads[0]["company"] == "Acme"
+    assert leads[0]["campaign"] == "c"
+    assert leads[0]["persona"] == "recruiter"
+    assert leads[0]["real_tagged_at"]
+
+
+def test_active_leads_excludes_untagged_and_not_interested(conn):
+    _stage_and_send(conn, recipient="untagged@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="reply", recipient="untagged@x.com", campaign="c")
+
+    _stage_and_send(conn, recipient="not_interested@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="reply", recipient="not_interested@x.com", campaign="c")
+    tag_reply(conn, "not_interested@x.com", "not_interested", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+
+    assert active_leads(conn) == []
+
+
+def test_active_leads_excludes_unreal(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
+    tag_reply(conn, "a@x.com", "real")
+    assert len(active_leads(conn)) == 1
+    tag_reply(conn, "a@x.com", "unreal")
+    assert active_leads(conn) == []
+
+
+def test_active_leads_excludes_stopped_recipient_even_though_still_tagged_real(conn):
+    # Stop outreach is a SEPARATE axis from Real/Unreal (append-only — Stop
+    # outreach never rewrites the reply tag), so a stopped recipient must
+    # fall out of Active Leads via the append-only 'stopped' event.
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
+    tag_reply(conn, "a@x.com", "real")
+    assert len(active_leads(conn)) == 1
+
+    stop_outreach(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    assert active_leads(conn) == []
+    assert reply_tags(conn)["a@x.com"] == "real"  # the tag itself is untouched
+
+
+def test_active_leads_stays_excluded_after_a_later_bounce_overwrites_status(conn):
+    # An iron-audit SHOULD-FIX: sync_reports() re-polls every known campaign
+    # regardless of any local stop, so a real GMass bounce CAN arrive after
+    # stop_outreach() and overwrite recipients.status away from 'stopped'.
+    # active_leads() must still exclude this recipient — it checks the
+    # append-only 'stopped' event's own existence, not the mutable status
+    # column, so it can never be silently re-admitted this way.
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
+    tag_reply(conn, "a@x.com", "real")
+    stop_outreach(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    assert active_leads(conn) == []
+
+    append_event(conn, type="bounce", recipient="a@x.com", campaign="c",
+                 meta={"bounce_reason": "mailbox full", "bounce_time": "t1", "category": "bounce"})
+    row = conn.execute("SELECT status FROM recipients WHERE recipient = ?", ("a@x.com",)).fetchone()
+    assert row["status"] == "bounced"  # confirms the status column really did flip
+    assert active_leads(conn) == []  # active_leads() is unaffected either way
+
+
+def test_active_leads_sorted_most_recent_first(conn):
+    _stage_and_send(conn, recipient="old@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="reply", recipient="old@x.com", campaign="c", timestamp=_ts(1))
+    append_event(conn, type="reply_reviewed", recipient="old@x.com", campaign="c",
+                 meta={"tag": "real"}, timestamp=_ts(1))
+
+    _stage_and_send(conn, recipient="new@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="reply", recipient="new@x.com", campaign="c", timestamp=_ts(2))
+    append_event(conn, type="reply_reviewed", recipient="new@x.com", campaign="c",
+                 meta={"tag": "real"}, timestamp=_ts(2))
+
+    leads = active_leads(conn)
+    assert [l["recipient"] for l in leads] == ["new@x.com", "old@x.com"]
+
+
+def test_follow_up_reminders_reuses_active_leads_and_adds_days_since(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter", company="Acme")
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c", timestamp=_ts(0))
+    append_event(conn, type="reply_reviewed", recipient="a@x.com", campaign="c",
+                 meta={"tag": "real"}, timestamp=_ts(0))
+
+    reminders = follow_up_reminders(conn, today=_ts(0).date() + timedelta(days=4))
+    assert len(reminders) == 1
+    assert reminders[0]["recipient"] == "a@x.com"
+    assert reminders[0]["company"] == "Acme"
+    assert reminders[0]["days_since"] == 4
+
+
+def test_follow_up_reminders_sorted_most_overdue_first(conn):
+    _stage_and_send(conn, recipient="recent@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="reply", recipient="recent@x.com", campaign="c", timestamp=_ts(9))
+    append_event(conn, type="reply_reviewed", recipient="recent@x.com", campaign="c",
+                 meta={"tag": "real"}, timestamp=_ts(9))
+
+    _stage_and_send(conn, recipient="overdue@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="reply", recipient="overdue@x.com", campaign="c", timestamp=_ts(0))
+    append_event(conn, type="reply_reviewed", recipient="overdue@x.com", campaign="c",
+                 meta={"tag": "real"}, timestamp=_ts(0))
+
+    reminders = follow_up_reminders(conn, today=_ts(20).date())
+    assert [r["recipient"] for r in reminders] == ["overdue@x.com", "recent@x.com"]
+
+
+def test_follow_up_reminders_excludes_stopped(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
+    tag_reply(conn, "a@x.com", "real")
+    stop_outreach(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    assert follow_up_reminders(conn) == []
+
+
+def test_follow_up_reminders_empty_when_no_active_leads(conn):
+    assert follow_up_reminders(conn) == []
+
+
+# --- stop_outreach -------------------------------------------------------------
+
+def test_stop_outreach_writes_stopped_event_and_sets_status(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    stop_outreach(conn, "a@x.com", api_key="fake-key", unsubscribe_fn=_fake_unsubscribe)
+    row = conn.execute("SELECT status FROM recipients WHERE recipient = ?", ("a@x.com",)).fetchone()
+    assert row["status"] == "stopped"
+    events = [dict(r) for r in conn.execute("SELECT * FROM events WHERE type = 'stopped'")]
+    assert len(events) == 1
+    assert json.loads(events[0]["meta"]) == {"scope": "recipient"}
+
+
+def test_stop_outreach_calls_unsubscribe_before_recording_anything_locally(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+
+    def failing_unsubscribe(api_key, email):
+        raise RuntimeError("simulated GMass failure")
+
+    with pytest.raises(RuntimeError, match="simulated GMass failure"):
+        stop_outreach(conn, "a@x.com", api_key="fake-key", unsubscribe_fn=failing_unsubscribe)
+    assert conn.execute("SELECT * FROM events WHERE type = 'stopped'").fetchone() is None
+    row = conn.execute("SELECT status FROM recipients WHERE recipient = ?", ("a@x.com",)).fetchone()
+    assert row["status"] == "active"
+
+
+def test_stop_outreach_calls_unsubscribe_with_recipient_and_api_key(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    captured = {}
+
+    def capturing_unsubscribe(api_key, email):
+        captured["api_key"] = api_key
+        captured["email"] = email
+        return _fake_unsubscribe(api_key, email)
+
+    stop_outreach(conn, "a@x.com", api_key="the-real-key", unsubscribe_fn=capturing_unsubscribe)
+    assert captured == {"api_key": "the-real-key", "email": "a@x.com"}
+
+
+def test_stop_outreach_removes_recipient_from_due_recipients(conn):
+    from slap.queue import due_recipients
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter", send=False)
+    assert len(due_recipients(conn)) == 1
+    stop_outreach(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    assert due_recipients(conn) == []
+
+
+def test_stop_outreach_does_not_affect_pipeline_for_other_recipients(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    _stage_and_send(conn, recipient="b@x.com", campaign="c", persona="recruiter")
+    stop_outreach(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    result = pipeline(conn, make_global_config())
+    all_active = [r for stage_list in result["mid_sequence_by_stage"].values() for r in stage_list]
+    assert "a@x.com" not in all_active
+    assert "b@x.com" in all_active
+
+
+# --- _status_chip: stopped -----------------------------------------------------
+
+def test_reachouts_rows_chip_stopped(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    stop_outreach(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    rows = reachouts_rows(conn)
+    row = next(r for r in rows if r["recipient"] == "a@x.com")
+    assert row["chip"] == {"color": "critical", "label": "Stopped"}
+
+
+def test_reachouts_rows_chip_stopped_takes_priority_over_replied(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
+    stop_outreach(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    rows = reachouts_rows(conn)
+    row = next(r for r in rows if r["recipient"] == "a@x.com")
+    assert row["chip"]["label"] == "Stopped"
+    assert row["engagement"] == "replied"  # history preserved, just not what the chip leads with
+
+
+def test_reachouts_rows_chip_stays_stopped_after_a_later_bounce_overwrites_status(conn):
+    # An iron-audit SHOULD-FIX: a LATER bounce event (sync_reports() re-
+    # polling regardless of any local stop) flips recipients.status away
+    # from 'stopped' to 'bounced' — the chip must still say "Stopped", and
+    # the row's own `stopped` field (which reachouts.html gates the "Stop
+    # outreach" button on) must still be True.
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    stop_outreach(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    append_event(conn, type="bounce", recipient="a@x.com", campaign="c",
+                 meta={"bounce_reason": "mailbox full", "bounce_time": "t1", "category": "bounce"})
+
+    row = conn.execute("SELECT status FROM recipients WHERE recipient = ?", ("a@x.com",)).fetchone()
+    assert row["status"] == "bounced"  # confirms the status column really did flip
+
+    rows = reachouts_rows(conn)
+    reachout = next(r for r in rows if r["recipient"] == "a@x.com")
+    assert reachout["stopped"] is True
+    assert reachout["chip"] == {"color": "critical", "label": "Stopped"}
+
+
 # --- _recipient_drop_meta -----------------------------------------------------
 
 def test_recipient_drop_meta_reads_latest_queued_event(conn):
@@ -2514,6 +2758,116 @@ def test_create_app_reachouts_not_interested_action_calls_unsubscribe(app, tmp_p
         assert resp.status_code == 302
         assert resp.headers["Location"] == "/reachouts"
         mock_unsub.assert_called_once_with("fake-key", "replied@acme.com")
+
+
+def test_create_app_reachouts_unreal_button_only_when_tagged_real(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    _stage_and_send(conn, recipient="real@acme.com", campaign="c", persona="founder")
+    append_event(conn, type="reply", recipient="real@acme.com", campaign="c")
+    append_event(conn, type="reply_reviewed", recipient="real@acme.com", campaign="c", meta={"tag": "real"})
+    _stage_and_send(conn, recipient="untagged@acme.com", campaign="c", persona="founder")
+    append_event(conn, type="reply", recipient="untagged@acme.com", campaign="c")
+    conn.close()
+
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+        client = app.test_client()
+        resp = client.get("/reachouts")
+
+    body = resp.data.decode()
+    real_row = body[body.index('data-recipient="real@acme.com"'):body.index('data-recipient="untagged@acme.com"')]
+    untagged_row = body[body.index('data-recipient="untagged@acme.com"'):]
+    assert 'value="unreal"' in real_row
+    assert 'value="unreal"' not in untagged_row
+
+
+def test_create_app_reply_tag_unreal_never_calls_unsubscribe_and_redirects(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    _stage_and_send(conn, recipient="a@acme.com", campaign="c", persona="founder")
+    append_event(conn, type="reply", recipient="a@acme.com", campaign="c")
+    append_event(conn, type="reply_reviewed", recipient="a@acme.com", campaign="c", meta={"tag": "real"})
+    conn.close()
+
+    with patch("slap.dashboard.gmass.unsubscribe_recipient") as mock_unsub:
+        client = app.test_client()
+        resp = client.post("/reply/a@acme.com/tag", data={"tag": "unreal", "redirect_to": "reachouts"})
+        assert resp.status_code == 302
+        assert resp.headers["Location"] == "/reachouts"
+        mock_unsub.assert_not_called()
+
+    conn = connect(tmp_path / "test.db")
+    assert reply_tags(conn)["a@acme.com"] == "unreal"
+
+
+def test_create_app_stop_outreach_route_calls_unsubscribe_and_redirects(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    _stage_and_send(conn, recipient="a@acme.com", campaign="c", persona="founder")
+    conn.close()
+
+    with patch("slap.dashboard.gmass.unsubscribe_recipient", return_value=_fake_unsubscribe(None, None)) as mock_unsub:
+        client = app.test_client()
+        resp = client.post("/reachouts/a@acme.com/stop")
+        assert resp.status_code == 302
+        assert resp.headers["Location"] == "/reachouts"
+        mock_unsub.assert_called_once_with("fake-key", "a@acme.com")
+
+    conn = connect(tmp_path / "test.db")
+    row = conn.execute("SELECT status FROM recipients WHERE recipient = ?", ("a@acme.com",)).fetchone()
+    assert row["status"] == "stopped"
+
+
+def test_create_app_stop_outreach_route_failure_returns_502_and_records_nothing(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    _stage_and_send(conn, recipient="a@acme.com", campaign="c", persona="founder")
+    conn.close()
+
+    def failing_unsubscribe(api_key, email):
+        raise RuntimeError("simulated GMass failure")
+
+    with patch("slap.dashboard.gmass.unsubscribe_recipient", side_effect=failing_unsubscribe):
+        client = app.test_client()
+        resp = client.post("/reachouts/a@acme.com/stop")
+        assert resp.status_code == 502
+
+    conn = connect(tmp_path / "test.db")
+    assert conn.execute("SELECT * FROM events WHERE type = 'stopped'").fetchone() is None
+    row = conn.execute("SELECT status FROM recipients WHERE recipient = ?", ("a@acme.com",)).fetchone()
+    assert row["status"] == "active"
+
+
+def test_create_app_reachouts_stop_button_hidden_once_already_stopped(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    _stage_and_send(conn, recipient="stopped@acme.com", campaign="c", persona="founder")
+    stop_outreach(conn, "stopped@acme.com", api_key="fake-key", unsubscribe_fn=_fake_unsubscribe)
+    _stage_and_send(conn, recipient="active@acme.com", campaign="c", persona="founder")
+    conn.close()
+
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+        client = app.test_client()
+        resp = client.get("/reachouts")
+
+    body = resp.data.decode()
+    stopped_row = body[body.index('data-recipient="stopped@acme.com"'):body.index('data-recipient="active@acme.com"')]
+    active_row = body[body.index('data-recipient="active@acme.com"'):]
+    assert '/reachouts/stopped@acme.com/stop' not in stopped_row
+    assert '/reachouts/active@acme.com/stop' in active_row
+
+
+def test_create_app_index_renders_active_leads_and_follow_up_reminders(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    _stage_and_send(conn, recipient="lead@acme.com", campaign="c", persona="founder", company="Acme")
+    append_event(conn, type="reply", recipient="lead@acme.com", campaign="c")
+    append_event(conn, type="reply_reviewed", recipient="lead@acme.com", campaign="c", meta={"tag": "real"})
+    conn.close()
+
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+        client = app.test_client()
+        resp = client.get("/")
+
+    assert resp.status_code == 200
+    body = resp.data.decode()
+    assert "Active leads" in body
+    assert "lead@acme.com" in body
+    assert "Follow-up reminders" in body
 
 
 def _stage_and_bounce(conn, tmp_path, *, recipient, campaign="c", company=""):
