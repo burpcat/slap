@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{% block title %}slap dashboard{% endblock %}</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+{% block extra_style %}{% endblock %}
+</head>
+<body>
+
+<header class="topbar">
+  <h1>slap</h1>
+  <nav class="pages">
+    <a href="{{ url_for('index') }}" class="{{ 'current' if request.endpoint == 'index' }}">Home</a>
+    <a href="{{ url_for('pipeline_page') }}" class="{{ 'current' if request.endpoint == 'pipeline_page' }}">Pipeline</a>
+    <a href="{{ url_for('engagement_page') }}" class="{{ 'current' if request.endpoint == 'engagement_page' }}">Engagement</a>
+    <a href="{{ url_for('deliverability_page') }}" class="{{ 'current' if request.endpoint == 'deliverability_page' }}">Deliverability</a>
+    <a href="{{ url_for('reachouts') }}" class="{{ 'current' if request.endpoint == 'reachouts' }}">Reach-outs</a>
+    {% if template_failures_count %}
+    <a href="{{ url_for('template_failures_page') }}" class="{{ 'current' if request.endpoint == 'template_failures_page' }}">Template Failures ({{ template_failures_count }})</a>
+    {% endif %}
+  </nav>
+  <button id="theme-toggle" type="button">Auto</button>
+</header>
+
+{% if sync_result is defined %}
+<p class="synced">
+  last synced: {{ sync_result.synced_at | to_local }}
+  &middot; +{{ sync_result.new_replies }} replies, +{{ sync_result.new_clicks }} clicks, +{{ sync_result.new_bounces }} bounces this sync
+  {% if cache_status == 'redis_unavailable' %}
+  &middot; <span class="badge warn">cache unavailable — data below may be empty until Redis is back</span>
+  {% elif cache_status == 'stale_refreshing' %}
+  &middot; <span class="badge warn">data may be stale — refreshing in the background</span>
+  &middot; <form class="tag-form" method="post" action="/gmass/refresh"><button class="tag-btn" type="submit">Refresh now</button></form>
+  {% endif %}
+</p>
+{% if sync_result.errors %}
+<div class="panel full" style="margin: 0 24px 20px; border-color: var(--critical);">
+  <h2 style="color: var(--critical);">Sync errors — some replies/clicks/bounces may be missing</h2>
+  <ul class="plain">
+    {% for err in sync_result.errors %}
+    <li><span class="badge critical">error</span> {{ err }}</li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+{% endif %}
+
+<main>
+{% block content %}{% endblock %}
+</main>
+
+<script>
+// Theme toggle: cycles Auto -> Light -> Dark -> Auto, persisted in
+// localStorage. Same scale as the existing tiny vanilla-JS already in
+// reachouts.html -- not a new dependency layer.
+(function () {
+  var ORDER = [null, 'light', 'dark'];
+  var btn = document.getElementById('theme-toggle');
+  var stored = localStorage.getItem('slap-theme');
+  if (stored) document.documentElement.setAttribute('data-theme', stored);
+  function label() {
+    var t = document.documentElement.getAttribute('data-theme');
+    btn.textContent = t === 'dark' ? 'Dark' : t === 'light' ? 'Light' : 'Auto';
+  }
+  label();
+  btn.addEventListener('click', function () {
+    var cur = document.documentElement.getAttribute('data-theme');
+    var next = ORDER[(ORDER.indexOf(cur) + 1) % ORDER.length];
+    if (next === null) {
+      document.documentElement.removeAttribute('data-theme');
+      localStorage.removeItem('slap-theme');
+    } else {
+      document.documentElement.setAttribute('data-theme', next);
+      localStorage.setItem('slap-theme', next);
+    }
+    label();
+  });
+})();
+</script>
+{% block extra_js %}{% endblock %}
+</body>
+</html>
