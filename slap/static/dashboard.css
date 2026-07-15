@@ -1,0 +1,206 @@
+/* Shared stylesheet for every dashboard page (Build Order step 11 + the
+   post-launch multi-page redesign). Served by Flask's default static
+   handling — slap/dashboard.py's create_app() needs no static_folder
+   override for this to resolve at /static/dashboard.css.
+
+   Palette: the exact reference palette from the dataviz skill (this app
+   already used its light-mode values hex-for-hex before this redesign) —
+   the dark-mode values below are the skill's own pre-validated dark
+   column, not invented. Light is the default; dark applies via
+   prefers-color-scheme UNLESS the viewer explicitly picked light
+   (data-theme="light"), and unconditionally via data-theme="dark" — see
+   base.html's theme-toggle script. */
+
+:root {
+  color-scheme: light;
+  --surface-1: #fcfcfb; --page: #f9f9f7;
+  --text-primary: #0b0b0b; --text-secondary: #52514e; --text-muted: #898781;
+  --hairline: #e1e0d9; --border: rgba(11,11,11,0.10);
+  --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
+  --series-1: #2a78d6;
+  /* Fixed — status fills don't change with theme, so neither does the ink
+     that reads on them (see the chip-good/chip-serious contrast fix
+     below: var(--text-primary) would be wrong here since IT flips to
+     white in dark mode, which would reintroduce the same failure). */
+  --ink-on-status: #0b0b0b;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --surface-1: #1a1a19; --page: #0d0d0d;
+    --text-primary: #ffffff; --text-secondary: #c3c2b7;
+    --hairline: #2c2c2a; --border: rgba(255,255,255,0.10);
+    --series-1: #3987e5;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface-1: #1a1a19; --page: #0d0d0d;
+  --text-primary: #ffffff; --text-secondary: #c3c2b7;
+  --hairline: #2c2c2a; --border: rgba(255,255,255,0.10);
+  --series-1: #3987e5;
+}
+
+* { box-sizing: border-box; }
+body {
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: var(--page); color: var(--text-primary);
+  margin: 0; font-size: 14px; line-height: 1.5;
+}
+a { color: inherit; }
+h1 { font-size: 18px; margin: 0 0 4px; }
+h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.04em;
+     color: var(--text-secondary); margin: 0 0 12px; }
+
+/* Page chrome: header/nav/theme toggle, shared by every page via base.html. */
+header.topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 24px; border-bottom: 1px solid var(--hairline);
+  background: var(--surface-1);
+}
+header.topbar h1 { font-size: 15px; margin: 0; font-weight: 600; }
+nav.pages { display: flex; gap: 18px; font-size: 13px; }
+nav.pages a { color: var(--text-secondary); text-decoration: none; padding: 4px 0; }
+nav.pages a.current { color: var(--text-primary); font-weight: 600; border-bottom: 2px solid var(--series-1); }
+nav.pages a:hover { color: var(--text-primary); }
+button#theme-toggle {
+  font-size: 12px; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--border);
+  background: var(--surface-1); color: var(--text-secondary); cursor: pointer;
+}
+button#theme-toggle:hover { color: var(--text-primary); border-color: var(--text-secondary); }
+
+main { padding: 24px; max-width: 1400px; margin: 0 auto; }
+
+.synced { color: var(--text-muted); font-size: 12px; margin: 0 24px 20px; }
+a.back { color: var(--text-secondary); font-size: 13px; }
+.count { color: var(--text-muted); font-size: 12px; margin: 8px 0 16px; }
+
+/* Stat tiles (Metrics panel, Reachouts summary strip). */
+.stat-row { display: flex; gap: 24px; flex-wrap: wrap; margin-bottom: 8px; }
+.stat-strip { display: flex; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
+.stat-tile { min-width: 90px; }
+.stat-tile .value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.stat-tile .label { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
+
+/* Panels (the grid every page's content lives in). */
+.panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+.panel { background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+.panel.full { grid-column: 1 / -1; }
+
+/* Daily-cap gauge. Track tints toward the SAME severity color as the fill
+   (a lighter step via color-mix against the live surface, so it stays
+   theme-correct automatically) rather than a flat neutral gray regardless
+   of severity -- the dataviz skill's meter spec: "the unfilled track is a
+   lighter step of the same ramp." */
+.gauge-track { background: var(--hairline); border-radius: 6px; height: 10px; overflow: hidden; margin: 6px 0; }
+.gauge-track.good     { background: color-mix(in oklab, var(--good) 22%, var(--surface-1)); }
+.gauge-track.warning  { background: color-mix(in oklab, var(--warning) 22%, var(--surface-1)); }
+.gauge-track.critical { background: color-mix(in oklab, var(--critical) 22%, var(--surface-1)); }
+.gauge-fill { height: 100%; border-radius: 6px; }
+.gauge-fill.good { background: var(--good); }
+.gauge-fill.warning { background: var(--warning); }
+.gauge-fill.critical { background: var(--critical); }
+
+/* Tables. */
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--hairline); }
+th { color: var(--text-secondary); font-weight: 500; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.reason { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.muted { color: var(--text-muted); }
+.empty { color: var(--text-muted); font-style: italic; padding: 16px 0; }
+ul.plain { list-style: none; padding: 0; margin: 0; }
+ul.plain li { padding: 3px 0; }
+
+/* Reachouts-page table variant: rounded/bordered card, sortable headers. */
+table.data-table { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+table.data-table th { cursor: pointer; user-select: none; white-space: nowrap; }
+table.data-table th:hover { color: var(--text-primary); }
+table.data-table th .arrow { font-size: 10px; color: var(--text-muted); }
+
+/* Badges (small inline status labels — errors, "seen before", RUN FAILED). */
+.badge { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 11px; }
+.badge.critical { background: var(--critical); color: white; }
+.badge.warn { background: var(--warning); color: var(--text-primary); }
+
+/* Status chips (Reachouts row status). chip-good/chip-serious use the
+   fixed --ink-on-status dark ink, not white -- computed WCAG contrast
+   fix: white-on-fill was 3.36:1 (good) / 2.64:1 (serious), both failing
+   the 4.5:1 AA requirement in both light and dark mode (the fill hex
+   never changes between themes). Dark ink clears 5.86:1 / 7.46:1.
+   chip-critical keeps white (4.81:1, the only one that actually passes). */
+.chip { display: inline-block; padding: 2px 9px; border-radius: 10px; font-size: 12px; white-space: nowrap; font-weight: 500; }
+.chip-critical { background: var(--critical); color: #ffffff; }
+.chip-good     { background: var(--good);     color: var(--ink-on-status); }
+.chip-serious  { background: var(--serious);  color: var(--ink-on-status); }
+.chip-neutral  { background: var(--hairline); color: var(--text-primary); }
+
+/* Forms / buttons shared across triage, OOO, resend, stop-outreach actions. */
+form.tag-form { display: flex; gap: 4px; margin-top: 4px; align-items: center; }
+button.tag-btn {
+  font-size: 12px; padding: 3px 8px; border-radius: 4px;
+  border: 1px solid var(--border); background: var(--surface-1); cursor: pointer; white-space: nowrap;
+}
+button.tag-btn:hover { background: var(--hairline); }
+button.tag-btn.danger { border-color: var(--critical); color: var(--critical); }
+button.tag-btn.danger:hover { background: var(--critical); color: white; }
+input.ooo-date { font-size: 12px; padding: 2px 4px; margin-right: 4px; border: 1px solid var(--border); border-radius: 4px; }
+.warning-banner { background: #fdf3d9; border: 1px solid var(--warning); border-radius: 6px; padding: 8px 12px; margin: 12px 0; font-size: 13px; }
+
+/* Reachouts row-action menu: one unified overflow menu instead of N
+   conditional inline buttons -- native <details>/<summary>, zero new JS
+   dependency. Generic enough to live here rather than page-specific CSS,
+   in case a future page wants the same per-row-menu treatment. */
+details.row-menu { position: relative; display: inline-block; }
+details.row-menu > summary {
+  list-style: none; cursor: pointer; width: 26px; height: 26px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 6px; border: 1px solid var(--border); color: var(--text-secondary);
+  font-size: 16px;
+}
+details.row-menu > summary::-webkit-details-marker { display: none; }
+details.row-menu > summary:hover, details.row-menu[open] > summary { background: var(--page); color: var(--text-primary); }
+details.row-menu .menu-panel {
+  position: absolute; right: 0; top: calc(100% + 4px); z-index: 20;
+  min-width: 230px; background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: 8px; padding: 6px; display: flex; flex-direction: column; gap: 2px;
+}
+details.row-menu .menu-panel form { display: flex; gap: 6px; align-items: center; padding: 3px 6px; }
+details.row-menu .menu-panel input[type="date"], details.row-menu .menu-panel input[type="email"] {
+  font-size: 12px; padding: 3px 5px; border: 1px solid var(--border); border-radius: 4px;
+  background: var(--page); color: var(--text-primary); width: 100%;
+}
+.menu-item {
+  all: unset; cursor: pointer; padding: 6px 8px; border-radius: 5px; font-size: 13px;
+  color: var(--text-primary); width: 100%; box-sizing: border-box;
+}
+.menu-item:hover { background: var(--page); }
+.menu-item.danger { color: var(--critical); }
+.menu-item.danger:hover { background: var(--critical); color: #ffffff; }
+.menu-divider { height: 1px; background: var(--hairline); margin: 4px 2px; }
+
+.expand-toggle { background: none; border: none; cursor: pointer; color: var(--text-muted); font-size: 11px; padding: 0 0 0 6px; }
+.expand-toggle:hover { color: var(--text-primary); }
+tr.detail-row { display: none; }
+tr.detail-row.open { display: table-row; }
+tr.detail-row td { background: var(--page); font-size: 12px; }
+
+/* OOO-paused rows fade until they actually resume -- keyed off
+   data-status (which stays 'ooo_requeued' until the resend fires), not
+   resume_date compared client-side (status can lag the resume date by up
+   to one drain cycle -- see reachouts_rows()'s own docstring). */
+tr.row[data-status="ooo_requeued"] { opacity: 0.55; }
+
+/* Filters bar (Reachouts). */
+.filters {
+  display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end;
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+  padding: 14px; margin-bottom: 16px;
+}
+.filters .field { display: flex; flex-direction: column; gap: 3px; }
+.filters label { font-size: 11px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.03em; }
+.filters select, .filters input {
+  font-size: 13px; padding: 5px 7px; border: 1px solid var(--border); border-radius: 5px;
+  background: var(--page); color: var(--text-primary);
+}
+.filters input[type="search"] { min-width: 180px; }

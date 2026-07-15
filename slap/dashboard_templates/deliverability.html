@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}slap dashboard — deliverability{% endblock %}
+{% block content %}
+
+<div class="panels">
+
+  <div class="panel">
+    <h2>Bounces &amp; blocks</h2>
+    {% if bounces %}
+    <table>
+      <tr><th>Recipient</th><th>Campaign</th><th>Type</th><th>Reason</th><th>Last event</th></tr>
+      {% for b in bounces %}
+      <tr>
+        <td>{{ b.recipient }}</td>
+        <td>{{ b.campaign }}</td>
+        <td>{% if b.category == 'block' %}<span class="badge warn">Blocked</span>{% else %}Bounced{% endif %}</td>
+        <td class="reason" title="{{ b.reason }}">{{ b.reason | truncate(60) if b.reason else '—' }}</td>
+        <td>{{ b.last_event_at | to_local }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <p class="empty">No bounces or blocks.</p>
+    {% endif %}
+  </div>
+
+  <div class="panel">
+    <h2>Stopped outreach</h2>
+    {% if stopped_outreach %}
+    <table>
+      <tr><th>Recipient</th><th>Company</th><th>Campaign</th><th>Stopped</th></tr>
+      {% for s in stopped_outreach %}
+      <tr>
+        <td>{{ s.recipient }}</td>
+        <td>{{ s.company if s.company else '—' }}</td>
+        <td>{{ s.campaign or '—' }}</td>
+        <td>{{ s.stopped_at | to_local if s.stopped_at else '—' }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <p class="empty">No stopped outreach.</p>
+    {% endif %}
+  </div>
+
+</div>
+{% endblock %}

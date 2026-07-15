@@ -1,85 +1,7 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>slap dashboard — reach-outs</title>
-<style>
-  :root {
-    --surface-1: #fcfcfb; --page: #f9f9f7;
-    --text-primary: #0b0b0b; --text-secondary: #52514e; --text-muted: #898781;
-    --hairline: #e1e0d9; --border: rgba(11,11,11,0.10);
-    --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
-  }
-  * { box-sizing: border-box; }
-  body {
-    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-    background: var(--page); color: var(--text-primary);
-    margin: 0; padding: 24px; font-size: 14px;
-  }
-  h1 { font-size: 18px; margin: 0 0 4px; }
-  a.back { color: var(--text-secondary); font-size: 13px; }
-  .count { color: var(--text-muted); font-size: 12px; margin: 8px 0 16px; }
-  .filters {
-    display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end;
-    background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px;
-    padding: 12px; margin-bottom: 16px;
-  }
-  .filters .field { display: flex; flex-direction: column; gap: 3px; }
-  .filters label { font-size: 11px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.03em; }
-  .filters select, .filters input {
-    font-size: 13px; padding: 4px 6px; border: 1px solid var(--border); border-radius: 4px;
-    background: white; color: var(--text-primary);
-  }
-  .filters input[type="search"] { min-width: 180px; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; background: var(--surface-1);
-          border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
-  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--hairline); }
-  th { color: var(--text-secondary); font-weight: 500; cursor: pointer; user-select: none; white-space: nowrap; }
-  th:hover { color: var(--text-primary); }
-  th .arrow { font-size: 10px; color: var(--text-muted); }
-  .muted { color: var(--text-muted); }
-  .empty { color: var(--text-muted); font-style: italic; padding: 16px 0; }
-  ul.plain { list-style: none; padding: 0; margin: 0; }
-  ul.plain li { padding: 2px 0; }
-  form.ooo-form { display: flex; gap: 4px; align-items: center; }
-  form.ooo-form input[type="date"] { font-size: 12px; padding: 2px 4px; border: 1px solid var(--border);
-                                      border-radius: 4px; }
-  form.ooo-form button { font-size: 12px; padding: 3px 8px; border-radius: 4px; border: 1px solid var(--border);
-                          background: var(--surface-1); cursor: pointer; white-space: nowrap; }
-  form.ooo-form button:hover { background: var(--hairline); }
-  form.tag-form { display: flex; gap: 4px; margin-top: 4px; }
-  button.tag-btn { font-size: 12px; padding: 3px 8px; border-radius: 4px; border: 1px solid var(--border);
-                    background: var(--surface-1); cursor: pointer; white-space: nowrap; }
-  button.tag-btn:hover { background: var(--hairline); }
-  form.stop-form { display: flex; gap: 4px; margin-top: 4px; }
-  button.tag-btn.danger { border-color: var(--critical); color: var(--critical); }
-  button.tag-btn.danger:hover { background: var(--critical); color: white; }
-  .warning-banner { background: #fdf3d9; border: 1px solid var(--warning); border-radius: 6px;
-                     padding: 8px 12px; margin: 12px 0; font-size: 13px; }
-  form.resend-form { display: flex; gap: 4px; align-items: center; margin-top: 4px; }
-  form.resend-form input[type="email"] { font-size: 12px; padding: 2px 4px; border: 1px solid var(--border);
-                                          border-radius: 4px; min-width: 160px; }
-  .chip { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; white-space: nowrap; }
-  .chip-critical { background: var(--critical); color: white; }
-  .chip-good { background: var(--good); color: white; }
-  .chip-serious { background: var(--serious); color: white; }
-  .chip-neutral { background: var(--hairline); color: var(--text-primary); }
-  .expand-toggle { background: none; border: none; cursor: pointer; color: var(--text-muted);
-                   font-size: 11px; padding: 0 0 0 6px; }
-  .expand-toggle:hover { color: var(--text-primary); }
-  tr.detail-row { display: none; }
-  tr.detail-row.open { display: table-row; }
-  tr.detail-row td { background: var(--page); font-size: 12px; }
-  /* OOO-paused rows fade until they actually resume -- keyed off data-status
-     (which stays 'ooo_requeued' until the resend fires), not resume_date
-     compared client-side (status can lag the resume date by up to one
-     drain cycle -- see reachouts_rows()'s own docstring). */
-  tr.row[data-status="ooo_requeued"] { opacity: 0.55; }
-</style>
-</head>
-<body>
+{% extends "base.html" %}
+{% block title %}slap dashboard — reach-outs{% endblock %}
+{% block content %}
 
-<a class="back" href="/">&larr; back to dashboard</a>
 <h1>Reach-outs</h1>
 
 {% if warning %}
@@ -89,7 +11,12 @@
 {% if total_count == 0 %}
 <p class="empty">No reach-outs yet — nothing staged or sent.</p>
 {% else %}
-<p class="count" id="count-line">{{ total_count }} of {{ total_count }} reach-outs shown</p>
+<div class="stat-strip">
+  <div class="stat-tile">
+    <div class="value"><span id="count-line">{{ total_count }}</span> <span class="muted" style="font-size:13px;font-weight:400;">of {{ total_count }}</span></div>
+    <div class="label">reach-outs shown</div>
+  </div>
+</div>
 
 <div class="filters">
   <div class="field">
@@ -172,7 +99,7 @@
 
 <p class="empty" id="no-matches" style="display: none;">No reach-outs match these filters.</p>
 
-<table id="reachouts-table">
+<table class="data-table" id="reachouts-table">
   <thead>
     <tr>
       <th data-sort="recipient">Recipient <span class="arrow"></span></th>
@@ -183,7 +110,7 @@
       <th data-sort="domain">Domain <span class="arrow"></span></th>
       <th data-sort="req-id">Req ID <span class="arrow"></span></th>
       <th data-sort="date">Date <span class="arrow"></span></th>
-      <th>Actions</th>
+      <th></th>
     </tr>
   </thead>
   <tbody>
@@ -215,35 +142,49 @@
       <td>{{ 'Present' if r.req_id_present else 'Blank' }}</td>
       <td>{{ r.date | to_local if r.date else '—' }}</td>
       <td>
-        <form class="ooo-form" method="post" action="/reply/{{ r.recipient }}/tag">
-          <input type="hidden" name="redirect_to" value="reachouts">
-          <input type="date" name="resume_date" required>
-          <button type="submit" name="tag" value="ooo"
-                  onclick="return confirm('Mark {{ r.recipient }} OOO? This permanently suppresses their GMass follow-ups account-wide (every campaign, not just this one).');">Mark OOO</button>
-        </form>
-        {% if r.engagement == 'replied' %}
-        <form class="tag-form" method="post" action="/reply/{{ r.recipient }}/tag">
-          <input type="hidden" name="redirect_to" value="reachouts">
-          <button type="submit" class="tag-btn" name="tag" value="real">Real</button>
-          <button type="submit" class="tag-btn" name="tag" value="not_interested"
-                  onclick="return confirm('Mark {{ r.recipient }} not interested? This permanently suppresses their GMass follow-ups account-wide (every campaign, not just this one).');">Not interested</button>
-          {% if r.reply_tag == 'real' %}
-          <button type="submit" class="tag-btn" name="tag" value="unreal">Unreal</button>
-          {% endif %}
-        </form>
-        {% endif %}
-        {% if r.status == 'bounced' %}
-        <form class="resend-form" method="post" action="/reachouts/{{ r.recipient }}/resend">
-          <input type="email" name="corrected_email" placeholder="corrected@address.com" required>
-          <button type="submit" class="tag-btn">Resend to corrected address</button>
-        </form>
-        {% endif %}
-        {% if not r.stopped %}
-        <form class="stop-form" method="post" action="/reachouts/{{ r.recipient }}/stop">
-          <button type="submit" class="tag-btn danger"
-                  onclick="return confirm('Stop outreach to {{ r.recipient }}? This permanently suppresses their GMass follow-ups account-wide (every campaign, not just this one) and cannot be undone.');">Stop outreach</button>
-        </form>
-        {% endif %}
+        <details class="row-menu">
+          <summary aria-label="Actions">&#8230;</summary>
+          <div class="menu-panel">
+            <form method="post" action="/reply/{{ r.recipient }}/tag">
+              <input type="hidden" name="redirect_to" value="reachouts">
+              <input type="date" name="resume_date" required>
+              <button type="submit" class="menu-item" name="tag" value="ooo"
+                      onclick="return confirm('Mark {{ r.recipient }} OOO? This permanently suppresses their GMass follow-ups account-wide (every campaign, not just this one).');">Mark OOO</button>
+            </form>
+            {% if r.engagement == 'replied' %}
+            <div class="menu-divider"></div>
+            <form method="post" action="/reply/{{ r.recipient }}/tag">
+              <input type="hidden" name="redirect_to" value="reachouts">
+              <button type="submit" class="menu-item" name="tag" value="real">Real</button>
+            </form>
+            <form method="post" action="/reply/{{ r.recipient }}/tag">
+              <input type="hidden" name="redirect_to" value="reachouts">
+              <button type="submit" class="menu-item danger" name="tag" value="not_interested"
+                      onclick="return confirm('Mark {{ r.recipient }} not interested? This permanently suppresses their GMass follow-ups account-wide (every campaign, not just this one).');">Not interested</button>
+            </form>
+            {% if r.reply_tag == 'real' %}
+            <form method="post" action="/reply/{{ r.recipient }}/tag">
+              <input type="hidden" name="redirect_to" value="reachouts">
+              <button type="submit" class="menu-item" name="tag" value="unreal">Unreal</button>
+            </form>
+            {% endif %}
+            {% endif %}
+            {% if r.status == 'bounced' %}
+            <div class="menu-divider"></div>
+            <form method="post" action="/reachouts/{{ r.recipient }}/resend">
+              <input type="email" name="corrected_email" placeholder="corrected@address.com" required>
+              <button type="submit" class="menu-item">Resend to corrected address</button>
+            </form>
+            {% endif %}
+            {% if not r.stopped %}
+            <div class="menu-divider"></div>
+            <form method="post" action="/reachouts/{{ r.recipient }}/stop">
+              <button type="submit" class="menu-item danger"
+                      onclick="return confirm('Stop outreach to {{ r.recipient }}? This permanently suppresses their GMass follow-ups account-wide (every campaign, not just this one) and cannot be undone.');">Stop outreach</button>
+            </form>
+            {% endif %}
+          </div>
+        </details>
       </td>
     </tr>
     {% if r.clicks or r.corrected_from or r.already_corrected_to %}
@@ -277,7 +218,9 @@
   </tbody>
 </table>
 {% endif %}
+{% endblock %}
 
+{% block extra_js %}
 <script>
 // Global (referenced from inline onclick= handlers) -- toggles a row's
 // expandable detail sub-row (click links / corrected-from), which always
@@ -289,6 +232,24 @@ function toggleDetail(btn) {
   var open = detail.classList.toggle('open');
   btn.innerHTML = open ? '&#9662; detail' : '&#9656; detail';
 }
+
+// Row action menus: only one open at a time, closes on an outside click.
+// Native <details>/<summary> does the open/close itself -- this just adds
+// the "only one, and close on outside click" polish.
+document.querySelectorAll('details.row-menu').forEach(function (d) {
+  d.addEventListener('toggle', function () {
+    if (d.open) {
+      document.querySelectorAll('details.row-menu[open]').forEach(function (other) {
+        if (other !== d) other.removeAttribute('open');
+      });
+    }
+  });
+});
+document.addEventListener('click', function (e) {
+  document.querySelectorAll('details.row-menu[open]').forEach(function (d) {
+    if (!d.contains(e.target)) d.removeAttribute('open');
+  });
+});
 
 (function () {
   var table = document.getElementById('reachouts-table');
@@ -343,7 +304,7 @@ function toggleDetail(btn) {
       }
       if (visible) shown++;
     });
-    countLine.textContent = shown + ' of ' + totalCount + ' reach-outs shown';
+    countLine.textContent = shown;
     noMatches.style.display = (shown === 0) ? '' : 'none';
   }
 
@@ -389,6 +350,4 @@ function toggleDetail(btn) {
   applyFilters();
 })();
 </script>
-
-</body>
-</html>
+{% endblock %}

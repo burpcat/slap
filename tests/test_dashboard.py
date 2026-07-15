@@ -22,8 +22,9 @@ from slap.dashboard import (
     _click_details, _clicked_recipients, _recipient_drop_meta, active_leads, actionable_replies,
     bounces, companies_contacted, compute_gmass_dependent_data, create_app, engagement_intelligence,
     filter_reachouts, follow_up_reminders, get_gmass_dependent_data, needs_triage, next_drain,
-    pipeline, reachouts_rows, reply_tags, stop_outreach, sync_reports, tag_reply, template_failures,
-    this_week, today_strip, todays_runs, visible_warm_but_silent, warm_but_silent,
+    pipeline, reachouts_rows, reply_tags, stop_outreach, stopped_outreach_roster, sync_reports,
+    tag_reply, template_failures, this_week, today_strip, todays_runs, visible_warm_but_silent,
+    warm_but_silent,
 )
 from slap.reload import ReloadFailure, write_failures
 from slap.tracking import append_event, connect
@@ -1156,6 +1157,57 @@ def test_bounces_reason_blank_not_none_when_gmass_gave_no_reason_text(conn):
     assert result[0]["reason"] == ""
 
 
+# --- stopped_outreach_roster (Deliverability page, post-launch) ------------
+
+def test_stopped_outreach_roster_empty_when_none(conn):
+    assert stopped_outreach_roster(conn) == []
+
+
+def test_stopped_outreach_roster_lists_a_stopped_recipient(conn):
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter", "company": "Acme"})
+    stop_outreach(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    result = stopped_outreach_roster(conn)
+    assert len(result) == 1
+    assert result[0]["recipient"] == "a@x.com"
+    assert result[0]["campaign"] == "c"
+    assert result[0]["company"] == "Acme"
+    assert result[0]["scope"] == "recipient"
+    assert result[0]["stopped_at"]
+
+
+def test_stopped_outreach_roster_survives_a_later_bounce_overwriting_status(conn):
+    # Same iron-audit-caught bug class as active_leads()'s analogous
+    # regression test: a later bounce event (sync_reports() re-polling
+    # regardless of any local stop) flips recipients.status away from
+    # 'stopped' to 'bounced' -- the roster must still list the recipient,
+    # since it's sourced from the append-only 'stopped' event itself
+    # (_stopped_recipients()), not the mutable status column.
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter"})
+    stop_outreach(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    append_event(conn, type="bounce", recipient="a@x.com", campaign="c",
+                 meta={"bounce_reason": "mailbox full", "bounce_time": "t1", "category": "bounce"})
+
+    row = conn.execute("SELECT status FROM recipients WHERE recipient = ?", ("a@x.com",)).fetchone()
+    assert row["status"] == "bounced"  # confirms the status column really did flip
+
+    result = stopped_outreach_roster(conn)
+    assert len(result) == 1
+    assert result[0]["recipient"] == "a@x.com"
+
+
+def test_stopped_outreach_roster_sorted_most_recently_stopped_first(conn):
+    append_event(conn, type="queued", recipient="old@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
+    append_event(conn, type="stopped", recipient="old@x.com", campaign="c", meta={"scope": "recipient"},
+                 timestamp=_ts(0))
+    append_event(conn, type="queued", recipient="new@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
+    append_event(conn, type="stopped", recipient="new@x.com", campaign="c", meta={"scope": "recipient"},
+                 timestamp=_ts(1))
+    result = stopped_outreach_roster(conn)
+    assert [r["recipient"] for r in result] == ["new@x.com", "old@x.com"]
+
+
 def test_companies_contacted_counts_distinct_non_consumer_domains(conn):
     append_event(conn, type="queued", recipient="a@acme.com", campaign="c", stage=0, meta={"persona": "recruiter"})
     append_event(conn, type="sent", recipient="a@acme.com", campaign="c", stage=0, timestamp=_ts(0))
@@ -1241,6 +1293,52 @@ def test_create_app_index_renders(app):
     assert b"Nothing needs triage." in resp.data
 
 
+# --- multi-page redesign: base.html/nav + each new page's happy path -------
+
+def test_create_app_pipeline_page_renders(app):
+    resp = app.test_client().get("/pipeline")
+    assert resp.status_code == 200
+    assert b"Pipeline" in resp.data
+    assert b"Companies contacted" in resp.data
+    assert b"nobody active" in resp.data  # honest empty state, no recipients staged
+
+
+def test_create_app_engagement_page_renders(app):
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+        resp = app.test_client().get("/engagement")
+    assert resp.status_code == 200
+    assert b"Engagement intelligence" in resp.data
+    assert b"Warm but silent" in resp.data
+
+
+def test_create_app_deliverability_page_renders(app):
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+        resp = app.test_client().get("/deliverability")
+    assert resp.status_code == 200
+    assert b"Bounces" in resp.data
+    assert b"Stopped outreach" in resp.data
+    assert b"No stopped outreach." in resp.data
+
+
+def test_create_app_nav_present_and_highlights_current_page_on_every_route(app):
+    # Every page's nav must resolve all six url_for() targets with no
+    # BuildError (a missing endpoint would 500 the whole page, not just
+    # omit a link) -- hitting every route once is the actual proof.
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+        client = app.test_client()
+        for path, current_label in [
+            ("/", "Home"), ("/pipeline", "Pipeline"), ("/engagement", "Engagement"),
+            ("/deliverability", "Deliverability"), ("/reachouts", "Reach-outs"),
+        ]:
+            resp = client.get(path)
+            assert resp.status_code == 200, path
+            body = resp.data.decode()
+            assert 'class="current"' in body
+            # The current page's own nav label carries the "current" class.
+            current_link = body[body.index(f">{current_label}<") - 200:body.index(f">{current_label}<")]
+            assert "current" in current_link
+
+
 def test_create_app_index_bounces_widget_shows_real_reason_text(app, tmp_path):
     # Previously: the Bounces & Blocks widget only ever showed a generic
     # "Bounced"/"Blocked" label, even though the real reason text was
@@ -1257,9 +1355,12 @@ def test_create_app_index_bounces_widget_shows_real_reason_text(app, tmp_path):
         # First load: no cache yet, so it renders the empty state immediately
         # while a background refresh (synchronous in this test — see the
         # `app` fixture) computes the real data and writes it to the cache.
-        first = client.get("/")
+        # Bounces & blocks lives on the Deliverability page (multi-page
+        # redesign, post-launch), sharing the same Redis-cached blob index()
+        # used to read from directly.
+        first = client.get("/deliverability")
         # Second load: reads that now-fresh cache directly.
-        second = client.get("/")
+        second = client.get("/deliverability")
 
     assert first.status_code == second.status_code == 200
     assert b"mailbox full" not in first.data
@@ -1299,8 +1400,11 @@ def test_create_app_index_renders_click_urls_in_warm_but_silent(app, tmp_path):
             return []
         mock_get.side_effect = side_effect
         client = app.test_client()
-        client.get("/")  # first load: no cache yet, renders empty while the (synchronous-in-test) refresh runs
-        resp = client.get("/")  # second load: reads the now-fresh cache directly
+        # Warm but silent lives on the Engagement page (multi-page redesign,
+        # post-launch), sharing the same Redis-cached blob index() used to
+        # read from directly.
+        client.get("/engagement")  # first load: no cache yet, renders empty while the (synchronous-in-test) refresh runs
+        resp = client.get("/engagement")  # second load: reads the now-fresh cache directly
     assert resp.status_code == 200
     assert b"https://acme.com/careers" in resp.data
 
@@ -1317,14 +1421,15 @@ def test_create_app_hide_warm_but_silent_removes_it_from_the_default_view(app, t
             if rt == "clicks" else []
         )
         client = app.test_client()
-        client.get("/")  # first load: no cache yet, renders empty while the (synchronous-in-test) refresh runs
-        resp = client.get("/")  # second load: reads the now-fresh cache directly
+        client.get("/engagement")  # first load: no cache yet, renders empty while the (synchronous-in-test) refresh runs
+        resp = client.get("/engagement")  # second load: reads the now-fresh cache directly
         assert b"jane@acme.com" in resp.data
 
         hide_resp = client.post("/warm-but-silent/jane@acme.com/hide")
         assert hide_resp.status_code == 302
+        assert hide_resp.headers["Location"] == "/engagement"
 
-        resp2 = client.get("/")
+        resp2 = client.get("/engagement")
     assert b"jane@acme.com" not in resp2.data
     assert b"show hidden (1)" in resp2.data
 
@@ -1341,9 +1446,9 @@ def test_create_app_hide_warm_but_silent_still_visible_with_show_hidden_param(ap
             if rt == "clicks" else []
         )
         client = app.test_client()
-        client.get("/")
+        client.get("/engagement")
         client.post("/warm-but-silent/jane@acme.com/hide")
-        resp = client.get("/?show_hidden=1")
+        resp = client.get("/engagement?show_hidden=1")
     assert resp.status_code == 200
     assert b"jane@acme.com" in resp.data
     assert b"/warm-but-silent/jane@acme.com/unhide" in resp.data
@@ -1360,11 +1465,12 @@ def test_create_app_unhide_warm_but_silent_restores_default_view(app, tmp_path):
             if rt == "clicks" else []
         )
         client = app.test_client()
-        client.get("/")
+        client.get("/engagement")
         client.post("/warm-but-silent/jane@acme.com/hide")
         unhide_resp = client.post("/warm-but-silent/jane@acme.com/unhide")
         assert unhide_resp.status_code == 302
-        resp = client.get("/")
+        assert unhide_resp.headers["Location"] == "/engagement?show_hidden=1"
+        resp = client.get("/engagement")
     assert b"jane@acme.com" in resp.data
     assert b"show hidden" not in resp.data
 
@@ -2597,7 +2703,12 @@ def test_create_app_reachouts_renders_rows_across_campaigns(app, tmp_path):
     assert resp.status_code == 200
     assert b"jane@acme.com" in resp.data
     assert b"bob@widgets.com" in resp.data
-    assert b"2 of 2 reach-outs shown" in resp.data
+    # Redesigned stat-tile markup (post-launch): the count and "of N"/label
+    # text are separate elements now, not one contiguous string -- assert
+    # on the pieces rather than the old exact sentence.
+    assert b'id="count-line">2<' in resp.data
+    assert b"of 2" in resp.data
+    assert b"reach-outs shown" in resp.data
 
 
 def test_create_app_reachouts_renders_bounce_reason_text(app, tmp_path):
@@ -2721,7 +2832,13 @@ def test_create_app_reachouts_ooo_row_has_fade_css_hook(app, tmp_path):
             resp = client.get("/reachouts")
     assert resp.status_code == 200
     assert b'data-status="ooo_requeued"' in resp.data
-    assert b'[data-status="ooo_requeued"] { opacity: 0.55; }' in resp.data
+    # The fade CSS rule itself now lives in the shared stylesheet
+    # (slap/static/dashboard.css, multi-page redesign) rather than inline
+    # in reachouts.html's own response -- confirm it's actually served
+    # there rather than just in reachouts.html's markup.
+    css_resp = client.get("/static/dashboard.css")
+    assert css_resp.status_code == 200
+    assert b'[data-status="ooo_requeued"] { opacity: 0.55; }' in css_resp.data
 
 
 def test_create_app_reachouts_triage_buttons_only_on_replied_rows(app, tmp_path):
@@ -2852,16 +2969,18 @@ def test_create_app_reachouts_stop_button_hidden_once_already_stopped(app, tmp_p
     assert '/reachouts/active@acme.com/stop' in active_row
 
 
-def test_create_app_index_renders_active_leads_and_follow_up_reminders(app, tmp_path):
+def test_create_app_pipeline_page_renders_active_leads_and_follow_up_reminders(app, tmp_path):
     conn = connect(tmp_path / "test.db")
     _stage_and_send(conn, recipient="lead@acme.com", campaign="c", persona="founder", company="Acme")
     append_event(conn, type="reply", recipient="lead@acme.com", campaign="c")
     append_event(conn, type="reply_reviewed", recipient="lead@acme.com", campaign="c", meta={"tag": "real"})
     conn.close()
 
-    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
-        client = app.test_client()
-        resp = client.get("/")
+    # Active Leads / Follow-up reminders live on the Pipeline page
+    # (multi-page redesign, post-launch) -- zero GMass dependency, so no
+    # gmass.get_reports patch is needed here at all.
+    client = app.test_client()
+    resp = client.get("/pipeline")
 
     assert resp.status_code == 200
     body = resp.data.decode()

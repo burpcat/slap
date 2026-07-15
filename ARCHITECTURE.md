@@ -36,7 +36,7 @@ independently reviewed against a written spec and a fixed set of design invarian
 moving to the next. Several real bugs were caught this way rather than in later
 integration — see "Notable bugs found," below.
 
-**Testing.** 714 fast tests (a few seconds total, grown well past the original 13-stage
+**Testing.** 722 fast tests (a few seconds total, grown well past the original 13-stage
 build via the post-launch features documented in `SLAP_PROJECT_CONTEXT.md`) plus 8 tests
 marked `slow` (real `xelatex` subprocess compiles, and one test that spins up a real
 threaded HTTP server) kept out of the default run for dev-loop speed. No test suite makes

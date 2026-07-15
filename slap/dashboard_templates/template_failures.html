@@ -1,36 +1,7 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>slap dashboard — template failures</title>
-<style>
-  :root {
-    --surface-1: #fcfcfb; --page: #f9f9f7;
-    --text-primary: #0b0b0b; --text-secondary: #52514e; --text-muted: #898781;
-    --hairline: #e1e0d9; --border: rgba(11,11,11,0.10); --critical: #d03b3b;
-  }
-  * { box-sizing: border-box; }
-  body {
-    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-    background: var(--page); color: var(--text-primary);
-    margin: 0; padding: 24px; font-size: 14px;
-  }
-  h1 { font-size: 18px; margin: 0 0 4px; }
-  a.back { color: var(--text-secondary); font-size: 13px; }
-  .count { color: var(--text-muted); font-size: 12px; margin: 8px 0 16px; }
-  .empty { color: var(--text-muted); font-style: italic; padding: 16px 0; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; background: var(--surface-1);
-          border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
-  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--hairline); vertical-align: top; }
-  th { color: var(--text-secondary); font-weight: 500; white-space: nowrap; }
-  .muted { color: var(--text-muted); }
-  .badge { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 11px;
-           background: var(--critical); color: white; }
-</style>
-</head>
-<body>
+{% extends "base.html" %}
+{% block title %}slap dashboard — template failures{% endblock %}
+{% block content %}
 
-<a class="back" href="/">&larr; back to dashboard</a>
 <h1>Template Failures</h1>
 
 {% if total_count == 0 %}
@@ -56,7 +27,7 @@
       <td>{{ f.reason }}</td>
       <td>
         {% if f.missing_fields %}
-        <span class="badge">{{ f.missing_fields | join(', ') }}</span>
+        <span class="badge critical">{{ f.missing_fields | join(', ') }}</span>
         {% else %}
         <span class="muted">—</span>
         {% endif %}
@@ -67,6 +38,4 @@
   </tbody>
 </table>
 {% endif %}
-
-</body>
-</html>
+{% endblock %}

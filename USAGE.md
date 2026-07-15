@@ -300,15 +300,17 @@ company, to reuse for the new recipient instead of the campaign's usual
 python slap.py dashboard
 ```
 
-Opens `http://127.0.0.1:5050`. Panels, top to bottom:
+Opens `http://127.0.0.1:5050`. Five pages share one header/nav bar, a light/dark theme
+toggle (top right — cycles Auto → Light → Dark, remembers your choice), and, only when
+the most recent `template-reload` run left at least one recipient un-reloaded, a
+**"Template Failures"** nav link listing who, in which campaign, and why (see "Editing a
+template after staging" above) — it disappears again once a later `template-reload` run
+comes back clean.
 
-- **Metrics** — today/this-week send counts (initial vs. follow-up split).
-- **Next drain** — when the runner is next scheduled to fire.
-- **Engagement intelligence** — reply rate by persona, replies/clicks by stage, and a
-  time-to-first-reply distribution.
-- **Warm but silent — clicked, no reply** — the highest-value signal on the whole
-  dashboard: someone opened a tracked link but hasn't replied yet. The message landed and
-  was read; it's just unanswered. Worth a manual nudge.
+**Home** (`/`) — the operational pulse, and the one thing that needs a same-visit decision:
+
+- **Metrics** — today/this-week send counts (initial vs. follow-up split), plus a
+  daily-cap gauge.
 - **Replies needing triage** — every reply that hasn't been tagged yet, with prior-contact
   domain context. Tag each one:
   - **real** — a genuine reply. Pure bookkeeping; no further action from slap.
@@ -321,14 +323,13 @@ Opens `http://127.0.0.1:5050`. Panels, top to bottom:
   - **unreal** — Reach-outs-only (see below), for a Real-tagged reply that later went
     cold. Not offered here since a recipient only reaches this widget while their reply
     is still untagged.
-- **Bounces & blocks** — every delivery failure GMass reports back, tagged **Bounced** or
-  **Blocked**. GMass tracks these as two separate categories (different report endpoints,
-  different reasons) — both are shown here rather than one blended into the other, so a
-  recipient whose mail got blocked by a spam filter doesn't look identical to one whose
-  address just doesn't exist. A **Reason** column shows GMass's actual reason text for
-  each one (truncated in the table; hover for the full text) — no more guessing why
-  something bounced from the Bounced/Blocked label alone. The same reason text shows up
-  next to a recipient's status on the Reach-outs page too.
+- **Next drain** — when the runner is next scheduled to fire.
+- **Today's runs** — each drain that actually did something today (fired, sent, failed
+  counts) — a drain that found nothing queued is omitted as noise.
+
+**Pipeline** (`/pipeline`) — the live-recipient work queue, always instant (nothing here
+depends on GMass's own report data):
+
 - **Active leads** — a roster of every recipient currently tagged Real: company,
   campaign, persona, and when you marked them real. This is a live "who's actually a
   real opportunity right now" list, separate from the triage widget above (which is
@@ -338,16 +339,31 @@ Opens `http://127.0.0.1:5050`. Panels, top to bottom:
   GMass's own automated follow-ups have already stopped for them (it stops firing on any
   reply) — this is the one place that reminds you to personally follow up, since nothing
   else on the dashboard tracks that.
-- **Companies contacted** — a rollup by company domain.
 - **Pipeline** — who's mid-sequence at which stage, and what's scheduled to fire today/tomorrow.
-- **Today's runs** — each drain that actually did something today (fired, sent, failed
-  counts) — a drain that found nothing queued is omitted as noise.
+- **Companies contacted** — a rollup by company domain.
 
-There's also an **"All reach-outs →"** link at the top — see "Reach-outs (all campaigns,
-filterable)" below — and, only when the most recent `template-reload` run left at least
-one recipient un-reloaded, a **"Template Failures →"** link (`/template-failures`)
-listing who, in which campaign, and why (see "Editing a template after staging" above).
-It disappears again once a later `template-reload` run comes back clean.
+**Engagement** (`/engagement`):
+
+- **Engagement intelligence** — reply rate by persona, replies/clicks by stage, and a
+  time-to-first-reply distribution.
+- **Warm but silent — clicked, no reply** — the highest-value signal on the whole
+  dashboard: someone opened a tracked link but hasn't replied yet. The message landed and
+  was read; it's just unanswered. Worth a manual nudge.
+
+**Deliverability** (`/deliverability`) — why a recipient stopped moving:
+
+- **Bounces & blocks** — every delivery failure GMass reports back, tagged **Bounced** or
+  **Blocked**. GMass tracks these as two separate categories (different report endpoints,
+  different reasons) — both are shown here rather than one blended into the other, so a
+  recipient whose mail got blocked by a spam filter doesn't look identical to one whose
+  address just doesn't exist. A **Reason** column shows GMass's actual reason text for
+  each one (truncated in the table; hover for the full text) — no more guessing why
+  something bounced from the Bounced/Blocked label alone. The same reason text shows up
+  next to a recipient's status on the Reach-outs page too.
+- **Stopped outreach** — every recipient you've permanently halted follow-ups to (see
+  **Stop outreach** under Reach-outs below), with company/campaign/when. A roster, not a
+  reply-tag view — a stopped recipient can independently still be tagged Real elsewhere;
+  this just tracks the stop itself.
 
 ## Reach-outs (all campaigns, filterable)
 
@@ -360,24 +376,26 @@ to slice "everyone I've contacted" by whatever you care about that day instead o
 through per-campaign panels. Never makes a GMass call on its own — everything here is
 already-synced local data.
 
-Each row's Actions column also offers, as applicable: **Mark OOO** (always available),
-**Real / Not interested** (only once that recipient has actually replied), **Resend to
-corrected address** (only on a bounced row), and two more:
+Each row has a single **⋯** button on the right — click it to open that row's action
+menu, rather than a wall of always-visible buttons. Inside, as applicable: **Mark OOO**
+(always available), **Real / Not interested** (only once that recipient has actually
+replied), **Resend to corrected address** (only on a bounced row), and two more:
 
 - **Unreal** — shown only once a recipient is already tagged Real (sits right next to
-  the Real/Not interested buttons). Use it when a Real lead goes cold later — the deal
+  the Real/Not interested items). Use it when a Real lead goes cold later — the deal
   fell through, they stopped responding, whatever. It's local-only: no GMass call, no
   suppression, nothing sent. The recipient drops out of the Active Leads / Follow-up
-  reminders widgets on the main dashboard, but their reply-tag history isn't erased —
+  reminders widgets on the Pipeline page, but their reply-tag history isn't erased —
   it's recorded as its own event, same as every tag change here.
-- **Stop outreach** — on every row. Permanently halts further follow-ups to *this one
-  recipient* (e.g. you got rejected for the specific role they were contacted about).
-  This is a real, irreversible suppression — same account-wide GMass unsubscribe Mark
-  OOO/Not interested use — so it asks for confirmation first, the same way those do.
-  Once stopped, the row shows a **Stopped** chip and the button disappears (nothing left
-  to stop); the recipient also drops out of the follow-up-reminder/Active-Leads widgets
-  if they were in one. This only ever affects the one recipient you clicked it on — it
-  does NOT stop the whole campaign or every contact at that company.
+- **Stop outreach** — offered until the row is already stopped. Permanently halts further
+  follow-ups to *this one recipient* (e.g. you got rejected for the specific role they
+  were contacted about). This is a real, irreversible suppression — same account-wide
+  GMass unsubscribe Mark OOO/Not interested use — so it asks for confirmation first, the
+  same way those do. Once stopped, the row shows a **Stopped** chip and the menu item
+  disappears (nothing left to stop); the recipient also drops out of the follow-up-
+  reminder/Active-Leads widgets and shows up instead on the Deliverability page's Stopped
+  outreach roster. This only ever affects the one recipient you clicked it on — it does
+  NOT stop the whole campaign or every contact at that company.
 
 Filter controls (all combine with AND — narrowing by campaign AND status AND date range,
 for instance, not any of them):

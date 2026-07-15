@@ -797,6 +797,63 @@ def bounces(conn) -> list:
     return result
 
 
+def _latest_stopped_meta(conn, recipient: str) -> dict:
+    """This recipient's most recent 'stopped' event's own timestamp/meta —
+    same latest-event-wins convention _latest_bounce_meta() above already
+    uses, so a later status-column drift can never affect what
+    stopped_outreach_roster() (below) shows as "when." Deliberately NOT
+    `recipients.last_event_at`: _stopped_recipients()'s own docstring
+    already explains why a later bounce/reply for an already-stopped
+    recipient can overwrite that column with a LATER timestamp — this
+    roster needs the stop's own moment, not whatever event happened to
+    land on the recipient most recently since."""
+    row = conn.execute(
+        "SELECT timestamp, meta FROM events WHERE recipient = ? AND type = 'stopped' "
+        "ORDER BY id DESC LIMIT 1",
+        (recipient,),
+    ).fetchone()
+    if row is None:
+        return {}
+    meta = json.loads(row["meta"]) if row["meta"] else {}
+    return {"stopped_at": row["timestamp"], "scope": meta.get("scope", "recipient")}
+
+
+def stopped_outreach_roster(conn) -> list:
+    """Deliverability widget (post-launch, Part-3 proposal #1): every
+    recipient ever stopped via Stop outreach — mirrors bounces()'s shape
+    above, but sourced from _stopped_recipients()'s append-only read of the
+    `stopped` event log, NOT `recipients.status == 'stopped'` — same
+    reason _stopped_recipients() itself already exists (a later bounce/
+    reply can overwrite that column away from 'stopped', which would
+    otherwise silently drop a genuinely-stopped recipient off this
+    roster). The per-recipient _latest_stopped_meta() lookup mirrors
+    _latest_bounce_meta()'s exact existing idiom — same
+    N-is-small-for-a-personal-tool, one-query-per-row pattern already used
+    for bounces, not a new one."""
+    stopped = _stopped_recipients(conn)
+    if not stopped:
+        return []
+    drop_meta = _recipient_drop_meta(conn)
+    placeholders = ",".join("?" * len(stopped))
+    rows = conn.execute(
+        f"SELECT recipient, campaign, persona FROM recipients WHERE recipient IN ({placeholders})",
+        list(stopped),
+    ).fetchall()
+    result = []
+    for row in rows:
+        meta = drop_meta.get(row["recipient"], {"company": "", "role": "", "req_id": ""})
+        stopped_meta = _latest_stopped_meta(conn, row["recipient"])
+        result.append({
+            "recipient": row["recipient"],
+            "campaign": row["campaign"],
+            "persona": row["persona"],
+            "company": meta["company"],
+            "stopped_at": stopped_meta.get("stopped_at"),
+            "scope": stopped_meta.get("scope", "recipient"),
+        })
+    return sorted(result, key=lambda e: e["stopped_at"] or "", reverse=True)
+
+
 def companies_contacted(conn, consumer_domains: set, *, today: date = None) -> dict:
     """Distinct non-consumer company domains actually contacted (this week +
     all-time) plus the top companies by headcount — supports DIY dedup
@@ -1608,16 +1665,75 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
         if conn is not None:
             conn.close()
 
+    @app.context_processor
+    def inject_template_failures_count():
+        # Multi-page redesign (post-launch): every page's shared nav
+        # (base.html) needs this count to decide whether to show the
+        # Template Failures link at all — a context processor runs on
+        # every render_template() call automatically, so no route has to
+        # remember to pass it (the way only index() used to).
+        return {"template_failures_count": len(template_failures())}
+
     @app.route("/")
     def index():
+        # Home (multi-page redesign, post-launch): the operational pulse +
+        # the one thing that needs a same-visit decision. Everything else
+        # that used to render here (Engagement intelligence, Warm but
+        # silent, Bounces & blocks, Pipeline, Companies contacted, Active
+        # leads, Follow-up reminders) now lives on its own page — see
+        # engagement_page()/deliverability_page()/pipeline_page() below.
+        # `replies` (actionable_replies, Redis-cached) is the one exception
+        # kept here even though it shares a cache blob with Engagement's
+        # widgets: it's the only GMass-dependent widget that demands a
+        # same-visit decision, so it stays where it's seen every open
+        # rather than buried on a page shared with lagging-indicator
+        # analytics.
         conn = get_conn()
         gmass_data = get_gmass_dependent_data(api_key, consumer_domains, redis_client, db_path)
-        # Hide/unhide (post-launch): applied HERE, on top of the possibly-
-        # hourly-cached warm_but_silent list, never baked into the cache
-        # itself — see visible_warm_but_silent()'s own docstring for why
-        # (hidden-state must stay instant, not wait for the next hourly
-        # refresh). show_hidden=1 shows every row (hidden ones get an
-        # "Unhide" action instead of "Hide") rather than a separate page.
+        return render_template(
+            "dashboard.html",
+            sync_result=gmass_data["sync_result"],
+            replies=gmass_data["replies"],
+            cache_status=gmass_data["cache_status"],
+            today=today_strip(conn, global_config),
+            week=this_week(conn),
+            runs=todays_runs(conn),
+            next_drain=next_drain(conn, global_config),
+        )
+
+    @app.route("/pipeline")
+    def pipeline_page():
+        # Pipeline (multi-page redesign): the live-recipient work queue —
+        # Active Leads/Follow-up reminders (own reply-tag roster) alongside
+        # mid-sequence-by-stage/followups-scheduled and companies contacted
+        # (queue/workflow facts, not engagement analytics — see the design
+        # plan for why these were split off "Engagement" onto their own
+        # page). Named `pipeline_page`, not `pipeline` — the latter is
+        # already the imported widget function `pipeline(conn,
+        # global_config)` below; reusing the name would shadow it. Zero
+        # GMass-cache dependency at all (every widget here is a plain
+        # uncached SQLite read) — no sync_result/cache_status passed, so
+        # base.html's banner block is naturally absent, and this page is
+        # always instant and never stale.
+        conn = get_conn()
+        return render_template(
+            "pipeline.html",
+            active_leads=active_leads(conn),
+            follow_up_reminders=follow_up_reminders(conn),
+            pipeline=pipeline(conn, global_config),
+            companies=companies_contacted(conn, consumer_domains),
+        )
+
+    @app.route("/engagement")
+    def engagement_page():
+        # Engagement (multi-page redesign): aggregate + per-recipient
+        # engagement signal. This is the hide/unhide-related block moved
+        # VERBATIM out of index() (see git history) — the one genuine
+        # behavior change in the whole redesign is that
+        # hide_warm_but_silent()/unhide_warm_but_silent() below now
+        # redirect here instead of to index().
+        conn = get_conn()
+        gmass_data = get_gmass_dependent_data(api_key, consumer_domains, redis_client, db_path)
         all_warm_but_silent = gmass_data["warm_but_silent"]
         hidden_recipients = _warm_but_silent_hidden_recipients(conn)
         show_hidden = request.args.get("show_hidden") == "1"
@@ -1626,51 +1742,43 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
             else [r for r in all_warm_but_silent if r["recipient"] not in hidden_recipients]
         )
         return render_template(
-            "dashboard.html",
+            "engagement.html",
             sync_result=gmass_data["sync_result"],
+            cache_status=gmass_data["cache_status"],
             engagement=gmass_data["engagement"],
-            replies=gmass_data["replies"],
             warm_but_silent=visible_warm_but_silent_rows,
             warm_but_silent_hidden_recipients=hidden_recipients,
             warm_but_silent_hidden_count=len(
                 [r for r in all_warm_but_silent if r["recipient"] in hidden_recipients]
             ),
             show_hidden=show_hidden,
-            bounces=gmass_data["bounces"],
+        )
+
+    @app.route("/deliverability")
+    def deliverability_page():
+        # Deliverability (multi-page redesign): why a recipient stopped
+        # moving — Bounces & blocks alongside the new Stopped outreach
+        # roster (stopped_outreach_roster(), below), the same pairing the
+        # earlier Part-3 widget proposal recommended.
+        conn = get_conn()
+        gmass_data = get_gmass_dependent_data(api_key, consumer_domains, redis_client, db_path)
+        return render_template(
+            "deliverability.html",
+            sync_result=gmass_data["sync_result"],
             cache_status=gmass_data["cache_status"],
-            today=today_strip(conn, global_config),
-            week=this_week(conn),
-            pipeline=pipeline(conn, global_config),
-            runs=todays_runs(conn),
-            companies=companies_contacted(conn, consumer_domains),
-            next_drain=next_drain(conn, global_config),
-            # Active Leads / follow-up reminders (post-launch): plain,
-            # uncached SQLite reads, same as pipeline/companies_contacted
-            # above — neither depends on GMass report data (see
-            # compute_gmass_dependent_data's own module docstring for the
-            # only four widgets that do), so both are computed fresh on
-            # every load rather than routed through the Redis cache.
-            active_leads=active_leads(conn),
-            follow_up_reminders=follow_up_reminders(conn),
-            # Deliberately different from this dashboard's usual "show an
-            # honest empty state" default (see reachouts_rows/reply_tags for
-            # that default elsewhere): the Template Failures nav link itself
-            # is owner-requested to disappear entirely at zero, not render a
-            # "0 failures" link — the /template-failures route below still
-            # shows a real empty-state page for anyone who navigates there
-            # directly regardless of this count.
-            template_failures_count=len(template_failures()),
+            bounces=gmass_data["bounces"],
+            stopped_outreach=stopped_outreach_roster(conn),
         )
 
     @app.route("/warm-but-silent/<string:recipient>/hide", methods=["POST"])
     def hide_warm_but_silent(recipient):
         ui_state.hide(get_conn(), recipient, WARM_BUT_SILENT_WIDGET)
-        return redirect(url_for("index"))
+        return redirect(url_for("engagement_page"))
 
     @app.route("/warm-but-silent/<string:recipient>/unhide", methods=["POST"])
     def unhide_warm_but_silent(recipient):
         ui_state.unhide(get_conn(), recipient, WARM_BUT_SILENT_WIDGET)
-        return redirect(url_for("index", show_hidden=1))
+        return redirect(url_for("engagement_page", show_hidden=1))
 
     @app.route("/gmass/refresh", methods=["POST"])
     def gmass_refresh():
