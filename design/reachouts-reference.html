@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>slap — reach-outs (reference)</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface-1: #fcfcfb; --page: #f9f9f7;
+    --text-primary: #0b0b0b; --text-secondary: #52514e; --text-muted: #898781;
+    --hairline: #e1e0d9; --border: rgba(11,11,11,0.10);
+    --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
+    --series-1: #2a78d6;
+    --ink-on-status: #0b0b0b; /* fixed — status fills don't change with theme, so neither does the ink that reads on them */
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --surface-1: #1a1a19; --page: #0d0d0d;
+      --text-primary: #ffffff; --text-secondary: #c3c2b7;
+      --hairline: #2c2c2a; --border: rgba(255,255,255,0.10);
+      --series-1: #3987e5;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface-1: #1a1a19; --page: #0d0d0d;
+    --text-primary: #ffffff; --text-secondary: #c3c2b7;
+    --hairline: #2c2c2a; --border: rgba(255,255,255,0.10);
+    --series-1: #3987e5;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--page); color: var(--text-primary);
+    margin: 0; font-size: 14px; line-height: 1.5;
+  }
+  a { color: inherit; }
+
+  header.topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 24px; border-bottom: 1px solid var(--hairline);
+    background: var(--surface-1);
+  }
+  header.topbar h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  nav.pages { display: flex; gap: 18px; font-size: 13px; }
+  nav.pages a { color: var(--text-secondary); text-decoration: none; padding: 4px 0; }
+  nav.pages a.current { color: var(--text-primary); font-weight: 600; border-bottom: 2px solid var(--series-1); }
+  nav.pages a:hover { color: var(--text-primary); }
+  button#theme-toggle {
+    font-size: 12px; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--surface-1); color: var(--text-secondary); cursor: pointer;
+  }
+  button#theme-toggle:hover { color: var(--text-primary); border-color: var(--text-secondary); }
+
+  main { padding: 24px; max-width: 1400px; margin: 0 auto; }
+
+  .stat-strip { display: flex; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
+  .stat-tile {
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+    padding: 12px 16px; min-width: 130px;
+  }
+  .stat-tile .value { font-size: 22px; font-weight: 600; }
+  .stat-tile .label { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
+
+  .filters {
+    display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end;
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px; margin-bottom: 16px;
+  }
+  .filters .field { display: flex; flex-direction: column; gap: 3px; }
+  .filters label { font-size: 11px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.03em; }
+  .filters select, .filters input {
+    font-size: 13px; padding: 5px 7px; border: 1px solid var(--border); border-radius: 5px;
+    background: var(--page); color: var(--text-primary);
+  }
+  .filters input[type="search"] { min-width: 180px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; background: var(--surface-1);
+          border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--hairline); }
+  th { color: var(--text-secondary); font-weight: 500; cursor: pointer; user-select: none; white-space: nowrap; font-size: 12px; }
+  th:hover { color: var(--text-primary); }
+  td.num, .tabular { font-variant-numeric: tabular-nums; }
+  tbody tr:hover { background: var(--page); }
+  .muted { color: var(--text-muted); }
+
+  .chip { display: inline-block; padding: 2px 9px; border-radius: 10px; font-size: 12px; white-space: nowrap; font-weight: 500; }
+  .chip-critical { background: var(--critical); color: #ffffff; }
+  .chip-good     { background: var(--good);     color: var(--ink-on-status); }
+  .chip-serious  { background: var(--serious);  color: var(--ink-on-status); }
+  .chip-neutral  { background: var(--hairline); color: var(--text-primary); }
+
+  /* Row actions: one unified overflow menu instead of N conditional inline
+     buttons — native <details>/<summary>, zero new JS dependency. */
+  details.row-menu { position: relative; display: inline-block; }
+  details.row-menu > summary {
+    list-style: none; cursor: pointer; width: 26px; height: 26px;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: 6px; border: 1px solid var(--border); color: var(--text-secondary);
+    font-size: 16px;
+  }
+  details.row-menu > summary::-webkit-details-marker { display: none; }
+  details.row-menu > summary:hover, details.row-menu[open] > summary { background: var(--page); color: var(--text-primary); }
+  details.row-menu .menu-panel {
+    position: absolute; right: 0; top: calc(100% + 4px); z-index: 20;
+    min-width: 230px; background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px; display: flex; flex-direction: column; gap: 2px;
+  }
+  details.row-menu .menu-panel form { display: flex; gap: 6px; align-items: center; padding: 3px 6px; }
+  details.row-menu .menu-panel input[type="date"], details.row-menu .menu-panel input[type="email"] {
+    font-size: 12px; padding: 3px 5px; border: 1px solid var(--border); border-radius: 4px;
+    background: var(--page); color: var(--text-primary); width: 100%;
+  }
+  .menu-item {
+    all: unset; cursor: pointer; padding: 6px 8px; border-radius: 5px; font-size: 13px;
+    color: var(--text-primary); width: 100%; box-sizing: border-box;
+  }
+  .menu-item:hover { background: var(--page); }
+  .menu-item.danger { color: var(--critical); }
+  .menu-item.danger:hover { background: var(--critical); color: #ffffff; }
+  .menu-divider { height: 1px; background: var(--hairline); margin: 4px 2px; }
+
+  .expand-toggle { background: none; border: none; cursor: pointer; color: var(--text-muted); font-size: 11px; padding: 0 0 0 6px; }
+  .expand-toggle:hover { color: var(--text-primary); }
+  tr.detail-row { display: none; }
+  tr.detail-row.open { display: table-row; }
+  tr.detail-row td { background: var(--page); font-size: 12px; }
+  ul.plain { list-style: none; padding: 0; margin: 0; }
+  ul.plain li { padding: 2px 0; }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <h1>slap</h1>
+  <nav class="pages">
+    <a href="#">Home</a>
+    <a href="#">Pipeline</a>
+    <a href="#">Engagement</a>
+    <a href="#">Deliverability</a>
+    <a href="#" class="current">Reach-outs</a>
+    <a href="#">Template Failures</a>
+  </nav>
+  <button id="theme-toggle" type="button">Auto</button>
+</header>
+
+<main>
+
+<div class="stat-strip">
+  <div class="stat-tile"><div class="value">18 <span class="muted" style="font-size:13px;font-weight:400;">of 18</span></div><div class="label">reach-outs shown</div></div>
+  <div class="stat-tile"><div class="value">3</div><div class="label">active leads</div></div>
+  <div class="stat-tile"><div class="value">1</div><div class="label">needs follow-up (7d+)</div></div>
+  <div class="stat-tile"><div class="value">2</div><div class="label">bounced / blocked</div></div>
+</div>
+
+<div class="filters">
+  <div class="field"><label>Search</label><input type="search" placeholder="recipient or company"></div>
+  <div class="field"><label>Campaign</label><select><option>Any</option><option>coldpost-recruiter</option><option>coldpost-founder</option><option>coldpost-hiring_manager</option></select></div>
+  <div class="field"><label>Status</label><select><option>Any</option><option>active</option><option>queued</option><option>done</option><option>bounced</option><option>ooo_requeued</option><option>stopped</option></select></div>
+  <div class="field"><label>Engagement</label><select><option>Any</option><option>Replied</option><option>Clicked, no reply</option><option>No engagement yet</option></select></div>
+  <div class="field"><label>Reply tag</label><select><option>Any</option><option>Real</option><option>Unreal</option><option>OOO</option><option>Not interested</option><option>Untagged</option></select></div>
+</div>
+
+<table>
+  <thead>
+    <tr>
+      <th>Recipient</th><th>Company</th><th>Campaign</th><th>Persona</th>
+      <th>Status</th><th>Domain</th><th class="tabular">Date</th><th></th>
+    </tr>
+  </thead>
+  <tbody>
+
+    <tr><td>dana.wu@heliostack.com</td><td>HelioStack</td><td>coldpost-recruiter</td><td>recruiter</td>
+      <td><span class="chip chip-neutral">Active</span></td><td>heliostack.com</td><td class="tabular">2026-07-10</td>
+      <td>
+        <details class="row-menu"><summary>&#8230;</summary>
+          <div class="menu-panel">
+            <form><input type="date"><button class="menu-item" type="submit">Mark OOO</button></form>
+            <div class="menu-divider"></div>
+            <form><button class="menu-item danger" type="submit">Stop outreach</button></form>
+          </div>
+        </details>
+      </td></tr>
+
+    <tr><td>tom.reyes@brightloop.ai</td><td>BrightLoop</td><td>coldpost-founder</td><td>founder</td>
+      <td><span class="chip chip-neutral">Queued</span></td><td>brightloop.ai</td><td class="tabular">2026-07-13</td>
+      <td>
+        <details class="row-menu"><summary>&#8230;</summary>
+          <div class="menu-panel">
+            <form><input type="date"><button class="menu-item" type="submit">Mark OOO</button></form>
+            <div class="menu-divider"></div>
+            <form><button class="menu-item danger" type="submit">Stop outreach</button></form>
+          </div>
+        </details>
+      </td></tr>
+
+    <tr><td>priya.nair@vertexbio.com</td><td>Vertex Bio</td><td>coldpost-hiring_manager</td><td>hiring_manager</td>
+      <td><span class="chip chip-neutral">Done</span></td><td>vertexbio.com</td><td class="tabular">2026-06-28</td>
+      <td>
+        <details class="row-menu"><summary>&#8230;</summary>
+          <div class="menu-panel">
+            <form><input type="date"><button class="menu-item" type="submit">Mark OOO</button></form>
+            <div class="menu-divider"></div>
+            <form><button class="menu-item danger" type="submit">Stop outreach</button></form>
+          </div>
+        </details>
+      </td></tr>
+
+    <tr><td>sam.okafor@driftlabs.io</td><td>Drift Labs</td><td>coldpost-recruiter</td><td>recruiter</td>
+      <td><span class="chip chip-good">Replied</span></td><td>driftlabs.io</td><td class="tabular">2026-07-08</td>
+      <td>
+        <details class="row-menu"><summary>&#8230;</summary>
+          <div class="menu-panel">
+            <form><input type="date"><button class="menu-item" type="submit">Mark OOO</button></form>
+            <div class="menu-divider"></div>
+            <form><button class="menu-item" type="submit">Real</button></form>
+            <form><button class="menu-item danger" type="submit">Not interested</button></form>
+            <div class="menu-divider"></div>
+            <form><button class="menu-item danger" type="submit">Stop outreach</button></form>
+          </div>
+        </details>
+      </td></tr>
+
+    <tr><td>jane.kim@acme.com</td><td>Acme Robotics</td><td>coldpost-recruiter</td><td>recruiter</td>
+      <td><span class="chip chip-good">Replied</span></td><td>acme.com</td><td class="tabular">2026-07-13</td>
+      <td>
+        <details class="row-menu"><summary>&#8230;</summary>
+          <div class="menu-panel">
+            <form><input type="date"><button class="menu-item" type="submit">Mark OOO</button></form>
+            <div class="menu-divider"></div>
+            <form><button class="menu-item" type="submit">Real</button></form>
+            <form><button class="menu-item danger" type="submit">Not interested</button></form>
+            <form><button class="menu-item" type="submit">Unreal</button></form>
+            <div class="menu-divider"></div>
+            <form><button class="menu-item danger" type="submit">Stop outreach</button></form>
+          </div>
+        </details>
+      </td></tr>
+
+    <tr><td>leo.martins@northgate.co</td><td>Northgate</td><td>coldpost-founder</td><td>founder</td>
+      <td><span class="chip chip-good">Replied</span></td><td>northgate.co</td><td class="tabular">2026-07-08</td>
+      <td>
+        <details class="row-menu"><summary>&#8230;</summary>
+          <div class="menu-panel">
+            <form><input type="date"><button class="menu-item" type="submit">Mark OOO</button></form>
+            <div class="menu-divider"></div>
+            <form><button class="menu-item" type="submit">Real</button></form>
+            <form><button class="menu-item danger" type="submit">Not interested</button></form>
+            <form><button class="menu-item" type="submit">Unreal</button></form>
+            <div class="menu-divider"></div>
+            <form><button class="menu-item danger" type="submit">Stop outreach</button></form>
+          </div>
+        </details>
+      </td></tr>
+
+    <tr><td>ivy.chen@paperclip.dev</td><td>Paperclip</td><td>coldpost-recruiter</td><td>recruiter</td>
+      <td><span class="chip chip-good">Replied</span></td><td>paperclip.dev</td><td class="tabular">2026-07-05</td>
+      <td>
+        <details class="row-menu"><summary>&#8230;</summary>
+          <div class="menu-panel">
+            <form><input type="date"><button class="menu-item" type="submit">Mark OOO</button></form>
+            <div class="menu-divider"></div>
+            <form><button class="menu-item" type="submit">Real</button></form>
+            <form><button class="menu-item danger" type="submit">Not interested</button></form>
+            <div class="menu-divider"></div>
+            <form><button class="menu-item danger" type="submit">Stop outreach</button></form>
+          </div>
+        </details>
+      </td></tr>
+
+    <tr><td>mo.abara@quietfield.io</td><td>Quietfield</td><td>coldpost-hiring_manager</td><td>hiring_manager</td>
+      <td><span class="chip chip-neutral">Not interested</span></td><td>quietfield.io</td><td class="tabular">2026-07-02</td>
+      <td>
+        <details class="row-menu"><summary>&#8230;</summary>
+          <div class="menu-panel">
+            <form><input type="date"><button class="menu-item" type="submit">Mark OOO</button></form>
+            <div class="menu-divider"></div>
+            <form><button class="menu-item danger" type="submit">Stop outreach</button></form>
+          </div>
+        </details>
+      </td></tr>
+
+    <tr><td>rae.lindqvist@brambleworks.com</td><td>Brambleworks</td><td>coldpost-founder</td><td>founder</td>
+      <td><span class="chip chip-neutral">OOO &mdash; resumes 2026-08-01</span></td><td>brambleworks.com</td><td class="tabular">2026-07-11</td>
+      <td>
+        <details class="row-menu"><summary>&#8230;</summary>
+          <div class="menu-panel">
+            <form><input type="date"><button class="menu-item" type="submit">Mark OOO</button></form>
+            <div class="menu-divider"></div>
+            <form><button class="menu-item danger" type="submit">Stop outreach</button></form>
+          </div>
+        </details>
+      </td></tr>
+
+    <tr><td>mia.chen@northwind.io</td><td>Northwind Labs</td><td>coldpost-hiring_manager</td><td>hiring_manager</td>
+      <td><span class="chip chip-critical">Stopped</span></td><td>northwind.io</td><td class="tabular">2026-07-09</td>
+      <td>
+        <details class="row-menu"><summary>&#8230;</summary>
+          <div class="menu-panel">
+            <form><input type="date"><button class="menu-item" type="submit">Mark OOO</button></form>
+          </div>
+        </details>
+      </td></tr>
+
+    <tr><td>cody.simms@ferrousworks.com</td><td>Ferrous Works</td><td>coldpost-recruiter</td><td>recruiter</td>
+      <td><span class="chip chip-critical" title="550 no such user">Bounced &mdash; 550 no such user</span></td><td>ferrousworks.com</td><td class="tabular">2026-07-04</td>
+      <td>
+        <details class="row-menu"><summary>&#8230;</summary>
+          <div class="menu-panel">
+            <form><input type="date"><button class="menu-item" type="submit">Mark OOO</button></form>
+            <div class="menu-divider"></div>
+            <form><input type="email" placeholder="corrected@address.com"><button class="menu-item" type="submit">Resend to corrected address</button></form>
+            <div class="menu-divider"></div>
+            <form><button class="menu-item danger" type="submit">Stop outreach</button></form>
+          </div>
+        </details>
+      </td></tr>
+
+    <tr><td>ana.petrov@glasswing.io</td><td>Glasswing</td><td>coldpost-founder</td><td>founder</td>
+      <td><span class="chip chip-critical">Blocked</span></td><td>glasswing.io</td><td class="tabular">2026-07-06</td>
+      <td>
+        <details class="row-menu"><summary>&#8230;</summary>
+          <div class="menu-panel">
+            <form><input type="date"><button class="menu-item" type="submit">Mark OOO</button></form>
+            <div class="menu-divider"></div>
+            <form><input type="email" placeholder="corrected@address.com"><button class="menu-item" type="submit">Resend to corrected address</button></form>
+            <div class="menu-divider"></div>
+            <form><button class="menu-item danger" type="submit">Stop outreach</button></form>
+          </div>
+        </details>
+      </td></tr>
+
+    <tr><td>wes.tanaka@corvidsystems.com</td><td>Corvid Systems</td><td>coldpost-hiring_manager</td><td>hiring_manager</td>
+      <td><span class="chip chip-serious">Clicked</span></td><td>corvidsystems.com</td><td class="tabular">2026-07-12</td>
+      <td>
+        <details class="row-menu"><summary>&#8230;</summary>
+          <div class="menu-panel">
+            <form><input type="date"><button class="menu-item" type="submit">Mark OOO</button></form>
+            <div class="menu-divider"></div>
+            <form><button class="menu-item danger" type="submit">Stop outreach</button></form>
+          </div>
+        </details>
+      </td>
+      <td style="display:none"></td>
+    </tr>
+    <tr class="detail-row"><td colspan="8">
+      <ul class="plain"><li>stage 1: <a href="#">corvidsystems.com/careers</a> <span class="muted">(2026-07-12 09:14)</span></li></ul>
+    </td></tr>
+
+    <tr><td>yara.solomon@brightloop.ai</td><td>BrightLoop</td><td>coldpost-recruiter</td><td>recruiter</td>
+      <td><span class="chip chip-serious">Clicked (3)</span>
+        <button type="button" class="expand-toggle" onclick="toggleDetail(this)">&#9656; detail</button>
+      </td><td>brightloop.ai</td><td class="tabular">2026-07-14</td>
+      <td>
+        <details class="row-menu"><summary>&#8230;</summary>
+          <div class="menu-panel">
+            <form><input type="date"><button class="menu-item" type="submit">Mark OOO</button></form>
+            <div class="menu-divider"></div>
+            <form><button class="menu-item danger" type="submit">Stop outreach</button></form>
+          </div>
+        </details>
+      </td></tr>
+    <tr class="detail-row"><td colspan="8">
+      <ul class="plain">
+        <li>stage 0: <a href="#">brightloop.ai/pricing</a> <span class="muted">(2026-07-14 08:02)</span></li>
+        <li>stage 1: <a href="#">brightloop.ai/careers</a> <span class="muted">(2026-07-14 08:03)</span></li>
+        <li>stage 1: <a href="#">calendly.com</a> <span class="muted">(2026-07-14 08:05)</span></li>
+      </ul>
+    </td></tr>
+
+    <tr><td>felix.omondi@driftlabs.io</td><td>Drift Labs</td><td>coldpost-founder</td><td>founder</td>
+      <td><span class="chip chip-neutral">Active</span></td><td>driftlabs.io</td><td class="tabular">2026-07-13</td>
+      <td>
+        <details class="row-menu"><summary>&#8230;</summary>
+          <div class="menu-panel">
+            <form><input type="date"><button class="menu-item" type="submit">Mark OOO</button></form>
+            <div class="menu-divider"></div>
+            <form><button class="menu-item danger" type="submit">Stop outreach</button></form>
+          </div>
+        </details>
+      </td></tr>
+
+    <tr><td>nadia.kessler@heliostack.com</td><td>HelioStack</td><td>coldpost-recruiter</td><td>recruiter</td>
+      <td><span class="chip chip-neutral">Queued</span></td><td>heliostack.com</td><td class="tabular">2026-07-15</td>
+      <td>
+        <details class="row-menu"><summary>&#8230;</summary>
+          <div class="menu-panel">
+            <form><input type="date"><button class="menu-item" type="submit">Mark OOO</button></form>
+            <div class="menu-divider"></div>
+            <form><button class="menu-item danger" type="submit">Stop outreach</button></form>
+          </div>
+        </details>
+      </td></tr>
+
+    <tr><td>theo.park@vertexbio.com</td><td>Vertex Bio</td><td>coldpost-hiring_manager</td><td>hiring_manager</td>
+      <td><span class="chip chip-neutral">Done</span></td><td>vertexbio.com</td><td class="tabular">2026-06-30</td>
+      <td>
+        <details class="row-menu"><summary>&#8230;</summary>
+          <div class="menu-panel">
+            <form><input type="date"><button class="menu-item" type="submit">Mark OOO</button></form>
+            <div class="menu-divider"></div>
+            <form><button class="menu-item danger" type="submit">Stop outreach</button></form>
+          </div>
+        </details>
+      </td></tr>
+
+    <tr><td>ester.oyelaran@quietfield.io</td><td>Quietfield</td><td>coldpost-founder</td><td>founder</td>
+      <td><span class="chip chip-good">Replied</span></td><td>quietfield.io</td><td class="tabular">2026-07-15</td>
+      <td>
+        <details class="row-menu"><summary>&#8230;</summary>
+          <div class="menu-panel">
+            <form><input type="date"><button class="menu-item" type="submit">Mark OOO</button></form>
+            <div class="menu-divider"></div>
+            <form><button class="menu-item" type="submit">Real</button></form>
+            <form><button class="menu-item danger" type="submit">Not interested</button></form>
+            <div class="menu-divider"></div>
+            <form><button class="menu-item danger" type="submit">Stop outreach</button></form>
+          </div>
+        </details>
+      </td></tr>
+
+  </tbody>
+</table>
+
+</main>
+
+<script>
+// Theme toggle: cycles Auto -> Light -> Dark -> Auto, persisted in localStorage.
+// Same scale/style as the existing tiny vanilla-JS already in reachouts.html —
+// not a new dependency layer.
+(function () {
+  var ORDER = [null, 'light', 'dark'];
+  var btn = document.getElementById('theme-toggle');
+  var stored = localStorage.getItem('slap-theme');
+  if (stored) document.documentElement.setAttribute('data-theme', stored);
+  function label() {
+    var t = document.documentElement.getAttribute('data-theme');
+    btn.textContent = t === 'dark' ? 'Dark' : t === 'light' ? 'Light' : 'Auto';
+  }
+  label();
+  btn.addEventListener('click', function () {
+    var cur = document.documentElement.getAttribute('data-theme');
+    var next = ORDER[(ORDER.indexOf(cur) + 1) % ORDER.length];
+    if (next === null) {
+      document.documentElement.removeAttribute('data-theme');
+      localStorage.removeItem('slap-theme');
+    } else {
+      document.documentElement.setAttribute('data-theme', next);
+      localStorage.setItem('slap-theme', next);
+    }
+    label();
+  });
+})();
+
+// Row action menus: only one open at a time, closes on an outside click.
+// Native <details>/<summary> does the open/close itself -- this just adds
+// the "only one, and close on outside click" polish, same pattern as the
+// existing toggleDetail() helper already in reachouts.html.
+document.querySelectorAll('details.row-menu').forEach(function (d) {
+  d.addEventListener('toggle', function () {
+    if (d.open) {
+      document.querySelectorAll('details.row-menu[open]').forEach(function (other) {
+        if (other !== d) other.removeAttribute('open');
+      });
+    }
+  });
+});
+document.addEventListener('click', function (e) {
+  document.querySelectorAll('details.row-menu[open]').forEach(function (d) {
+    if (!d.contains(e.target)) d.removeAttribute('open');
+  });
+});
+
+// Click-detail expand toggle -- identical to reachouts.html's existing function.
+function toggleDetail(btn) {
+  var row = btn.closest('tr');
+  var detail = row.nextElementSibling;
+  if (!detail || !detail.classList.contains('detail-row')) return;
+  var open = detail.classList.toggle('open');
+  btn.innerHTML = open ? '&#9662; detail' : '&#9656; detail';
+}
+</script>
+
+</body>
+</html>
