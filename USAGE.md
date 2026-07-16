@@ -129,7 +129,7 @@ Company: Acme Corp
 Req ID:  (Req #4521)
 Contact name: Jane
 Company signal: you shipped the new search re-ranking system
-EOF
+<<<EOF>>>
 ```
 
 - Each line is split on the **first colon only** (`Role: Backend: Infra` → key `Role`,
@@ -139,8 +139,10 @@ EOF
   Matching against a field's `key` or `label` is case-insensitive.
 - Lines with no colon are ignored; unknown keys are ignored; a field missing from the
   drop entirely defaults to an empty string.
-- Type `EOF` on its own line to end the paste — this works the same whether you're typing
-  live or pasting a multi-line block from your clipboard.
+- Type `<<<EOF>>>` on its own line to end the paste — this works the same whether you're
+  typing live or pasting a multi-line block from your clipboard. (The terminator is
+  deliberately an unusual token, not a bare `EOF`, so it can't collide with a stray `EOF`
+  line that happens to appear inside a real drop or résumé paste.)
 - A declared field left empty prints a warning (`⚠ empty fields: req_id`) right before
   the preview — this is **informational only, it never blocks the send**, since some
   fields (like `req_id`) are legitimately blank often.
@@ -151,9 +153,9 @@ EOF
 python slap.py send my-campaign
 ```
 
-1. **Paste the drop** (above), terminated with `EOF`.
+1. **Paste the drop** (above), terminated with `<<<EOF>>>`.
 2. **If `latex.enabled: true`**: paste the LaTeX `.tex` source next (also terminated with
-   `EOF`). It compiles, opens the PDF in Preview and the `.tex` in `code`, then drops you
+   `<<<EOF>>>`). It compiles, opens the PDF in Preview and the `.tex` in `code`, then drops you
    into a loop:
    - `[r]ecompile` — after you've edited the `.tex`, recompile and reopen the preview.
    - `[o]pen editor` — reopen the `.tex` in `code` if you closed it.

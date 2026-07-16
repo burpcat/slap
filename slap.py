@@ -23,7 +23,7 @@ from slap import archive, dashboard, doctor, domains, gmass, gmass_cache, init, 
 
 load_dotenv()
 
-PASTE_TERMINATOR = "EOF"
+PASTE_TERMINATOR = "<<<EOF>>>"
 
 
 def read_paste(prompt: str, read_line=input) -> str:
