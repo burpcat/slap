@@ -31,6 +31,34 @@ sync:
 you regenerate and reload — the runner is never even invoked that day. **Always
 regenerate + reload after changing `active_days` or `fire_window_start`** (see below).
 
+## GMass-side follow-up scheduling (`gmass.allowed_days` / `gmass.skip_holidays`)
+
+`active_days` above only ever gates SLAP's own local `runner` — it has zero effect on
+GMass's own follow-up stages, which fire server-side on the cadence baked in at initial
+send (confirmed by a real investigation after Sunday follow-up activity was seen despite
+a weekday-only schedule — see `SLAP_PROJECT_CONTEXT.md` §5). If you actually want to pause
+GMass's *own* follow-up firing, that's a separate, independent knob:
+
+```yaml
+gmass:
+  allowed_days: [mon, tue, wed, thu, fri]
+  skip_holidays: false
+```
+
+- **`allowed_days`** — confirmed directly against GMass support: it reschedules which
+  days GMass's own scheduler may fire follow-up stages for recipients queued from that
+  point on. Locked in per-recipient at send time, so editing it never affects anyone
+  already sent. Omit entirely to leave GMass fully unrestricted (no `allowedDays` field
+  sent at all).
+- **`skip_holidays`** — tri-state, not a plain boolean default. Left out entirely, GMass's
+  own server-side default is actually `true` (holidays are already skipped with no config
+  here at all, confirmed by GMass support) — set it to `false` explicitly if you want
+  holidays *not* skipped.
+
+Both are independent of `schedule.active_days`: one is a low-stakes local preference for
+when SLAP itself wakes up, the other is locked in per-recipient at send time with no way
+to retroactively change it.
+
 ## Install
 
 1. Generate the plist from your current `config.yaml` and copy it into place:

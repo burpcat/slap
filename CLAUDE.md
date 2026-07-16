@@ -4,10 +4,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-This repo currently contains only the build brief `SLAP_BUILD_PROMPT.md`. The application
-(`slap.py`) has **not been built yet**. The brief is the authoritative spec — read it in
-full before writing code, and follow its **Build Order** (§14). Build in that order;
-Phase-0 probes come first and gate everything else.
+The app is built and in real, personal use — not a spec waiting to be implemented. 13 CLI
+commands (`list, send, dashboard, doctor, init, domains, rebuild, template-reload,
+runner, sync, plist, cleanup, bounced`), 730 tests (`pytest -q` / `pytest -m slow -q`),
+a multi-page localhost dashboard, and a long tail of post-launch features beyond the
+original build brief (Redis-backed dashboard cache, résumé archive/reuse, Reach-outs,
+Active Leads/Stop outreach, manual OOO marking, `gmass.allowed_days`/`skip_holidays`).
+
+For current, detailed state, read (in this order): `README.md` and `USAGE.md` (setup +
+day-to-day usage), `ARCHITECTURE.md` (engineering decisions, known limitations, bugs
+found), `SLAP_PROJECT_CONTEXT.md` (full onboarding brief — mission, every locked design
+decision, probe-verified GMass API facts, landmines, open questions). Don't assume
+`CONTROL_SHEET.md` or `SLAP_BUILD_PROMPT.md` are present — both are gitignored/local-only
+(never committed) and won't exist in a fresh worktree; treat `SLAP_PROJECT_CONTEXT.md` as
+the source of truth when they're absent.
 
 ## What this is
 
@@ -19,14 +29,15 @@ SQLite; a localhost dashboard shows status and lets the owner tag replies.
 
 ## Design philosophy ("iron") — governs every decision
 
-These are load-bearing. When a choice is already determined by these or by a spec in the
-brief, **do it — don't ask.** Only ask on a genuine unresolved fork.
+These are load-bearing. When a choice is already determined by these or by an existing
+locked decision (`SLAP_PROJECT_CONTEXT.md` §5), **do it — don't ask.** Only ask on a
+genuine unresolved fork.
 
 - **One source of truth.** Derived data is regenerated, never hand-maintained in parallel.
 - **Append-only event log.** The `events` table is never mutated/deleted. Any cache is
   rebuildable by replaying it.
 - **Fail loud, never silent.** Missing config/files/bad state → stop with a clear message.
-- **Warn, don't block — with exactly ONE hard gate:** the >1-page résumé gate (§9). All
+- **Warn, don't block — with exactly ONE hard gate:** the >1-page résumé gate. All
   other risky actions prompt the human and proceed on explicit confirm.
 - **Idempotent, one-recipient blast radius.** A failure can affect at most one recipient
   and can never double-send.
@@ -34,56 +45,65 @@ brief, **do it — don't ask.** Only ask on a genuine unresolved fork.
 
 ## Architecture (the big picture)
 
-- **Event-sourced tracking (§5).** One SQLite file, two tables. `events` is truth
+- **Event-sourced tracking.** One SQLite file, two tables. `events` is truth
   (append-only). `recipients` is a *derived cache* for fast current-state, fully
   rebuildable via the `rebuild` command by replaying `events`. Tests must prove a rebuilt
   cache equals the live one. **All timestamps are UTC**; convert to local only at
   dashboard display.
-- **Queue = more events (§10).** `send` stages a recipient as a `queued` event (+ staged
+- **Queue = more events.** `send` stages a recipient as a `queued` event (+ staged
   files) and does **not** send. The `runner` is **stateless**: it asks the DB "what's
-  queued and due?" and drains, writing `sent`/`send_failed`/`run_failed` events. No
-  separate queue store.
-- **Prep vs Fire split (§10).** Prep (`slap.py send`) is interactive (drop paste, LaTeX
+  queued and due?" and drains. No separate queue store.
+- **Prep vs Fire split.** Prep (`slap.py send`) is interactive (drop paste, LaTeX
   loop, domain check, preview, confirm → stage). Fire (`runner`, via macOS **launchd**) is
   unattended. Use a `StartCalendarInterval` LaunchAgent so a sleeping Mac runs the job
   **on wake** — plain cron does NOT catch up on wake; do not use it.
-- **Idempotent two-call send (§3).** Per recipient, always: (1) `POST /api/campaigndrafts`
+- **Idempotent two-call send.** Per recipient, always: (1) `POST /api/campaigndrafts`
   (creates draft, carries the attachment → returns draft ID), then (2) `POST /api/campaigns`
   (sends + sets follow-up cadence). Record the draft ID in the event log **the instant
   step 1 returns, before step 2 fires** — so a step-2 failure is retryable with no orphan
   and no double-create.
 - **Follow-ups are GMass's job.** Owner has GMass Premium; we set stage cadence at send
-  time (`stageOneDays`/`stageOneCampaignText`, etc.) and GMass fires stages 1–3, stopping
-  on reply. We build **no** follow-up scheduler.
-- **Domain/recipient dedup is derived live from `events` (§6)** — no parallel store. Exact
+  time and GMass fires stages 1–3, stopping on reply. We build **no** follow-up scheduler
+  of our own — `gmass.allowed_days`/`skip_holidays` reschedules GMass's *own* firing, it
+  doesn't replace it.
+- **Domain/recipient dedup is derived live from `events`** — no parallel store. Exact
   recipient already contacted → **hard warn** (always). Same non-consumer domain, different
   person → **soft warn**. Both warn, never block. Consumer domains
   (`consumer_domains.txt`) are excluded from the soft warn only.
-- **OOO re-queue (§7).** No GMass re-enroll API. Owner tags a reply OOO in the dashboard →
-  app itself sends the next stage as `sendAsReply: true` + `campaignIdToReplyTo` on the
-  normal runner cadence. Deterministic threading — never rely on GMass "last conversation"
-  auto-detection.
-- **App owns LaTeX compilation (§9).** Compile with `xelatex` (twice) or `latexmk -xelatex`
+- **OOO handling has two mechanisms, both real, not one.** (1) Reply-triggered re-queue:
+  owner tags a reply OOO in the dashboard → app sends the next stage itself as
+  `sendAsReply: true` + `campaignIdToReplyTo` on the normal runner cadence — deterministic
+  threading, never relying on GMass "last conversation" auto-detection. (2) Manual,
+  date-based marking: any Reach-outs row can be marked OOO directly and unconditionally,
+  with an owner-chosen resume date, via GMass's account-wide unsubscribe endpoint — this
+  deliberately goes further than "no per-recipient scheduling," a considered addition,
+  not scope creep.
+- **App owns LaTeX compilation.** Compile with `xelatex` (twice) or `latexmk -xelatex`
   in a per-recipient workdir. `code`/Preview are human surfaces only. The staged PDF is
   tied to a hash of the accepted `.tex` so a stale/broken PDF is never attached.
+- **Dashboard GMass-data cache is optional, never gating.** `slap/gmass_cache.py`
+  refreshes a Redis-backed cache hourly (`sync`, its own launchd job); if Redis is
+  unreachable, every page just falls back to a live GMass poll on open, exactly as if the
+  cache never existed.
 
-## Phase 0 — verify before building (§2)
+## Phase 0 — verify before building (historical, but the safety rule still applies)
 
-The GMass API contract in the brief comes from docs and **must be verified against the live
-API first** via isolated `probes/` scripts, with real responses recorded into
-`CONTROL_SHEET.md`. Do not build dependent code on any unverified assumption. Most
-load-bearing unknown: the exact **stop-on-reply** parameter (probe #2).
+The original build verified the GMass API contract against the live API via isolated
+`probes/` scripts before any production code was written — this caught real discrepancies
+between the vendor's docs and actual behavior (see `SLAP_PROJECT_CONTEXT.md` §6 for the
+resolved facts). If you ever need to re-probe something (the API is third-party and could
+change), the same hard safety rule still applies, baked into probe code, not a config
+knob:
 
-**Hard safety rule baked into probe code (not a config knob, not overridable):** any probe
-that sends may target **only** the owner's own inbox via Gmail plus-tags
-(`everythingforgenius+testmass{N}@gmail.com`) or create drafts without sending. Any other
-`to` value must raise **before any network call**.
+**Any probe that sends may target only the owner's own inbox via Gmail plus-tags, or
+create drafts without sending. Any other `to` value must raise before any network call.**
 
-## Config & layout (§4)
+## Config & layout
 
-- `config.yaml` (global): sender, `gmass.api_key_env`, fixed **persona cadences**
-  (`hiring_manager [2,4,6]`, `recruiter [2,3,5]`, `founder [2,5,7]`), schedule knobs,
-  tracking.
+- `config.yaml` (global): sender, `gmass.api_key_env`, `gmass.allowed_days`/
+  `skip_holidays`, fixed **persona cadences** (`hiring_manager [2,4,6]`,
+  `recruiter [2,3,5]`, `founder [2,5,7]` — plus an unexplained fourth, `vibe`, see
+  `SLAP_PROJECT_CONTEXT.md` §11), `signature`, schedule knobs, tracking, optional Redis.
 - `campaigns/<name>/` is **auto-discovered** — any folder with a valid `campaign.yaml` is
   live. No central registry. Contains `campaign.yaml`, `initial.txt`, `stageN.txt`, and
   `resume.pdf` (when latex disabled).
@@ -95,23 +115,26 @@ that sends may target **only** the owner's own inbox via Gmail plus-tags
   (`line.partition(":")`); strip exactly one space after the colon, preserve the rest;
   ignore colon-less lines; unknown keys ignored; missing keys default empty. Paste-only.
 
-## CLI surface (§11)
+## CLI surface
 
-`list` · `send <campaign> [--now]` · `dashboard` · `doctor` · `domains` · `rebuild`.
-`doctor` preflight also auto-runs before any send and any drain. Secrets: `.env` holds
-`GMASS_API_KEY` (python-dotenv), `.env` gitignored from first commit, ship `.env.example`.
-Deps pinned in `requirements.txt`, kept minimal.
+See `README.md`'s Commands table for the full, current list with flags — don't hardcode a
+second copy here, it will drift. `doctor` preflight also auto-runs before any send and
+any drain. Secrets: `.env` holds `GMASS_API_KEY` (python-dotenv), `.env` gitignored from
+first commit, ship `.env.example`. Deps pinned in `requirements.txt`, kept minimal.
 
-## Standing deliverable: CONTROL_SHEET.md (§12)
+## CONTROL_SHEET.md — local-only, not shipped
 
-Maintain `CONTROL_SHEET.md` as the single reference of every knob, toggle, default,
-confirmation gate, file location, and Phase-0 probe finding — updated as each piece is
-built, and populated with resolved Phase-0 API facts.
+`CONTROL_SHEET.md` is gitignored and exists only in the main checkout, never committed
+and never present in a fresh worktree. When present, it's organized into: GMass API
+Contract, Config Knobs, Confirmation Gates, File/Module Locations, Event Schema, CLI
+Command Reference, and a chronological Changelog/Decision Log of post-launch features.
+Treat `SLAP_PROJECT_CONTEXT.md` as the source of truth whenever `CONTROL_SHEET.md` isn't
+available.
 
 ## Commands
 
-No build/test tooling exists yet. When scaffolding, expect:
+- Install deps: `pip install -r requirements-dev.txt` (includes `requirements.txt` + pytest)
 - Run: `python slap.py <command>` (e.g. `python slap.py doctor`, `python slap.py list`)
-- Install deps: `pip install -r requirements.txt`
-- Tests per the §13 plan (probes run first, self-send-only). Wire the chosen test runner
-  and document the single-test invocation here once it exists.
+- Tests: `pytest -q` (fast suite, default) / `pytest -m slow -q` (real `xelatex` compiles
+  + a real threaded HTTP server). Neither suite makes real GMass API calls or sends
+  anything — that's what the standalone, hand-run Phase-0 probes are for.

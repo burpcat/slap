@@ -16,8 +16,10 @@ event-sourced SQLite store with a localhost dashboard for monitoring and reply t
 
 **Stack:** Python 3, stdlib `argparse` for the CLI, SQLite for storage, Flask for the
 localhost dashboard, `requests` for the GMass HTTP client, `PyYAML` for config, `pypdf`
-for LaTeX page-counting. No ORM, no task queue, no background worker framework — the
-"runner" is a plain script fired by macOS `launchd`.
+for LaTeX page-counting, `rich` for terminal colorization, `python-dotenv` for `.env`
+loading, and an optional `redis` client for the dashboard's GMass-data cache (below). No
+ORM, no task queue, no background worker framework — the "runner" is a plain script fired
+by macOS `launchd`.
 
 **Build approach — verify before building, then build in dependency order.** Rather than
 implementing against the GMass API's documented shape, the project started with a
@@ -82,7 +84,11 @@ scheduler. The one thing the app *does* own unattended is the reply-triggered "o
 office" recovery: when the owner tags a reply as OOO in the dashboard, the app sends the
 next stage itself, as an explicit threaded reply (`sendAsReply` + a specific
 `campaignIdToReplyTo`) rather than depending on GMass's own conversation-matching
-heuristics — deterministic threading was worth the small amount of extra code.
+heuristics — deterministic threading was worth the small amount of extra code. A second,
+separate mechanism exists alongside it: any Reach-outs row can be marked OOO manually and
+unconditionally, with an owner-chosen resume date, independent of whether a reply was
+ever tagged — see "Future expansions," below, for why this deliberately goes further than
+the original reply-triggered-only design.
 
 **Dedup is derived, not stored.** "Have I already emailed this person / this company?"
 is answered by querying the event log live at send time — an exact-recipient match is a
@@ -127,6 +133,39 @@ recent attempt was never going to need append-only replay anyway. Same one-recip
 (and, here, one-campaign) blast radius as everywhere else in the app: one broken
 campaign's config, or one recipient's field mismatch, never blocks reloading anyone else.
 
+**Redis-backed dashboard cache (`slap/gmass_cache.py`), because live polling didn't
+scale.** The dashboard originally called GMass's report endpoints live on every page
+open; in practice that meant 170+ sequential HTTP requests per load with no timeout,
+"just keeps buffering." `sync` (a second, hourly `launchd` job — see `LAUNCHD.md`) now
+refreshes a Redis-cached blob of reply/click/bounce/block data instead, and every
+dashboard page reads from that cache first. Redis is entirely optional and never gating:
+if it's unreachable, `doctor` just reports that fact, and every page falls back to a live
+GMass poll on open exactly like before — the cache only exists to make that the
+*uncommon* path instead of the *every-page-load* path.
+
+**Dashboard multi-page split, with a shared static-asset foundation.** The dashboard grew
+from one ever-growing scrolling page into five — Home, Pipeline, Engagement,
+Deliverability, and the all-campaigns Reach-outs page — sharing one `base.html` layout
+(nav, theme toggle, the cache-status banner). This is also the app's first static asset
+(`slap/static/dashboard.css`) and its first dark mode (CSS custom properties,
+`prefers-color-scheme` plus a manual toggle persisted in `localStorage`). Pipeline is
+deliberately the one page with zero Redis-cache dependency — every widget on it is a
+plain uncached SQLite read, so it's always instant.
+
+**`gmass.allowed_days`/`gmass.skip_holidays` — a GMass-side scheduling knob, distinct
+from `schedule.active_days`.** `active_days` only ever gates whether SLAP's own local
+`runner` initiates a new send on a given day; it has zero effect on GMass's own follow-up
+stages, which fire server-side on the cadence baked in at initial send. `allowed_days`/
+`skip_holidays` (confirmed directly against GMass support) is the actual GMass-side
+answer: it reschedules GMass's *own* follow-up firing, locked in per recipient at send
+time, so changing it never affects anyone already sent.
+
+**Bounce/block reason text.** GMass's own bounce/block reason string was captured from
+the moment bounces-vs-blocks were split into separate report categories, but sat unused —
+the dashboard only ever showed a bare "Bounced"/"Blocked" label. It's now surfaced
+(truncated in-table, full text in a native tooltip) in both the Deliverability page and
+Reach-outs, since a real DSN blob can be arbitrarily long.
+
 ## Future expansions / known limitations
 
 Found during development (mostly via structured self-audits run after every build
@@ -144,10 +183,12 @@ stage) and deliberately deferred rather than silently left undocumented:
   headroom by design), but worth unifying into one date-handling utility.
   Comment: the localhost dashboard's own equivalent panels *do* correctly convert to
   local time — this gap is specifically in the unattended runner's cap-headroom estimate.
-- **A hand-crafted API request could tag a reply "out of office" for a recipient with no
-  actual unresolved reply**, creating a queue entry that can never resolve. Not reachable
-  through the dashboard UI (which only ever renders real, actionable replies), but the
-  backend doesn't independently guard against it.
+- **Manual, date-based OOO marking is a real, intentional dashboard feature, not a
+  backend gap.** Any Reach-outs row can be marked OOO directly, unconditionally, with a
+  mandatory owner-chosen resume date — this deliberately supersedes the original
+  reply-triggered-only design (see "Follow-ups are the vendor's job," above). It uses
+  GMass's account-wide unsubscribe endpoint rather than the per-campaign one, after
+  probing found the per-campaign endpoint silently didn't register.
 - **Read-your-own-config inconsistency**: one read-only reporting command (`domains`)
   still reads a hardcoded default file path rather than the same configurable path the
   rest of the app now respects, for owners who rename that file. Low-stakes (it only
@@ -164,6 +205,15 @@ stage) and deliberately deferred rather than silently left undocumented:
 - **Single-owner by design** — the dedup/cap/tracking model assumes one sender identity
   and one local SQLite file; extending to multiple senders would need per-sender
   partitioning throughout, not just a config change.
+- **`design/reachouts-reference.html` is a reference-only design mockup, not live app
+  code** — a standalone file, visually built on the same CSS system as the real
+  dashboard, used for an IA design review before the multi-page redesign was built. It's
+  never served by the Flask app; don't confuse it with anything under
+  `slap/dashboard_templates/`.
+- **Bounce/block remediation exists in two places**: the `bounced` CLI command (prompt a
+  corrected address for a bounced/blocked recipient, then resend) and the dashboard's own
+  "Resend to corrected address" Reach-outs row action — same underlying fix, two entry
+  points for whichever the owner has open at the time.
 
 ## Notable bugs found (worth knowing for the "how do you catch bugs" conversation)
 

@@ -25,6 +25,11 @@ you're set up.
   [MacTeX](https://www.tug.org/mactex/) (for `xelatex`) and the
   [`code`](https://code.visualstudio.com/docs/editor/command-line) CLI (VS Code), both
   on your `PATH`. `slap.py doctor` checks for both — see below.
+- Optional: **Redis** (`redis-server` on your `PATH`), used to cache GMass reply/click/
+  bounce data for the dashboard, refreshed hourly by `slap.py sync`. Entirely optional —
+  without it the dashboard just falls back to live GMass polling on every page open,
+  exactly like before this existed. `doctor` reports whether it's reachable but never
+  blocks a send/drain over it.
 
 ## Setup
 
@@ -45,9 +50,10 @@ python slap.py init
 `init` is the entry point for everything else in this section — it's re-runnable any
 time (it asks before overwriting anything real) and walks through:
 
-1. **Preflight** — checks python3/venv/macOS/`xelatex`/`code`, printing exact install
-   instructions for anything missing. Nothing is auto-installed; LaTeX/`code` are only
-   required if you turn on a LaTeX campaign.
+1. **Preflight** — checks python3/venv/macOS/`xelatex`/`code`/`redis-server`, printing
+   exact install instructions for anything missing. Nothing is auto-installed; LaTeX/
+   `code` are only required if you turn on a LaTeX campaign, and Redis is only required
+   if you want the dashboard's hourly GMass-data cache (optional either way).
 2. **Sender** — writes `config.yaml` and asks for your Gmail address and name.
    **Your `from_email` must be the exact Gmail account your GMass API key is connected
    to** — GMass sends by relaying through that account.
@@ -81,9 +87,10 @@ first real send, or that placeholder is exactly what goes out. The key must be p
 `GMASS_API_KEY` is set, `config.yaml`'s sender fields are filled in, the SQLite tracking
 DB is reachable, and `consumer_domains.txt` is present (it seeds the default
 consumer-email-provider list automatically if missing — the only check here that writes
-anything; everything else only checks, never installs). It then validates every campaign
-under `campaigns/` and reports pass/fail per check, exiting non-zero if anything needs
-attention.
+anything; everything else only checks, never installs). It also reports whether Redis is
+reachable (never blocking — the dashboard's cache is entirely optional). It then
+validates every campaign under `campaigns/` and reports pass/fail per check, exiting
+non-zero if anything needs attention.
 
 ## Setting up a campaign
 
@@ -144,9 +151,11 @@ dashboard, deliverability tips). Quick reference:
 | `python slap.py domains` | Regenerates and prints a read-only domain index from tracked events (who you've contacted, grouped by email domain) — for manual inspection, not itself a source of truth. |
 | `python slap.py rebuild` | Rebuilds the `recipients` cache table by replaying the full `events` log. Use this if the cache ever looks wrong — `events` is always the source of truth. |
 | `python slap.py runner` | The unattended drain — asks the DB what's queued and due, and sends it. Meant to be triggered by **launchd**, not run by hand day-to-day. See [`LAUNCHD.md`](LAUNCHD.md) for setup and the one-time manual test. Guards itself against `config.yaml`'s `schedule.active_days` — exits without draining on a day that isn't listed. |
-| `python slap.py plist` | Prints the launchd `.plist` for `runner`, generated from the current `config.yaml` (one `StartCalendarInterval` entry per `schedule.active_days` day) — redirect it into `~/Library/LaunchAgents/`. See [`LAUNCHD.md`](LAUNCHD.md). |
-| `python slap.py cleanup [--confirm]` | Deletes stale compiled résumé PDFs for recipients who are done/dead/never replied and have been idle 15+ days — except one still referenced by a live `RESUME_ARCHIVE_DIR` symlink, which is kept. Dry run by default; `--confirm` actually deletes. Never touches `resume.tex`. |
+| `python slap.py sync` | Refreshes the dashboard's optional Redis-backed cache of GMass reply/click/bounce/block data. Meant to be triggered hourly by **launchd**, not run by hand day-to-day. See [`LAUNCHD.md`](LAUNCHD.md). Fails loud (fast) if Redis isn't reachable; the dashboard falls back to live polling regardless. |
+| `python slap.py plist [--job runner\|sync]` | Prints the launchd `.plist` for `runner` (default) or, with `--job sync`, for the hourly cache-sync job — both generated from the current `config.yaml`. Redirect the output into `~/Library/LaunchAgents/`. See [`LAUNCHD.md`](LAUNCHD.md). |
+| `python slap.py cleanup [--confirm] [--min-days-idle N]` | Deletes stale compiled résumé PDFs for recipients who are done/dead/never replied and have been idle `N` days (default 15) — except one still referenced by a live `RESUME_ARCHIVE_DIR` symlink, which is kept. Dry run by default; `--confirm` actually deletes. Never touches `resume.tex`. |
 | `python slap.py template-reload` | Re-renders every not-yet-sent recipient's staged content (across every campaign) against whatever `initial.txt`/`stageN.txt` currently say — for when you edit a template after already staging sends. Shows a summary + sample diffs and asks to confirm before writing anything. Only touches recipients who haven't sent at all yet: once a recipient's initial send fires, GMass has already locked in every follow-up stage's wording, so editing templates afterward can't change it. A recipient staged before this feature existed, or whose stored drop values don't cover a newly-added placeholder, is left untouched and reported in the dashboard's **Template Failures** tab instead. |
+| `python slap.py bounced` | Fixes bounced/blocked recipients — prompts for a corrected address and resends. The same remediation is also available as a "Resend to corrected address" row action directly on the dashboard's Reach-outs page. |
 
 Typical flow: `send` a few recipients through the interactive prep loop (staging them to
 the queue, not sending yet) → either `send --now` to drain immediately, or let the

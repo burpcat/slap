@@ -5,7 +5,7 @@ the mission, architecture, every locked decision, the real (probe-verified) GMas
 facts, current build state, known landmines, and the working rhythm — so you can be
 useful without re-deriving any of it.*
 
-*Snapshot date: 2026-07-09. Build state moves; treat "Current state" (§8) as of this
+*Snapshot date: 2026-07-15. Build state moves; treat "Current state" (§8) as of this
 date and confirm against `CONTROL_SHEET.md` in the repo, which is the live source of
 truth. This revision was produced by re-reading the actual code, schema, `campaign.yaml`
 files, and `CONTROL_SHEET.md` end to end — not by rewriting the prior draft from memory —
@@ -112,8 +112,11 @@ you're about to introduce the class of bug this project is built to avoid.
    stale compiled résumé PDFs after 15 idle days by default (keeps `.tex`; never deletes a
    PDF a live `RESUME_ARCHIVE_DIR` symlink still points at). `python slap.py doctor`
    health-checks. `python slap.py rebuild` reconstructs the recipients cache from events.
-   `python slap.py plist` (re)generates the launchd `.plist` from the current
-   `config.yaml`. `python slap.py init` is the interactive installer (see §8).
+   `python slap.py plist [--job runner|sync]` (re)generates a launchd `.plist` from the
+   current `config.yaml`. `python slap.py sync` refreshes the optional Redis-backed
+   dashboard cache (hourly, via its own launchd job). `python slap.py bounced` prompts a
+   corrected address for a bounced/blocked recipient and resends. `python slap.py init`
+   is the interactive installer (see §8).
 
 Mental model: **prep stages → `--now` or the scheduled `runner` drains the WHOLE due
 queue → GMass sends + follows up + tracks → check dashboard/Reach-outs, tag replies →
@@ -130,8 +133,8 @@ colorization). xelatex (system) for résumé compile. macOS launchd for scheduli
 ```
 slap.py                     # entry point — real CLI surface (13 commands, not the brief's original 6):
                              #   list | send <campaign> [--now] | dashboard | doctor | init |
-                             #   domains | rebuild | runner | sync | plist | cleanup [--confirm] [--min-days-idle N] |
-                             #   template-reload
+                             #   domains | rebuild | runner | sync | plist [--job runner|sync] |
+                             #   cleanup [--confirm] [--min-days-idle N] | template-reload | bounced
 slap/                       # package:
     config.py                 #   config.yaml + campaign.yaml loading, auto-discovery, fail-loud validation
     templates.py               #   drop parser + {{key}} fill + merge_config_values() (signature)
@@ -143,13 +146,18 @@ slap/                       # package:
     queue.py                    #   stage_recipient(), due_recipients(), OOO tag_ooo()/due_for_ooo_resend()
     runner.py                   #   drain(), wait_for_fire_window(), is_active_day(), OOO resend
     reload.py                    #   template-reload: scan()/apply_changes()/write_failures()/load_failures()
-    dashboard.py + dashboard_templates/{dashboard,reachouts,template_failures}.html   # Flask app, all pages
+    dashboard.py                  #   Flask app — all routes (index/pipeline/engagement/deliverability/reachouts/template-failures)
+    dashboard_templates/           #   base.html (shared layout) + dashboard/pipeline/engagement/deliverability/reachouts/template_failures.html
+    static/dashboard.css           #   shared stylesheet — the app's first static asset (dark mode + light mode)
+    ui_state.py                  #   third SQLite table (warm-but-silent hide/unhide), independent of events/recipients
     doctor.py                    #   preflight checks (global + per-campaign), wired into send + drain
     cleanup.py                   #   stale-PDF classification/deletion (`cleanup` command)
     archive.py                   #   résumé archive (RESUME_ARCHIVE_DIR) + résumé-reuse lookup
     init.py                      #   interactive installer (`init` command)
-    launchd.py                   #   render_plist() — generates the launchd .plist from config.yaml
+    launchd.py                   #   render_plist() — generates the launchd .plist (runner or sync job) from config.yaml
     display.py                    #   rich-based terminal colorization (warn/error/success/preview panel)
+design/reachouts-reference.html  # reference-only IA mockup used during the dashboard redesign review —
+                             #   never served by the Flask app, not live app code
 config.yaml                 # global: sender, gmass key env, signature, persona cadences, schedule, tracking
 config.yaml.example
 campaigns/<name>/           # per campaign, auto-discovered:
@@ -172,7 +180,7 @@ probes/ (probes/findings/)  # Phase-0 API-truth probes + captured evidence (also
 .env / .env.example          # GMASS_API_KEY, RESUME_ARCHIVE_DIR (never committed)
 .claude/                    # agents/iron-auditor.md, settings.json (hooks, permissions)
 com.slap.runner.plist.example + LAUNCHD.md   # scheduler reference (real plist is generated by `plist`, not hand-copied)
-conftest.py, tests/         # pytest suite (595 tests passing as of this snapshot; `pytest -m slow` for real-xelatex/real-socket tests)
+conftest.py, tests/         # pytest suite (730 tests total as of this snapshot — 722 fast + 8 marked `slow` for real-xelatex/real-socket tests)
 ```
 
 ---
@@ -410,10 +418,26 @@ every reason (a mailbox-full soft bounce, a spam-policy block, an invalid-recipi
 bounce all render their own real text) — verified specifically against a realistic
 invalid-address 5.1.1 diagnostic string, not just asserted to work in the abstract.
 
+**Bounce/block remediation — two entry points, one fix, shipped.** `python slap.py
+bounced` (a standalone CLI command) prompts for a corrected address for a bounced/blocked
+recipient and resends. The dashboard's own Reach-outs row action, "Resend to corrected
+address" (only shown on a bounced row), is the same underlying fix reachable without
+leaving the browser — whichever the owner has open at the time.
+
 **OOO re-queue:** GMass usually filters auto-responders itself, so this is a safety net.
 Tagging a reply "OOO" fires that recipient's next stage as a send-as-reply
 (`sendAsReply: true` + `campaignIdToReplyTo`, coerced to int) on the normal drain
 cadence — see §3 item 5 and §11 for what's proven vs. not.
+
+**Manual, date-based OOO marking — a second, separate mechanism, shipped, not a
+proposal.** The reply-triggered re-queue above only ever fires from a tagged reply. Any
+Reach-outs row can also be marked OOO directly and unconditionally — no reply required —
+with a mandatory owner-chosen resume date; `due_for_ooo_resend()` gates the actual resend
+on that date having passed. This deliberately goes further than the original brief's "no
+special date parsing, no per-recipient scheduling" constraint for OOO handling — a
+considered override, not drift. It uses GMass's **account-wide** unsubscribe endpoint
+rather than the per-campaign one: the per-campaign endpoint was probed first and found to
+silently not register, so the account-wide one was adopted instead after that finding.
 
 **LaTeX loop:** app owns compilation (deterministic, gives page count + guaranteed PDF);
 `code` + macOS Preview are surfaces. Compile loop `[r]ecompile / [o]pen editor / [d]one /
@@ -486,10 +510,21 @@ had their persona's 2-day first stage land right on that Sunday — GMass fired 
 invisibly to SLAP. `active_days` being unrestricted (all 7 days, above) made this doubly
 inevitable but isn't even the deciding factor — even a fully weekday-restricted
 `active_days` would not have paused those follow-ups, since they were never subject to
-it. See CONTROL_SHEET.md's dedicated write-up for the full investigation. If pausing
-follow-ups over weekends is ever wanted, `active_days` cannot do it — that would need a
-real design decision (GMass-side controls, if any exist, or accepting the current
-behavior), not something this investigation decided unilaterally.
+it. See CONTROL_SHEET.md's dedicated write-up for the full investigation. **This has
+since been resolved, not left open**: `gmass.allowed_days`/`gmass.skip_holidays` (below)
+is the real GMass-side control this entry was asking whether one existed.
+
+**`gmass.allowed_days`/`gmass.skip_holidays` — the actual GMass-side answer to the
+question above, confirmed directly against GMass support (2026-07-13/14).** Unlike
+`schedule.active_days` (which only ever gates SLAP's own local `runner`), this pair
+reaches GMass's own server-side follow-up scheduler: `allowed_days` reschedules which
+days GMass may fire follow-up stages for recipients queued from that point on, locked in
+per-recipient at send time (editing it later never affects anyone already sent).
+`skip_holidays` is tri-state, not a plain boolean — omitted entirely, GMass's own
+server-side default is actually `true` (holidays are skipped even with no config here at
+all, per GMass support); set it to `false` explicitly if holidays should NOT be skipped.
+Deliberately a separate knob from `active_days`: one is a low-stakes local scheduling
+preference, the other is locked in per-recipient with no way to retroactively fix it.
 
 **Active Leads / Unreal / Stop outreach — shipped, not still pending.** A Real-tagged
 reply used to have exactly one consequence: nothing (pure bookkeeping, per the
@@ -598,24 +633,28 @@ fill (via CSS `color-mix()` against the live surface) instead of a flat neutral 
 matching the "unfilled track is a lighter step of the same ramp" meter convention the rest
 of this app's palette already follows.
 
-An iron-audit found no blockers. Three NITs, none fixed yet: the shared "Refresh now"
-button (in `base.html`'s banner) always redirects to Home regardless of which page it was
-clicked from, since it predates the multi-page split; `engagement_page()` reimplements the
-hidden-row filter inline instead of reusing `visible_warm_but_silent()` (moved verbatim
-from the old `index()`, not a new drift risk, just an unreduced duplication); and this doc
-itself needed the sync pass you're reading now.
+An iron-audit found no blockers. Three NITs surfaced; two remain unfixed: the shared
+"Refresh now" button (in `base.html`'s banner) always redirects to Home regardless of
+which page it was clicked from, since it predates the multi-page split; and
+`engagement_page()` reimplements the hidden-row filter inline instead of reusing
+`visible_warm_but_silent()` (moved verbatim from the old `index()`, not a new drift risk,
+just an unreduced duplication). The third — this doc itself needing a sync pass — is what
+the 2026-07-15 revision you're reading did.
 
 ---
 
 ## 6. Real GMass API facts (probe-verified — these OVERRIDE the build brief's assumptions)
 
 **These facts are as of the original Phase-0 probes (2026-07-02) and have not been
-re-verified live since.** No new probe run is recorded in `CONTROL_SHEET.md` between then
-and this snapshot (2026-07-09). Treat anything below as "true as of the last time anyone
+re-verified live since.** Treat anything below as "true as of the last time anyone
 checked," and re-probe (`probes/run.py`) before trusting a fact that's become
 load-bearing for new work, especially anything about follow-up/stop-on-reply behavior
 (see §11 — several of the below were explicitly marked as parameter-accepted but
-behaviorally *unproven*, and that remains the case).
+behaviorally *unproven*, and that remains the case). Two later, narrower live probes were
+run for specific new features — GMass's account-wide vs. per-campaign unsubscribe
+endpoint (§5, manual OOO marking) and `gmass.allowed_days`/`skip_holidays` (§5, confirmed
+directly against GMass support 2026-07-13/14) — but neither re-verified the broader
+send/reports/threading contract below.
 
 - **Auth:** `X-apikey` **header** (query `?apikey=` also works; header preferred to keep
   the key out of logs).
@@ -709,7 +748,7 @@ behaviorally *unproven*, and that remains the case).
 
 ---
 
-## 8. Current state (as of 2026-07-09)
+## 8. Current state (as of 2026-07-15)
 
 **All original 13 Build Order steps are complete, plus a long tail of post-launch
 features and real-usage bugfixes** (this app has been in real, personal use for a while
@@ -735,6 +774,17 @@ don't assume a feature landed just because a task once existed for it):
 - **Bounce/block reason text** — GMass's real reason text now shown (truncated, full text
   in a tooltip) in both the Bounces & Blocks widget and Reachouts, not just a bare
   "Bounced"/"Blocked" label (§5).
+- **Bounce/block remediation** (`slap.py bounced` CLI + the dashboard's "Resend to
+  corrected address" Reach-outs row action) — real, two entry points to the same fix (§5).
+- **Redis-backed dashboard cache** (`slap/gmass_cache.py`, hourly `slap.py sync` job) —
+  real, fully optional (never gates a send/drain), falls back to live GMass polling on
+  open if Redis is unreachable or the cache is stale (§5, Architecture in
+  `ARCHITECTURE.md`).
+- **`gmass.allowed_days`/`gmass.skip_holidays`** — real, GMass-support-confirmed knob that
+  actually reschedules GMass's own follow-up firing (unlike `schedule.active_days`,
+  which only ever gates SLAP's own local runner) (§5).
+- **Manual, date-based OOO marking** — real, unconditional Reach-outs row action with an
+  owner-chosen resume date, using GMass's account-wide unsubscribe endpoint (§5).
 - **Distribution tooling**: `slap.py init` (9-step interactive installer), the
   config-driven owner test-guard (probes now guard to whoever's `config.yaml` says, not
   one hardcoded address), and `slap-dist` (a separate public repo,
@@ -897,13 +947,16 @@ down. Re-check these before designing anything that depends on the answer.
   can only ever be a manual "open the delivered email and check" step, not something
   automatable. Do this periodically, not just once.
 - **What is `vibe: [2,4]` in the real `config.yaml`'s `personas:` block?** Not used by
-  any of the three real campaigns, not mentioned in `CONTROL_SHEET.md`, README.md,
-  USAGE.md, or CLAUDE.md. Either a fourth persona being prepared for a future campaign, or
-  stray/leftover config. Ask the owner before assuming either way — don't build against
-  it, and don't delete it, without confirming which.
-- **Has anyone re-run the Phase-0 probes since 2026-07-02?** Not as far as
-  `CONTROL_SHEET.md` records. Every fact in §6 is "true as of that date" — GMass is a
-  third-party API and could change behavior without this repo knowing.
+  any of the three real campaigns, and not mentioned in README.md, USAGE.md, or CLAUDE.md
+  (it's now noted as an open, unused knob in `CONTROL_SHEET.md`'s Config Knobs section,
+  but that doesn't resolve what it's *for*). Either a fourth persona being prepared for a
+  future campaign, or stray/leftover config. Ask the owner before assuming either way —
+  don't build against it, and don't delete it, without confirming which.
+- **Has anyone re-run the *original* Phase-0 probes since 2026-07-02?** Not as far as
+  `CONTROL_SHEET.md` records — every fact in §6 is still "true as of that date," and
+  GMass is a third-party API that could change behavior without this repo knowing. (Two
+  later, narrower probes were run for specific new features — the unsubscribe endpoint
+  and `allowed_days`/`skip_holidays` — but neither re-verified §6's broader contract.)
 - **Is the launchd wake-catch-up behavior still proven against the CURRENT plist
   generation path** (`slap.py plist`, post-scheduler-days rework), or only against the
   older hand-copied `.example` plist from before that feature shipped? Worth a fresh

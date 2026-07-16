@@ -228,13 +228,15 @@ confirm it lands and looks right, then you're clear to send to real recipients.
 | `python slap.py list` | Lists every auto-discovered campaign (persona, LaTeX on/off). |
 | `python slap.py send <campaign> [--now]` | The prep flow above. `--now` also drains immediately. |
 | `python slap.py dashboard` | Starts the localhost dashboard at `http://127.0.0.1:5050`, plus the filterable all-campaigns Reach-outs page at `/reachouts`. |
-| `python slap.py doctor` | Preflight checks — sender fields, API key, DB, consumer domains file, every campaign's attachment/LaTeX toolchain, and (separately, never blocking) `RESUME_ARCHIVE_DIR`'s validity and any dangling symlinks in it. Safe to run any time; the core checks also run automatically before every `send` and every drain. |
+| `python slap.py doctor` | Preflight checks — sender fields, API key, DB, consumer domains file, every campaign's attachment/LaTeX toolchain, and (separately, never blocking) `RESUME_ARCHIVE_DIR`'s validity/dangling symlinks and whether Redis is reachable. Safe to run any time; the core checks also run automatically before every `send` and every drain. |
 | `python slap.py domains` | Prints a read-only index of who you've contacted, grouped by email domain — for manual inspection. |
 | `python slap.py rebuild` | Rebuilds the `recipients` cache table by replaying the full `events` log from scratch. Use this if the cache ever looks wrong — `events` is always the source of truth, the cache is fully disposable. |
 | `python slap.py cleanup [--confirm] [--min-days-idle N]` | Deletes stale *compiled* résumé PDFs (LaTeX campaigns only) for recipients who are done/dead/never-replied and idle 15+ days by default — except a PDF still referenced by a live `RESUME_ARCHIVE_DIR` symlink, which is kept and reported separately. Dry run unless you pass `--confirm`. Never touches the `.tex` source. |
 | `python slap.py runner` | The unattended drain — asks the DB what's queued and due, and sends it. Meant to be fired by **launchd** (see Scheduler below), not run by hand day-to-day. |
-| `python slap.py plist` | Prints the launchd `.plist` for `runner`, generated fresh from your current `config.yaml`. |
+| `python slap.py sync` | Refreshes the dashboard's optional Redis-backed cache of GMass reply/click/bounce/block data. Meant to be fired hourly by **launchd**, not run by hand day-to-day. Fails loud (fast) if Redis isn't reachable; the dashboard just falls back to live polling either way. |
+| `python slap.py plist [--job runner\|sync]` | Prints the launchd `.plist` for `runner` (default) or, with `--job sync`, the hourly cache-sync job — generated fresh from your current `config.yaml`. |
 | `python slap.py template-reload` | Re-renders every not-yet-sent recipient across every campaign against whatever `initial.txt`/`stageN.txt` currently say — use this after editing a template you've already staged sends against. Shows a summary and sample diffs, asks to confirm before writing anything. Only ever touches recipients who haven't sent at all yet (see "Editing a template after staging" below); everyone else is untouched by definition. |
+| `python slap.py bounced` | Prompts for a corrected address for a bounced/blocked recipient and resends. Same fix as the dashboard's own "Resend to corrected address" Reach-outs row action. |
 
 Typical day-to-day flow: `send` a few recipients through the interactive prep loop →
 either `--now` or let the scheduled `runner` pick them up → check `dashboard`
@@ -306,6 +308,14 @@ the most recent `template-reload` run left at least one recipient un-reloaded, a
 **"Template Failures"** nav link listing who, in which campaign, and why (see "Editing a
 template after staging" above) — it disappears again once a later `template-reload` run
 comes back clean.
+
+Every page also shares a **sync/cache-status banner** just below the nav: the last time
+the Redis-backed GMass cache was refreshed, a quick tally of what's new since then
+(replies/clicks/bounces), and — if the cache is stale or Redis is unreachable — a
+"cache unavailable / stale, refreshing" note. A **"Refresh now"** button forces an
+immediate re-sync instead of waiting for the next hourly `sync` run. If you don't run the
+optional `sync` job at all, this banner just reflects a live poll made on that page open,
+the same as before the cache existed.
 
 **Home** (`/`) — the operational pulse, and the one thing that needs a same-visit decision:
 
@@ -404,8 +414,9 @@ for instance, not any of them):
 - **Status** — `queued` (staged, nothing sent yet), `active` (sent at least once, still
   mid-sequence), `done`, `replied`, `bounced`, `ooo_requeued`.
 - **Engagement** — replied / clicked-no-reply / no engagement yet.
-- **Reply tag** — real / OOO / not-interested / untagged (untagged means "replied,
-  pending triage" — someone who's never replied at all just won't match any of these).
+- **Reply tag** — real / unreal / OOO / not-interested / untagged (untagged means
+  "replied, pending triage" — someone who's never replied at all just won't match any of
+  these).
 - **Req ID** — present vs. blank.
 - **Date range** — two date pickers; matches whichever of "first sent" or "last event"
   a recipient actually has (a queued-but-never-sent recipient still gets a date).
@@ -443,9 +454,20 @@ Knobs, all in `config.yaml`'s `schedule:` block:
 - **`active_days`** — which weekdays the runner is allowed to drain (e.g. skip weekends).
   Enforced twice: the generated plist only has entries for these days, AND the runner
   re-checks `active_days` itself at drain time — so it stays correct even if you edit
-  `config.yaml` without regenerating/reloading the plist yet.
+  `config.yaml` without regenerating/reloading the plist yet. **Only covers SLAP's own
+  local initial sends** — GMass's own follow-up stages fire server-side regardless (see
+  `gmass.allowed_days` below).
 - **`daily_cap`** — a hard ceiling on sends per day (initial + follow-ups combined); the
   drain stops here and overflow simply stays queued for the next run.
+- **`send_delay_min` / `send_delay_max`** — seconds to randomly wait between individual
+  sends during a drain.
+- **`drain_retries`** — how many times a drain-time preflight failure (e.g. a missing API
+  key) retries before giving up loud for that run; a per-recipient send failure is not
+  affected by this and simply retries on the next scheduled drain.
+
+Separately, `config.yaml`'s `gmass:` block has its own **`allowed_days`/`skip_holidays`**
+pair — unlike everything above, these reach GMass's own server-side follow-up scheduler,
+not just SLAP's local runner. See [`LAUNCHD.md`](LAUNCHD.md) for the full detail.
 
 **Your Mac needs to be on and logged in (sleep is fine, fully shut down is not) at some
 point during the fire window** — launchd can wake a sleeping Mac for a scheduled job, but
