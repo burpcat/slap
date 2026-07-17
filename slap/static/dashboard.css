@@ -204,3 +204,10 @@ tr.row[data-status="ooo_requeued"] { opacity: 0.55; }
   background: var(--page); color: var(--text-primary);
 }
 .filters input[type="search"] { min-width: 180px; }
+
+/* Logs page: raw meta JSON + raw launchd stdout/stderr tails. */
+.log-pre {
+  background: var(--page); border: 1px solid var(--hairline); border-radius: 6px;
+  padding: 10px; font-size: 12px; line-height: 1.5; max-height: 320px; overflow: auto;
+  white-space: pre-wrap; word-break: break-word; color: var(--text-primary);
+}

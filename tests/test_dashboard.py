@@ -21,10 +21,10 @@ from slap.queue import stage_recipient
 from slap.dashboard import (
     _click_details, _clicked_recipients, _recipient_drop_meta, active_leads, actionable_replies,
     bounces, companies_contacted, compute_gmass_dependent_data, create_app, engagement_intelligence,
-    filter_reachouts, follow_up_reminders, get_gmass_dependent_data, needs_triage, next_drain,
-    pipeline, reachouts_rows, reply_tags, stop_outreach, stopped_outreach_roster, sync_reports,
-    tag_reply, template_failures, this_week, today_strip, todays_runs, visible_warm_but_silent,
-    warm_but_silent,
+    event_display, filter_reachouts, follow_up_reminders, get_gmass_dependent_data, needs_triage,
+    next_drain, pipeline, reachouts_rows, read_log_tail, recent_events, reply_tags, stop_outreach,
+    stopped_outreach_roster, sync_reports, tag_reply, template_failures, this_week, today_strip,
+    todays_runs, visible_warm_but_silent, warm_but_silent,
 )
 from slap.reload import ReloadFailure, write_failures
 from slap.tracking import append_event, connect
@@ -1328,7 +1328,7 @@ def test_create_app_nav_present_and_highlights_current_page_on_every_route(app):
         client = app.test_client()
         for path, current_label in [
             ("/", "Home"), ("/pipeline", "Pipeline"), ("/engagement", "Engagement"),
-            ("/deliverability", "Deliverability"), ("/reachouts", "Reach-outs"),
+            ("/deliverability", "Deliverability"), ("/reachouts", "Reach-outs"), ("/logs", "Logs"),
         ]:
             resp = client.get(path)
             assert resp.status_code == 200, path
@@ -3151,3 +3151,111 @@ def test_create_app_template_failures_page_reachable_directly_with_zero_failures
     resp = client.get("/template-failures")
     assert resp.status_code == 200
     assert b"No template-reload failures" in resp.data
+
+
+# --- Logs page: recent_events / event_display / read_log_tail / /logs -----
+
+def test_recent_events_orders_newest_first_and_respects_limit(conn):
+    append_event(conn, type="run_started")
+    append_event(conn, type="queued", recipient="jane@acme.com", campaign="c")
+    append_event(conn, type="sent", recipient="jane@acme.com", campaign="c", stage=0,
+                 meta={"is_final_stage": False})
+
+    all_events = recent_events(conn)
+    assert [e["type"] for e in all_events] == ["sent", "queued", "run_started"]  # newest first
+    assert all_events[0]["meta"] == {"is_final_stage": False}  # meta JSON-decoded, not a raw string
+
+    limited = recent_events(conn, limit=2)
+    assert [e["type"] for e in limited] == ["sent", "queued"]
+
+
+def test_recent_events_meta_defaults_to_empty_dict_when_absent(conn):
+    append_event(conn, type="run_started")
+    [ev] = recent_events(conn)
+    assert ev["meta"] == {}
+
+
+def test_event_display_sent_and_final_stage():
+    assert event_display({"type": "sent", "meta": {"is_final_stage": False}}) == {
+        "label": "Sent", "chip": "chip-good", "detail": "",
+    }
+    assert event_display({"type": "sent", "meta": {"is_final_stage": True}})["detail"] == "final stage"
+
+
+def test_event_display_send_failed_shows_stage_and_error():
+    d = event_display({"type": "send_failed", "meta": {"stage": "create_draft", "error": "boom"}})
+    assert d["chip"] == "chip-critical"
+    assert d["detail"] == "create_draft: boom"
+
+
+def test_event_display_run_completed_chip_reflects_failures():
+    good = event_display({"type": "run_completed", "meta": {"sent": 3, "failed": 0, "remaining_queued": 0}})
+    assert good["chip"] == "chip-good"
+    assert good["detail"] == "3 sent, 0 failed, 0 remaining"
+
+    serious = event_display({"type": "run_completed", "meta": {"sent": 1, "failed": 2, "remaining_queued": 0}})
+    assert serious["chip"] == "chip-serious"
+
+
+def test_event_display_bounce_vs_block_category():
+    bounce = event_display({"type": "bounce", "meta": {"category": "bounce", "bounce_reason": "mailbox full"}})
+    assert bounce["label"] == "Bounced"
+    assert bounce["detail"] == "mailbox full"
+
+    block = event_display({"type": "bounce", "meta": {"category": "block", "bounce_reason": "spam"}})
+    assert block["label"] == "Blocked"
+
+
+def test_event_display_unknown_type_never_crashes():
+    d = event_display({"type": "some_future_type", "meta": {"whatever": 1}})
+    assert d["label"] == "some_future_type"
+    assert d["chip"] == "chip-neutral"
+
+
+def test_read_log_tail_returns_last_n_lines_newest_first(tmp_path):
+    path = tmp_path / "runner.log"
+    path.write_text("\n".join(f"line {i}" for i in range(1, 6)) + "\n")
+
+    assert read_log_tail(path, n_lines=3) == ["line 5", "line 4", "line 3"]
+
+
+def test_read_log_tail_missing_file_returns_empty_list(tmp_path):
+    assert read_log_tail(tmp_path / "does-not-exist.log") == []
+
+
+def test_create_app_logs_page_empty_state(app):
+    resp = app.test_client().get("/logs")
+    assert resp.status_code == 200
+    assert b"No events recorded yet." in resp.data
+    assert b"No output yet" in resp.data  # all four raw log panels
+
+
+def test_create_app_logs_page_lists_events_and_raw_log_tail(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="queued", recipient="jane@acme.com", campaign="coldpost",
+                 meta={"company": "Acme", "role": "Staff Engineer"})
+    append_event(conn, type="sent", recipient="jane@acme.com", campaign="coldpost", stage=0,
+                 meta={"is_final_stage": False})
+    conn.close()
+    (tmp_path / "runner.log").write_text("Drain complete: 1 sent, 0 failed, 0 still queued.\n")
+
+    resp = app.test_client().get("/logs")
+
+    assert resp.status_code == 200
+    body = resp.data.decode()
+    assert "jane@acme.com" in body
+    assert "coldpost" in body
+    assert "Queued" in body
+    assert "Sent" in body
+    assert "Drain complete: 1 sent, 0 failed, 0 still queued." in body
+
+
+def test_create_app_logs_page_show_more_link_appears_only_when_truncated(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    append_event(conn, type="run_started")
+    append_event(conn, type="run_completed", meta={"sent": 0, "failed": 0, "remaining_queued": 0})
+    conn.close()
+
+    client = app.test_client()
+    assert b"Show more" not in client.get("/logs?limit=500").data
+    assert b"Show more" in client.get("/logs?limit=1").data

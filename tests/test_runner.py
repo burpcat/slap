@@ -115,6 +115,51 @@ def test_drain_sends_a_staged_recipient(conn, tmp_path):
     assert due_recipients(conn) == []
 
 
+def test_drain_calls_log_fn_once_per_send_attempt(conn, tmp_path):
+    # Previously drain() produced zero output per recipient — only the
+    # final summary line after the whole batch finished, indistinguishable
+    # from a hang during a multi-minute throttled batch. log_fn (default
+    # print) gives live, per-recipient progress instead.
+    gc = make_global_config(tmp_path)
+    stage_one(conn, tmp_path, recipient="bob@acme.com")
+    stage_one(conn, tmp_path, recipient="jane@acme.com")
+    create_fn, send_fn, calls = fake_gmass()
+    logs = []
+
+    result = drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+                    create_draft_fn=create_fn, send_campaign_fn=send_fn, log_fn=logs.append)
+
+    assert result.sent == 2
+    assert len(logs) == 2  # one line per attempted send, not per API call
+    # due_recipients() orders by recipient email (queue.py) -> bob before jane.
+    assert logs[0] == "[1/2] bob@acme.com (c) -> sent"
+    assert logs[1] == "[2/2] jane@acme.com (c) -> sent"
+
+
+def test_drain_log_fn_reports_failed_sends_too(conn, tmp_path):
+    gc = make_global_config(tmp_path)
+    stage_one(conn, tmp_path, recipient="jane@acme.com")
+    create_fn, send_fn, calls = fake_gmass(create_fails=True)
+    logs = []
+
+    drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+          create_draft_fn=create_fn, send_campaign_fn=send_fn, log_fn=logs.append)
+
+    assert logs == ["[1/1] jane@acme.com (c) -> FAILED"]
+
+
+def test_drain_default_log_fn_is_print(conn, tmp_path, capsys):
+    # No log_fn given -> real output via the builtin print, not silence.
+    gc = make_global_config(tmp_path)
+    stage_one(conn, tmp_path)
+    create_fn, send_fn, calls = fake_gmass()
+
+    drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+          create_draft_fn=create_fn, send_campaign_fn=send_fn)
+
+    assert "jane@acme.com (c) -> sent" in capsys.readouterr().out
+
+
 # --- gmass_allowed_days / gmass_skip_holidays (Investigation 1) ------------
 
 def test_drain_initial_send_threads_gmass_allowed_days_and_skip_holidays_through(conn, tmp_path):

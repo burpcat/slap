@@ -1620,8 +1620,100 @@ def _to_local(value) -> str:
     return value.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
+# --- Logs page: every event + every raw job-output log in one place -------
+
+EVENTS_DEFAULT_LIMIT = 500
+
+# The two launchd-invoked jobs (slap/launchd.py) — always a sibling of the
+# DB file, same "wherever this is run from" convention as tracking.DB_PATH
+# itself (see create_app's log_dir param below). No rotation exists for
+# these files (per LAUNCHD.md) — they're plain, ever-growing stdout/stderr
+# redirects, so the Logs page only ever reads their tail, never the whole
+# file.
+LOG_FILES = ["runner.log", "runner.err.log", "sync.log", "sync.err.log"]
+
+
+def recent_events(conn, *, limit: int = EVENTS_DEFAULT_LIMIT) -> list:
+    """Newest-first, across every event type in `tracking.EVENT_TYPES` — the
+    one unfiltered view of the whole `events` table. Everything else in this
+    file queries a narrow slice for one specific widget; this is
+    deliberately the opposite; "literally every log" needs the full table,
+    not another purpose-built projection of it."""
+    rows = conn.execute(
+        "SELECT id, timestamp, type, recipient, campaign, stage, "
+        "gmass_campaign_id, gmass_draft_id, meta FROM events ORDER BY id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [dict(r, meta=json.loads(r["meta"]) if r["meta"] else {}) for r in rows]
+
+
+def event_display(ev: dict) -> dict:
+    """Human label/chip-color/one-line detail for a single `recent_events()`
+    row, derived from that event type's own `meta` shape (see CONTROL_SHEET.md
+    / the append_event call sites for what each type actually carries).
+    `chip` follows the same {critical, good, serious, neutral} vocabulary
+    reachouts.html's _status_chip() already established — no new color
+    scheme to learn. Never raises on an unexpected/missing meta key: a
+    malformed or future-added meta shape degrades to a blank detail string,
+    never a broken Logs page."""
+    meta = ev.get("meta") or {}
+    t = ev["type"]
+    if t == "sent":
+        return {"label": "Sent", "chip": "chip-good",
+                "detail": "final stage" if meta.get("is_final_stage") else ""}
+    if t == "send_failed":
+        return {"label": "Send failed", "chip": "chip-critical",
+                "detail": f"{meta.get('stage', '')}: {meta.get('error', '')}".strip(": ")}
+    if t == "run_started":
+        return {"label": "Run started", "chip": "chip-neutral", "detail": ""}
+    if t == "run_completed":
+        failed = meta.get("failed", 0)
+        return {"label": "Run completed", "chip": "chip-good" if not failed else "chip-serious",
+                "detail": f"{meta.get('sent', 0)} sent, {failed} failed, "
+                          f"{meta.get('remaining_queued', 0)} remaining"}
+    if t == "run_failed":
+        return {"label": "Run failed", "chip": "chip-critical",
+                "detail": f"{meta.get('error', '')} (retried {meta.get('retry_count', '?')}x)"}
+    if t == "queued":
+        detail = " · ".join(filter(None, [meta.get("company"), meta.get("role")]))
+        return {"label": "Queued", "chip": "chip-neutral", "detail": detail}
+    if t == "draft_created":
+        return {"label": "Draft created", "chip": "chip-neutral", "detail": ""}
+    if t == "requeued":
+        resume = meta.get("next_resume_date")
+        return {"label": "Requeued (OOO)", "chip": "chip-neutral",
+                "detail": f"next resume {resume}" if resume else "cadence exhausted"}
+    if t == "ooo_tagged":
+        return {"label": "Marked OOO", "chip": "chip-serious",
+                "detail": f"resume {meta.get('resume_date', '')}"}
+    if t == "reply":
+        return {"label": "Reply received", "chip": "chip-good", "detail": meta.get("reply_time", "") or ""}
+    if t == "reply_reviewed":
+        return {"label": "Reply tagged", "chip": "chip-neutral", "detail": meta.get("tag", "") or ""}
+    if t == "click":
+        return {"label": "Link clicked", "chip": "chip-neutral", "detail": meta.get("url", "") or ""}
+    if t == "bounce":
+        category = meta.get("category", "bounce")
+        return {"label": "Blocked" if category == "block" else "Bounced", "chip": "chip-critical",
+                "detail": meta.get("bounce_reason", "") or ""}
+    if t == "stopped":
+        return {"label": "Stopped outreach", "chip": "chip-serious", "detail": meta.get("scope", "") or ""}
+    return {"label": t, "chip": "chip-neutral", "detail": ""}  # future/unknown type — never crash
+
+
+def read_log_tail(path: Path, *, n_lines: int = 200) -> list:
+    """Last `n_lines` of a raw launchd stdout/stderr file, newest line
+    first. No rotation/streaming — these files are personal-scale (one
+    owner's own outreach), so a plain read-and-slice is enough; a missing
+    file (the job has never fired yet) is an empty, not-yet-run state, never
+    an error."""
+    if not path.exists():
+        return []
+    return path.read_text().splitlines()[-n_lines:][::-1]
+
+
 def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str, *,
-                redis_client=None) -> Flask:
+                redis_client=None, log_dir: Path = None) -> Flask:
     """§8: reads SQLite, renders read-only panels except the single write
     action (reply tagging). The four GMass-dependent widgets (engagement
     intelligence, warm-but-silent, bounces, replies-needing-triage) are
@@ -1645,13 +1737,20 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
     a bound default parameter — unlike a sqlite3 connection, ONE redis.Redis
     client is the correct, thread-safe, connection-pooling way to use it
     across every request (see slap.gmass_cache.redis_client_from_url), so
-    it's built once here rather than per-request like get_conn() above."""
+    it's built once here rather than per-request like get_conn() above.
+
+    `log_dir` (Logs page) defaults to `db_path.parent` — `runner.log`/
+    `sync.log`/their `.err` twins are always written as siblings of
+    `slap.db` (both derived from the same "wherever this is run from"
+    convention, see slap/launchd.py), so no caller needs to pass this
+    explicitly; tests override it to point at their own tmp_path."""
     app = Flask(__name__, template_folder=TEMPLATE_FOLDER)
     app.jinja_env.filters["to_local"] = _to_local
     redis_client = redis_client if redis_client is not None else gmass_cache.redis_client_from_url(
         global_config.redis_url
     )
     app.redis_client = redis_client  # exposed as a plain attribute so tests can inspect/seed cache state
+    log_dir = log_dir if log_dir is not None else db_path.parent
 
     def get_conn():
         if "db_conn" not in g:
@@ -1810,6 +1909,23 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
         rows = reachouts_rows(get_conn())
         return render_template("reachouts.html", rows=rows, total_count=len(rows),
                                 warning=request.args.get("warning"))
+
+    @app.route("/logs")
+    def logs_page():
+        # Local-only, same as Reach-outs/Pipeline — never calls GMass, so no
+        # sync_result is passed and base.html's sync banner naturally stays
+        # hidden here too. No pagination state (matches every other page in
+        # this app): just a LIMIT, bumped via a "Show more" link that
+        # re-requests with a bigger one.
+        limit = request.args.get("limit", EVENTS_DEFAULT_LIMIT, type=int)
+        events = recent_events(get_conn(), limit=limit)
+        for ev in events:
+            ev["display"] = event_display(ev)
+        logs = {name: read_log_tail(log_dir / name) for name in LOG_FILES}
+        return render_template(
+            "logs.html", events=events, total_count=len(events), limit=limit,
+            truncated=len(events) == limit, event_types=sorted(tracking.EVENT_TYPES), logs=logs,
+        )
 
     @app.route("/template-failures")
     def template_failures_page():

@@ -26,9 +26,11 @@ template_reload_failures.json
 # LaTeX compile workdirs (runtime staging, not source)
 workdir/
 
-# runner logs (runtime output, not source)
+# runner/sync logs (runtime output, not source)
 runner.log
 runner.err.log
+sync.log
+sync.err.log
 
 # local marketing/screenshot mockups — real campaign names, never committed
 marketing_dashboard_sample.html
