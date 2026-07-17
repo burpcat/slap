@@ -1,0 +1,208 @@
+{% extends "base.html" %}
+{% block title %}slap dashboard — logs{% endblock %}
+{% block content %}
+
+<h1>Logs</h1>
+<p class="muted">Every event slap has ever recorded, plus the raw output of the scheduled
+  runner/sync jobs — one place to check instead of <code>runner.log</code>/<code>sync.log</code>
+  and their <code>.err</code> twins by hand.</p>
+
+<h2>Events</h2>
+{% if total_count == 0 %}
+<p class="empty">No events recorded yet.</p>
+{% else %}
+<div class="stat-strip">
+  <div class="stat-tile">
+    <div class="value"><span id="count-line">{{ total_count }}</span> <span class="muted" style="font-size:13px;font-weight:400;">of {{ total_count }}</span></div>
+    <div class="label">events shown</div>
+  </div>
+</div>
+
+<div class="filters">
+  <div class="field">
+    <label for="f-search">Search</label>
+    <input type="search" id="f-search" placeholder="recipient, campaign, detail">
+  </div>
+  <div class="field">
+    <label for="f-type">Type</label>
+    <select id="f-type">
+      <option value="">Any</option>
+      {% for v in event_types %}
+      <option value="{{ v }}">{{ v }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label for="f-recipient">Recipient</label>
+    <select id="f-recipient">
+      <option value="">Any</option>
+      {% for v in events | map(attribute='recipient') | reject('none') | unique | sort %}
+      <option value="{{ v }}">{{ v }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label for="f-campaign">Campaign</label>
+    <select id="f-campaign">
+      <option value="">Any</option>
+      {% for v in events | map(attribute='campaign') | reject('none') | unique | sort %}
+      <option value="{{ v }}">{{ v }}</option>
+      {% endfor %}
+    </select>
+  </div>
+</div>
+
+<p class="empty" id="no-matches" style="display: none;">No events match these filters.</p>
+
+<table class="data-table" id="logs-table">
+  <thead>
+    <tr>
+      <th data-sort="time">Time <span class="arrow"></span></th>
+      <th data-sort="type">Type <span class="arrow"></span></th>
+      <th data-sort="recipient">Recipient <span class="arrow"></span></th>
+      <th data-sort="campaign">Campaign <span class="arrow"></span></th>
+      <th>Stage</th>
+      <th>Detail</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for ev in events %}
+    <tr class="row"
+        data-time="{{ ev.timestamp }}"
+        data-type="{{ ev.type }}"
+        data-recipient="{{ ev.recipient or '' }}"
+        data-campaign="{{ ev.campaign or '' }}"
+        data-search="{{ ((ev.recipient or '') ~ ' ' ~ (ev.campaign or '') ~ ' ' ~ ev.type ~ ' ' ~ (ev.display.detail or '')) | lower }}">
+      <td>{{ ev.timestamp | to_local }}</td>
+      <td><span class="chip {{ ev.display.chip }}">{{ ev.display.label }}</span></td>
+      <td>{{ ev.recipient or '—' }}</td>
+      <td>{{ ev.campaign or '—' }}</td>
+      <td>{{ ev.stage if ev.stage is not none else '—' }}</td>
+      <td class="reason" title="{{ ev.display.detail }}">{{ ev.display.detail or '—' }}</td>
+      <td>
+        {% if ev.meta or ev.gmass_campaign_id or ev.gmass_draft_id %}
+        <button type="button" class="expand-toggle" onclick="toggleDetail(this)">&#9656; detail</button>
+        {% endif %}
+      </td>
+    </tr>
+    {% if ev.meta or ev.gmass_campaign_id or ev.gmass_draft_id %}
+    <tr class="detail-row">
+      <td colspan="7">
+        {% if ev.gmass_campaign_id %}<div>gmass_campaign_id: <strong>{{ ev.gmass_campaign_id }}</strong></div>{% endif %}
+        {% if ev.gmass_draft_id %}<div>gmass_draft_id: <strong>{{ ev.gmass_draft_id }}</strong></div>{% endif %}
+        {% if ev.meta %}<pre class="log-pre">{{ ev.meta | tojson(indent=2) }}</pre>{% endif %}
+      </td>
+    </tr>
+    {% endif %}
+    {% endfor %}
+  </tbody>
+</table>
+
+{% if truncated %}
+<p class="muted"><a href="{{ url_for('logs_page', limit=limit * 2) }}">Show more (currently showing the most recent {{ limit }})</a></p>
+{% endif %}
+{% endif %}
+
+<h2>Raw job output</h2>
+<p class="muted">Last 200 lines of each scheduled job's stdout/stderr, newest first — the only
+  place a launchd-level failure (a crash before slap.py ever writes an event) would show up.</p>
+<div class="panels">
+  {% for name, lines in logs.items() %}
+  <div class="panel">
+    <h3>{{ name }}</h3>
+    {% if lines %}
+    <pre class="log-pre">{{ lines | join('\n') }}</pre>
+    {% else %}
+    <p class="empty">No output yet — created the first time this job fires.</p>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+
+{% endblock %}
+
+{% block extra_js %}
+<script>
+function toggleDetail(btn) {
+  var row = btn.closest('tr');
+  var detail = row.nextElementSibling;
+  if (!detail || !detail.classList.contains('detail-row')) return;
+  var open = detail.classList.toggle('open');
+  btn.innerHTML = open ? '&#9662; detail' : '&#9656; detail';
+}
+
+(function () {
+  var table = document.getElementById('logs-table');
+  if (!table) return;  // total_count == 0 -- no table/filters rendered at all
+
+  var rows = Array.prototype.slice.call(table.querySelectorAll('tbody tr.row'));
+  var countLine = document.getElementById('count-line');
+  var noMatches = document.getElementById('no-matches');
+
+  var filterIds = { search: 'f-search', type: 'f-type', recipient: 'f-recipient', campaign: 'f-campaign' };
+  var controls = {};
+  Object.keys(filterIds).forEach(function (key) {
+    controls[key] = document.getElementById(filterIds[key]);
+  });
+
+  function matches(row) {
+    var search = controls.search.value.trim().toLowerCase();
+    if (search && row.dataset.search.indexOf(search) === -1) return false;
+    if (controls.type.value && row.dataset.type !== controls.type.value) return false;
+    if (controls.recipient.value && row.dataset.recipient !== controls.recipient.value) return false;
+    if (controls.campaign.value && row.dataset.campaign !== controls.campaign.value) return false;
+    return true;
+  }
+
+  function applyFilters() {
+    var shown = 0;
+    rows.forEach(function (row) {
+      var visible = matches(row);
+      row.style.display = visible ? '' : 'none';
+      var detail = row.nextElementSibling;
+      if (detail && detail.classList.contains('detail-row')) {
+        detail.style.display = visible ? '' : 'none';
+      }
+      if (visible) shown++;
+    });
+    countLine.textContent = shown;
+    noMatches.style.display = (shown === 0) ? '' : 'none';
+  }
+
+  Object.keys(controls).forEach(function (key) {
+    var el = controls[key];
+    el.addEventListener(el.tagName === 'SELECT' ? 'change' : 'input', applyFilters);
+  });
+
+  var sortState = { key: null, dir: 1 };
+  table.querySelectorAll('th[data-sort]').forEach(function (th) {
+    th.addEventListener('click', function () {
+      var key = th.getAttribute('data-sort');
+      sortState.dir = (sortState.key === key) ? -sortState.dir : 1;
+      sortState.key = key;
+      table.querySelectorAll('th[data-sort] .arrow').forEach(function (a) { a.textContent = ''; });
+      th.querySelector('.arrow').textContent = sortState.dir === 1 ? '▲' : '▼';
+
+      var attr = 'data-' + key;
+      var sorted = rows.slice().sort(function (a, b) {
+        var av = a.getAttribute(attr) || '';
+        var bv = b.getAttribute(attr) || '';
+        if (av < bv) return -sortState.dir;
+        if (av > bv) return sortState.dir;
+        return 0;
+      });
+      var tbody = table.querySelector('tbody');
+      sorted.forEach(function (row) {
+        var detail = row.nextElementSibling;
+        var hasDetail = detail && detail.classList.contains('detail-row');
+        tbody.appendChild(row);
+        if (hasDetail) tbody.appendChild(detail);
+      });
+    });
+  });
+
+  applyFilters();
+})();
+</script>
+{% endblock %}

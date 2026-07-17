@@ -323,11 +323,21 @@ def _send_ooo_resend(conn, api_key: str, row: dict, *, workdir_root: Path = WORK
 
 def drain(conn, global_config, api_key: str, *, now: date = None, sleep_fn=time.sleep,
           random_fn=random.uniform, workdir_root: Path = WORKDIR_ROOT,
-          create_draft_fn=gmass.create_draft, send_campaign_fn=gmass.send_campaign) -> DrainResult:
+          create_draft_fn=gmass.create_draft, send_campaign_fn=gmass.send_campaign,
+          log_fn=print) -> DrainResult:
     """Drain whatever's queued and due, right now — no window waiting (that's
     wait_for_fire_window's job). Cap-aware, resilient: a preflight failure
     retries then gives up loud (run_failed, queue untouched); a per-email
-    failure logs send_failed and moves on (queue stays intact either way)."""
+    failure logs send_failed and moves on (queue stays intact either way).
+
+    `log_fn` prints one line per recipient as each send attempt resolves —
+    real-time progress instead of the previous total silence until the final
+    summary line, which made a multi-minute batch (throttled by
+    send_delay_min/max) indistinguishable from a hang. Defaults to the
+    builtin `print` so every existing caller (`cmd_runner`, `send --now`)
+    gets this for free; unattended launchd runs land these same lines in
+    runner.log right alongside the existing summary, which the dashboard's
+    Logs page also surfaces."""
     today = now or date.today()
 
     error = _preflight_with_retries(
@@ -392,6 +402,8 @@ def drain(conn, global_config, api_key: str, *, now: date = None, sleep_fn=time.
             append_event(conn, type="send_failed", recipient=row["recipient"], campaign=row["campaign"],
                          meta={"stage": "unexpected", "error": str(e)})
             ok = False
+        log_fn(f"[{i + 1}/{len(to_send)}] {row['recipient']} ({row['campaign']}) "
+               f"-> {'sent' if ok else 'FAILED'}")
         if ok:
             sent_count += 1
         else:

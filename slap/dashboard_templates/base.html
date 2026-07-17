@@ -16,6 +16,7 @@
     <a href="{{ url_for('engagement_page') }}" class="{{ 'current' if request.endpoint == 'engagement_page' }}">Engagement</a>
     <a href="{{ url_for('deliverability_page') }}" class="{{ 'current' if request.endpoint == 'deliverability_page' }}">Deliverability</a>
     <a href="{{ url_for('reachouts') }}" class="{{ 'current' if request.endpoint == 'reachouts' }}">Reach-outs</a>
+    <a href="{{ url_for('logs_page') }}" class="{{ 'current' if request.endpoint == 'logs_page' }}">Logs</a>
     {% if template_failures_count %}
     <a href="{{ url_for('template_failures_page') }}" class="{{ 'current' if request.endpoint == 'template_failures_page' }}">Template Failures ({{ template_failures_count }})</a>
     {% endif %}
