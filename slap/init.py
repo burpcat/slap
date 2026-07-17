@@ -422,7 +422,10 @@ def step_launchd(global_config) -> None:
         f"check above). Install as a second LaunchAgent:\n"
         f"    python slap.py plist --job sync > {Path.home() / 'Library' / 'LaunchAgents' / 'com.slap.sync.plist'}\n"
         f"    launchctl load {Path.home() / 'Library' / 'LaunchAgents' / 'com.slap.sync.plist'}\n"
-        f"  See LAUNCHD.md's 'The hourly cache-sync job' section for details."
+        f"  See LAUNCHD.md's 'The hourly cache-sync job' section for details.\n\n"
+        f"  Once running, check http://127.0.0.1:5050/logs to confirm a scheduled run actually "
+        f"fired — it shows every event plus the raw runner.log/sync.log tails in one place, so you "
+        f"don't have to go find and open those files by hand."
     )
 
 
@@ -440,7 +443,10 @@ def step_finish(global_config) -> None:
         "sent. Off by default and never blocks a send either way — see README.md."
     )
     if ok:
-        display.success("\ninit complete — all checks passed. You're ready to `python slap.py send <campaign>`.")
+        display.success(
+            "\ninit complete — all checks passed. You're ready to `python slap.py send <campaign>`. "
+            "Run `python slap.py dashboard` any time to watch status, replies, and logs."
+        )
     else:
         display.warn(
             "\ninit complete, but some checks are failing above — fix those before your first real send. "

@@ -139,11 +139,11 @@ dashboard, deliverability tips). Quick reference:
 | `python slap.py init` | Interactive installer — see Setup above. Safe to re-run any time. |
 | `python slap.py list` | Lists every auto-discovered campaign (persona, LaTeX on/off). |
 | `python slap.py send <campaign> [--now]` | Interactive prep: paste a drop, optionally compile/preview a LaTeX résumé, see domain-dedup warnings (and, for a static campaign, an offer to reuse an archived résumé) and a preview, then stage the send to the queue. `--now` also drains the queue immediately afterward instead of waiting for the scheduled runner. |
-| `python slap.py dashboard` | Starts the localhost dashboard at `http://127.0.0.1:5050` — today/week stats, engagement metrics, replies needing triage (tag as real/OOO/not-interested), bounces & blocks, pipeline, recent run history, and a link to the all-campaigns **Reach-outs** page (`/reachouts`, filterable, read-only). |
+| `python slap.py dashboard` | Starts the localhost dashboard at `http://127.0.0.1:5050` — today/week stats, engagement metrics, replies needing triage (tag as real/OOO/not-interested), bounces & blocks, pipeline, recent run history, the all-campaigns **Reach-outs** page (`/reachouts`, filterable, read-only), and a **Logs** page (`/logs`) with every recorded event plus the raw `runner.log`/`sync.log` tails in one place. |
 | `python slap.py doctor` | Preflight checks — see Setup above. Safe to run any time. |
 | `python slap.py domains` | Regenerates and prints a read-only domain index from tracked events (who you've contacted, grouped by email domain) — for manual inspection, not itself a source of truth. |
 | `python slap.py rebuild` | Rebuilds the `recipients` cache table by replaying the full `events` log. Use this if the cache ever looks wrong — `events` is always the source of truth. |
-| `python slap.py runner` | The unattended drain — asks the DB what's queued and due, and sends it. Meant to be triggered by **launchd**, not run by hand day-to-day. See [`LAUNCHD.md`](LAUNCHD.md) for setup and the one-time manual test. Guards itself against `config.yaml`'s `schedule.active_days` — exits without draining on a day that isn't listed. |
+| `python slap.py runner` | The unattended drain — asks the DB what's queued and due, and sends it, printing one progress line per recipient as each send resolves. Meant to be triggered by **launchd**, not run by hand day-to-day. See [`LAUNCHD.md`](LAUNCHD.md) for setup and the one-time manual test. Guards itself against `config.yaml`'s `schedule.active_days` — exits without draining on a day that isn't listed. |
 | `python slap.py plist` | Prints the launchd `.plist` for `runner`, generated from the current `config.yaml` (one `StartCalendarInterval` entry per `schedule.active_days` day) — redirect it into `~/Library/LaunchAgents/`. See [`LAUNCHD.md`](LAUNCHD.md). |
 | `python slap.py cleanup [--confirm]` | Deletes stale compiled résumé PDFs for recipients who are done/dead/never replied and have been idle 15+ days — except one still referenced by a live `RESUME_ARCHIVE_DIR` symlink, which is kept. Dry run by default; `--confirm` actually deletes. Never touches `resume.tex`. |
 | `python slap.py template-reload` | Re-renders every not-yet-sent recipient's staged content (across every campaign) against whatever `initial.txt`/`stageN.txt` currently say — for when you edit a template after already staging sends. Shows a summary + sample diffs and asks to confirm before writing anything. Only touches recipients who haven't sent at all yet: once a recipient's initial send fires, GMass has already locked in every follow-up stage's wording, so editing templates afterward can't change it. A recipient staged before this feature existed, or whose stored drop values don't cover a newly-added placeholder, is left untouched and reported in the dashboard's **Template Failures** tab instead. |
@@ -175,6 +175,8 @@ static (`latex.enabled: false`) campaigns only. Purely an offer: the default ans
 since cron doesn't catch up if your Mac was asleep at the scheduled time. Setup
 instructions, how the wake-catch-up timing works, and a one-time manual test checklist
 (this behavior can only be verified on real hardware) are in [`LAUNCHD.md`](LAUNCHD.md).
+To confirm a scheduled run actually fired, check the dashboard's **Logs** page
+(`/logs`) rather than opening `runner.log`/`sync.log` by hand.
 
 ## Running the tests
 
