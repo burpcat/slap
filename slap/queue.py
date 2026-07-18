@@ -96,6 +96,16 @@ def stage_recipient(conn, *, campaign: str, recipient: str, persona: str, cadenc
     before this change simply lacks these keys, and every reader treats a
     missing key as blank/unknown, never a guessed value.
 
+    `cadence` (post-launch: per-recipient follow-up override) also rides in
+    this same `meta` — it's the EFFECTIVE cadence actually being staged for
+    this recipient (the caller may have truncated the persona's full default
+    down to fewer follow-ups, or even to zero), not necessarily
+    `global_config.personas[persona]`. `slap.tracking._apply_event_to_cache`
+    copies it into the `recipients` cache's own `cadence` column so
+    `slap.runner`/`slap.dashboard`/`slap.cleanup` can each prefer the real,
+    per-recipient value over the persona default when deciding what's still
+    scheduled to fire.
+
     `extra_meta` (post-launch, bounce remediation) merges additional keys
     into the same `queued` event's meta on top of persona/company/role/
     req_id — e.g. `{"corrected_from": "<bounced address>"}` from
@@ -139,7 +149,7 @@ def stage_recipient(conn, *, campaign: str, recipient: str, persona: str, cadenc
 
     append_event(conn, type="queued", recipient=recipient, campaign=campaign, stage=0,
                  meta={"persona": persona, "company": company, "role": role, "req_id": req_id,
-                       **(extra_meta or {})})
+                       "cadence": cadence, **(extra_meta or {})})
     return workdir
 
 

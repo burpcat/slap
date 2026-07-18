@@ -17,33 +17,12 @@ from slap import display
 from slap.cleanup import DEFAULT_MIN_DAYS_IDLE, delete_eligible, find_cleanup_candidates
 from slap.config import ConfigError, discover_campaigns, load_campaign, load_global_config
 from slap.latex import recipient_workdir, run_latex_loop
+from slap.prompts import PASTE_TERMINATOR, read_paste
 from slap.queue import AmbiguousArchiveChoice, QueueError, resend_bounced, stage_recipient
 from slap.templates import fill_template, merge_config_values, parse_drop
-from slap import archive, dashboard, doctor, domains, gmass, gmass_cache, init, launchd, reload, runner, tracking
+from slap import archive, dashboard, doctor, domains, gmass, gmass_cache, init, launchd, onboard, reload, runner, tracking
 
 load_dotenv()
-
-PASTE_TERMINATOR = "<<<EOF>>>"
-
-
-def read_paste(prompt: str, read_line=input) -> str:
-    """Reads a multi-line paste terminated by a line containing only
-    PASTE_TERMINATOR, not a blocking read-until-EOF. A real read-until-EOF
-    (sys.stdin.read()) would consume the entire stdin stream, leaving
-    nothing for any later input() prompt (Add another?, confirmations) to
-    read — this works correctly for both a live terminal and piped/scripted
-    input, and doesn't rely on TTY-specific Ctrl-D-per-read semantics."""
-    print(f"{prompt} (end with a line containing only {PASTE_TERMINATOR}):")
-    lines = []
-    while True:
-        try:
-            line = read_line()
-        except EOFError:
-            break
-        if line.strip() == PASTE_TERMINATOR:
-            break
-        lines.append(line)
-    return "\n".join(lines)
 
 
 def cmd_list(args):
@@ -166,6 +145,36 @@ def _offer_resume_reuse(matches: list, *, read_line=input):
         display.warn(f"  Not understood — enter a number 0-{len(matches)}.")
 
 
+def _ask_followup_count(campaign, *, read_line=input) -> int:
+    """Per-recipient follow-up override (post-launch): lets the owner choose,
+    for THIS recipient only, how many of the persona's configured follow-up
+    stages actually go out — 0 (initial send only) up to the persona's full
+    cadence length. Always shown (never opt-in — an explicit owner decision,
+    per the same "warn/ask, don't hide" convention every other prompt in this
+    flow follows), defaulting to the persona's full cadence on a bare Enter
+    so the common case (no override) costs nothing but reading one line.
+    Returns an int in [0, len(campaign.cadence)] — the caller truncates
+    `campaign.cadence`/`stage_bodies` to a PREFIX of this length (a persona's
+    cadence is a fixed, ordered day-offset sequence; there's no notion of
+    skipping stage 2 but keeping stage 3)."""
+    max_n = len(campaign.cadence)
+    while True:
+        raw = read_line(
+            f"\nFollow-ups for this recipient? [0-{max_n}, default {max_n}] "
+            f"(persona={campaign.persona} cadence {campaign.cadence}): "
+        ).strip()
+        if raw == "":
+            return max_n
+        try:
+            n = int(raw)
+        except ValueError:
+            display.warn(f"  {raw!r} is not a whole number — enter 0-{max_n}.")
+            continue
+        if 0 <= n <= max_n:
+            return n
+        display.warn(f"  Must be between 0 and {max_n}.")
+
+
 def _prep_one_recipient(conn, campaign, consumer_domains, values, recipient, archive_dir, *,
                          signature: str, read_line=input):
     if campaign.latex_enabled:
@@ -178,6 +187,9 @@ def _prep_one_recipient(conn, campaign, consumer_domains, values, recipient, arc
         attachment_path = staged.path
     else:
         attachment_path = campaign.path / campaign.attachment_file
+        placeholder_check = doctor.check_placeholder_resume(campaign)
+        if not placeholder_check.ok:
+            display.warn(f"⚠ {placeholder_check.detail}")
 
     dedup = domains.check_recipient(conn, recipient, consumer_domains)
     if dedup.hard_warning:
@@ -236,13 +248,28 @@ def _prep_one_recipient(conn, campaign, consumer_domains, values, recipient, arc
     body = fill_template(campaign.body_template, fill_values, campaign.fields)
     stage_bodies = [fill_template(s, fill_values, campaign.fields) for s in campaign.stage_bodies]
 
+    # Per-recipient follow-up override (post-launch): asked BEFORE the preview
+    # so the preview's own cadence line always reflects exactly what will be
+    # staged, never the persona's untruncated default. cadence/stage_bodies
+    # are always a PREFIX of the persona's full lists — a cadence is an
+    # ordered day-offset sequence, not a set of independently-selectable
+    # stages.
+    followup_count = _ask_followup_count(campaign, read_line=read_line)
+    effective_cadence = campaign.cadence[:followup_count]
+    effective_stage_bodies = stage_bodies[:followup_count]
+
     _warn_empty_fields(campaign, values)
     display.preview_panel(recipient, subject, body)
     if reused_from:
         print(f"Attachment: reused from {reused_from}")
     else:
         print(f"Attachment: {campaign.attachment_name}")
-    print(f"Cadence (persona={campaign.persona}): {campaign.cadence}")
+    if followup_count == len(campaign.cadence):
+        print(f"Cadence (persona={campaign.persona}): {effective_cadence}")
+    else:
+        print(f"Cadence: {effective_cadence} ({followup_count} follow-up"
+              f"{'s' if followup_count != 1 else ''}, persona={campaign.persona} "
+              f"default is {campaign.cadence})")
 
     if read_line("\nStage this send? [y/N]: ").strip().lower() != "y":
         print("Skipped.")
@@ -250,7 +277,7 @@ def _prep_one_recipient(conn, campaign, consumer_domains, values, recipient, arc
 
     stage_recipient(
         conn, campaign=campaign.name, recipient=recipient, persona=campaign.persona,
-        cadence=campaign.cadence, subject=subject, body=body, stage_bodies=stage_bodies,
+        cadence=effective_cadence, subject=subject, body=body, stage_bodies=effective_stage_bodies,
         attachment_path=attachment_path, attachment_name=campaign.attachment_name,
         latex_enabled=campaign.latex_enabled,
         company=values.get("company", ""), role=values.get("role_catted", ""),
@@ -391,6 +418,14 @@ def cmd_init(args):
         init.run_init()
     except init.InitError as e:
         display.fail(f"slap init: {e}")
+        sys.exit(1)
+
+
+def cmd_onboard_campaign(args):
+    try:
+        onboard.run_onboard_campaign()
+    except onboard.OnboardError as e:
+        display.fail(f"slap onboard-campaign: {e}")
         sys.exit(1)
 
 
@@ -644,6 +679,9 @@ def build_parser():
     sub.add_parser(
         "init", help="Interactive installer — config.yaml, .env, schedule, DB, launchd"
     ).set_defaults(func=cmd_init)
+    sub.add_parser(
+        "onboard-campaign", help="Interactive wizard to scaffold a new campaigns/<name>/ folder"
+    ).set_defaults(func=cmd_onboard_campaign)
     sub.add_parser("domains", help="Regenerate/print the domain index").set_defaults(func=cmd_domains)
     sub.add_parser("rebuild", help="Rebuild the recipients cache from events").set_defaults(func=cmd_rebuild)
     sub.add_parser(

@@ -897,6 +897,27 @@ def test_pipeline_followups_scheduled_today_and_tomorrow(conn):
     assert [e["recipient"] for e in result["followups_scheduled"]["tomorrow"]] == ["tomorrow@x.com"]
 
 
+def test_pipeline_followups_scheduled_prefers_recipients_own_cadence(conn):
+    # Per-recipient follow-up override (post-launch): recruiter's persona
+    # default is [2,3,5], but this recipient's own staged cadence is [2, 10]
+    # -- the schedule must reflect what was ACTUALLY staged, not the config
+    # default, which would put the next follow-up on an entirely different day.
+    first_sent = datetime(2026, 3, 1, 10, 0, tzinfo=timezone.utc)
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter", "cadence": [2, 10]}, timestamp=first_sent)
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=0, timestamp=first_sent)
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=1,
+                 timestamp=first_sent + timedelta(days=2))
+
+    # persona default [2,3,5] would schedule the next stage for day 6 (Mar 6);
+    # this recipient's own [2, 10] cadence actually schedules it for day 13.
+    result_day6 = pipeline(conn, make_global_config(), today=date(2026, 3, 6))
+    assert result_day6["followups_scheduled"]["today"] == []
+
+    result_day13 = pipeline(conn, make_global_config(), today=date(2026, 3, 13))
+    assert [e["recipient"] for e in result_day13["followups_scheduled"]["today"]] == ["a@x.com"]
+
+
 # --- todays_runs --------------------------------------------------------
 
 def test_todays_runs_pairs_started_with_completed(conn):

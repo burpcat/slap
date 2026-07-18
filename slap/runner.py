@@ -31,6 +31,7 @@ CONTROL_SHEET.md):
 """
 from __future__ import annotations
 
+import json
 import random
 import time
 from dataclasses import dataclass
@@ -121,14 +122,21 @@ def todays_sent_count(conn, today: date) -> int:
 
 
 def _estimate_followups_firing_today(conn, global_config, today: date) -> int:
-    """Best-effort estimate only — see module docstring."""
+    """Best-effort estimate only — see module docstring.
+
+    Prefers each recipient's own recorded `cadence` (set at stage time via
+    `slap.queue.stage_recipient`, possibly truncated from the persona's full
+    default by a per-send override — see slap.tracking's module docstring)
+    over the persona lookup; a `queued` event written before that column
+    existed leaves it NULL, so this falls back to the persona default exactly
+    like before for older recipients."""
     rows = conn.execute(
-        "SELECT persona, current_stage, first_sent_at FROM recipients "
+        "SELECT persona, current_stage, first_sent_at, cadence FROM recipients "
         "WHERE status = 'active' AND first_sent_at IS NOT NULL"
     ).fetchall()
     count = 0
     for row in rows:
-        cadence = global_config.personas.get(row["persona"])
+        cadence = json.loads(row["cadence"]) if row["cadence"] else global_config.personas.get(row["persona"])
         if not cadence:
             continue
         next_stage = row["current_stage"] + 1
