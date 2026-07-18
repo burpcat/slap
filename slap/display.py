@@ -22,6 +22,8 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
+from slap.templates import PLACEHOLDER_RE
+
 GREEN = "green"
 RED = "bold red"
 YELLOW = "yellow"
@@ -92,6 +94,36 @@ def styled_menu_prompt(items: list) -> str:
         text.append(f"]{rest}")
     text.append(": ")
     return _rendered(text)
+
+
+def template_review_panel(sections: list) -> None:
+    """`onboard-campaign`'s review-before-write step: renders every template
+    section (initial subject/body, each follow-up body) in one place, with
+    every `{{key}}`/`{{signature}}` placeholder visually highlighted.
+    `sections` is a list of (heading, text) pairs, printed in order inside
+    one bordered panel.
+
+    Reuses `slap.templates.PLACEHOLDER_RE` rather than a second regex, so
+    highlighting always matches exactly what `fill_template()` will actually
+    substitute later — one source of truth for what counts as a placeholder.
+
+    Unlike `preview_panel()` above, `text` here is raw, still-unfilled
+    template source being reviewed BEFORE anything is written to
+    campaigns/<name>/ — never a filled/staged message bound for a real
+    recipient — so there's no conflict with this module's hard requirement
+    about the actual send path."""
+    body = Text()
+    for i, (heading, text) in enumerate(sections):
+        if i > 0:
+            body.append("\n\n")
+        body.append(f"{heading}\n", style=ACCENT)
+        pos = 0
+        for match in PLACEHOLDER_RE.finditer(text):
+            body.append(text[pos:match.start()])
+            body.append(match.group(0), style=ACCENT)
+            pos = match.end()
+        body.append(text[pos:])
+    console.print(Panel(body, title="Template review", border_style="dim", padding=(1, 2)))
 
 
 def preview_panel(recipient: str, subject: str, body: str) -> None:

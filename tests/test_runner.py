@@ -542,6 +542,25 @@ def test_cap_headroom_estimates_followups_firing_today(conn, tmp_path):
     assert cap_headroom(conn, gc, today=today_stage1_fires) == 4  # 5 - 1 estimated follow-up
 
 
+def test_cap_headroom_prefers_recipients_own_cadence_over_persona_default(conn, tmp_path):
+    # Per-recipient follow-up override (post-launch): this recipient's ACTUAL
+    # staged cadence ([2, 10], as if a per-send override reshaped the
+    # persona's usual [2,3,5]) must drive the estimate -- not the persona's
+    # config default, which would put the same next-stage estimate on a
+    # totally different day.
+    gc = make_global_config(tmp_path, daily_cap=5)
+    first_sent = datetime(2026, 1, 1, 9, 0, tzinfo=timezone.utc)
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter", "cadence": [2, 10]}, timestamp=first_sent)
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=0, timestamp=first_sent)
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=1,
+                 timestamp=first_sent + timedelta(days=2))
+    # persona default [2,3,5] would put the next stage on day 5; this
+    # recipient's own [2, 10] cadence actually puts it on day 12.
+    assert cap_headroom(conn, gc, today=date(2026, 1, 6)) == 5  # not day 5 -- no estimate here
+    assert cap_headroom(conn, gc, today=date(2026, 1, 13)) == 4  # day 12 -- 1 estimated follow-up
+
+
 def test_cap_headroom_never_negative(conn, tmp_path):
     gc = make_global_config(tmp_path, daily_cap=1)
     ts = datetime(2026, 1, 1, 10, 0, tzinfo=timezone.utc)

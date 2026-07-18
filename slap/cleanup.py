@@ -153,7 +153,12 @@ def classify_recipient(conn, campaign: str, recipient: str, global_config: Globa
     if persona is None or persona not in global_config.personas:
         return Verdict("undetermined", f"persona {persona!r} not found in config — cannot verify cadence")
 
-    cadence = global_config.personas[persona]
+    # Prefers the SAME queued event's own recorded cadence (a per-send
+    # override may have truncated it from the persona's full default — see
+    # slap.tracking's module docstring) over the persona lookup; a queued
+    # event written before that field existed simply lacks it, falling back
+    # to the persona default exactly like before.
+    cadence = persona_rows[0]["meta"].get("cadence") or global_config.personas[persona]
     window_days = sum(cadence)
     first_sent_at = datetime.fromisoformat(first_sent["timestamp"])
     elapsed_days = (now - first_sent_at).days

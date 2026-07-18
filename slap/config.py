@@ -332,17 +332,28 @@ def load_campaign(name: str, global_config: GlobalConfig, campaigns_dir: Path = 
     )
 
 
-def _validate_initial_txt(path: Path) -> tuple:
-    if not path.exists():
-        raise ConfigError(f"{path} not found — every campaign needs an initial.txt")
-    lines = path.read_text().splitlines()
+def parse_initial_txt_text(text: str, *, ctx: str = "initial.txt") -> tuple:
+    """The Subject:-line + blank-line-separator shape shared by a real
+    initial.txt file (_validate_initial_txt below) AND `slap.onboard`'s
+    interactive wizard, which validates a live paste against this EXACT rule
+    before anything is written to campaigns/<name>/ — one source of truth so
+    the two can never quietly drift apart. `ctx` is whatever the caller wants
+    named in a raised ConfigError (a real path for the file-based caller, a
+    plain step label for the wizard, which has no file yet to name)."""
+    lines = text.splitlines()
     if not lines or not lines[0].startswith("Subject:"):
-        raise ConfigError(f"{path}: first line must be 'Subject: ...'")
+        raise ConfigError(f"{ctx}: first line must be 'Subject: ...'")
     if len(lines) < 2 or lines[1] != "":
-        raise ConfigError(f"{path}: second line must be blank (Subject line + blank-line separator)")
+        raise ConfigError(f"{ctx}: second line must be blank (Subject line + blank-line separator)")
     subject = lines[0].removeprefix("Subject:").lstrip(" ")
     body = "\n".join(lines[2:])
     return subject, body
+
+
+def _validate_initial_txt(path: Path) -> tuple:
+    if not path.exists():
+        raise ConfigError(f"{path} not found — every campaign needs an initial.txt")
+    return parse_initial_txt_text(path.read_text(), ctx=str(path))
 
 
 def _validate_stage_files(campaign_path: Path, cadence: list) -> None:

@@ -95,6 +95,22 @@ CONTROL_SHEET.md, revisit when steps 6/9/10 wire in real callers):
   blast radius) — see `stop_outreach()`'s own docstring for the full
   rationale and its GMass-suppression-first ordering, identical to
   `ooo`/`not_interested` above.
+- `recipients.cadence` (post-launch: per-recipient follow-up override) is a
+  nullable JSON-encoded list, populated from a `queued` event's own
+  `meta["cadence"]` (`slap.queue.stage_recipient` always includes it — the
+  effective, possibly owner-truncated cadence actually staged for THIS
+  recipient, not necessarily the persona's full default). This is a plain
+  `ALTER TABLE ADD COLUMN`, not a CHECK-constraint literal like `stopped`
+  above, so it needs none of that migration's rename/recreate dance — SQLite
+  supports adding a nullable column to an existing table natively.
+  Before this column existed, `slap.runner._estimate_followups_firing_today`/
+  `slap.dashboard._followups_scheduled`/`slap.cleanup.classify_recipient` all
+  silently assumed a recipient's cadence was always exactly
+  `global_config.personas[persona]` — this column lets them prefer the
+  recipient's own recorded cadence instead, falling back to the persona
+  default only for `queued` events written before this feature shipped
+  (missing key = unknown, never fabricated, the same convention every other
+  additive `meta` field in this module follows).
 """
 from __future__ import annotations
 
@@ -146,7 +162,8 @@ CREATE TABLE IF NOT EXISTS recipients (
     last_gmass_campaign_id TEXT,
     first_sent_at TEXT,
     last_event_at TEXT,
-    replied_at TEXT
+    replied_at TEXT,
+    cadence TEXT
 );
 
 -- events is append-only and grows forever by design (§5) — these cover the
@@ -247,11 +264,35 @@ def _migrate_events_check_constraint(conn: sqlite3.Connection) -> None:
         raise
 
 
+def _migrate_recipients_cadence_column(conn: sqlite3.Connection) -> None:
+    """One-time additive migration for `recipients.cadence` (per-recipient
+    follow-up override, post-launch — see this module's own docstring). Unlike
+    `_migrate_events_check_constraint`, this is a plain `ALTER TABLE ... ADD
+    COLUMN` — no CHECK constraint is involved, so none of that function's
+    rename/recreate/copy/drop dance is needed; SQLite supports adding a
+    nullable column to an existing table natively and atomically.
+
+    A fresh db has no `recipients` table yet at the point this runs (it's
+    called before `_SCHEMA`'s own `CREATE TABLE IF NOT EXISTS`, same ordering
+    as `_migrate_events_check_constraint`) — nothing to do, since `_SCHEMA`
+    creates it moments later already including `cadence`. An already-existing
+    db missing the column gets it added here; `PRAGMA table_info` is the
+    idempotent detection, mirroring how the CHECK-constraint migration reads
+    the table's own recorded shape back from `sqlite_master` rather than
+    tracking a separate schema-version number."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(recipients)")}
+    if not cols or "cadence" in cols:
+        return  # no recipients table yet (fresh db), or already migrated
+    conn.execute("ALTER TABLE recipients ADD COLUMN cadence TEXT")
+    conn.commit()
+
+
 def connect(path: Path = DB_PATH) -> sqlite3.Connection:
     """Open (creating if needed) the tracking DB with the schema applied."""
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     _migrate_events_check_constraint(conn)
+    _migrate_recipients_cadence_column(conn)
     conn.executescript(_SCHEMA)
     conn.commit()
     return conn
@@ -340,16 +381,22 @@ def rebuild(conn: sqlite3.Connection) -> None:
 
 def _upsert_recipient(conn, recipient, *, campaign=None, persona=None, status=None,
                        current_stage=None, last_gmass_campaign_id=None,
-                       first_sent_at=None, last_event_at=None, replied_at=None) -> None:
+                       first_sent_at=None, last_event_at=None, replied_at=None,
+                       cadence=None) -> None:
     """Insert a recipients row or merge fields into an existing one. Fields
     left as None here mean 'don't change' on conflict, except first_sent_at/
-    replied_at which are first-write-wins (once set, never overwritten)."""
+    replied_at which are first-write-wins (once set, never overwritten).
+    `cadence` follows the general COALESCE convention (None = don't change) —
+    only the `queued` handler below ever passes a real value, and every
+    `queued` event written since this feature shipped always carries one
+    (see `slap.queue.stage_recipient`), so in practice it's set once per
+    recipient and never blanked out by some other event's None."""
     conn.execute(
         """
         INSERT INTO recipients
             (recipient, campaign, persona, status, current_stage,
-             last_gmass_campaign_id, first_sent_at, last_event_at, replied_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             last_gmass_campaign_id, first_sent_at, last_event_at, replied_at, cadence)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(recipient) DO UPDATE SET
             campaign = COALESCE(excluded.campaign, recipients.campaign),
             persona = COALESCE(excluded.persona, recipients.persona),
@@ -358,10 +405,11 @@ def _upsert_recipient(conn, recipient, *, campaign=None, persona=None, status=No
             last_gmass_campaign_id = COALESCE(excluded.last_gmass_campaign_id, recipients.last_gmass_campaign_id),
             first_sent_at = COALESCE(recipients.first_sent_at, excluded.first_sent_at),
             last_event_at = COALESCE(excluded.last_event_at, recipients.last_event_at),
-            replied_at = COALESCE(recipients.replied_at, excluded.replied_at)
+            replied_at = COALESCE(recipients.replied_at, excluded.replied_at),
+            cadence = COALESCE(excluded.cadence, recipients.cadence)
         """,
         (recipient, campaign, persona, status, current_stage, last_gmass_campaign_id,
-         first_sent_at, last_event_at, replied_at),
+         first_sent_at, last_event_at, replied_at, cadence),
     )
 
 
@@ -378,8 +426,10 @@ def _apply_event_to_cache(conn: sqlite3.Connection, event: dict) -> None:
     etype = event["type"]
 
     if etype == "queued":
+        cadence = meta.get("cadence")
         _upsert_recipient(conn, recipient, campaign=campaign, persona=meta.get("persona"),
-                           status="active", current_stage=event["stage"], last_event_at=ts)
+                           status="active", current_stage=event["stage"], last_event_at=ts,
+                           cadence=json.dumps(cadence) if cadence is not None else None)
     elif etype == "draft_created":
         return  # audit/idempotency marker only — no recipients-cache-visible state change
     elif etype == "sent":

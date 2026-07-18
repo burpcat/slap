@@ -29,6 +29,16 @@ Two check batteries:
   wired into `print_report()` only, visible in the standalone `doctor`
   report (and `init`'s finish step) but invisible to `send`'s auto-preflight
   and `runner.drain()`'s preflight-retry gate.
+- `check_placeholder_resume(campaign)` (post-launch, `onboard-campaign`) — a
+  FOURTH standalone check, same reasoning as `check_resume_archive()`: a
+  static campaign's `attachment_file` still being the scaffolded placeholder
+  PDF must warn, never block, so it's appended in `print_report()`'s
+  per-campaign loop only, never inside `run_campaign_checks()`. Content-based
+  (compares bytes against `slap.prompts.placeholder_pdf()`), so it keeps
+  warning for as long as the placeholder is in place and clears itself the
+  moment it's replaced — no dismiss flag to hand-maintain. Also called
+  directly (not through doctor) from `slap.py::_prep_one_recipient`, so the
+  warning shows at `send` time too, not just when `doctor` is run by hand.
 """
 from __future__ import annotations
 
@@ -39,6 +49,7 @@ from pathlib import Path
 
 from slap import archive, gmass_cache, tracking
 from slap.config import CampaignConfig, GlobalConfig
+from slap.prompts import placeholder_pdf
 
 DEFAULT_CONSUMER_DOMAINS = [
     "gmail.com", "outlook.com", "yahoo.com", "icloud.com", "proton.me",
@@ -116,6 +127,46 @@ def run_campaign_checks(campaign: CampaignConfig) -> list:
     return check_attachment(campaign)
 
 
+def check_placeholder_resume(campaign: CampaignConfig) -> CheckResult:
+    """Is a static campaign's `attachment_file` still the exact scaffold
+    placeholder PDF (`slap.prompts.placeholder_pdf()`) that `onboard-campaign`/
+    `init` write when the owner hasn't supplied a real résumé yet? Content-
+    based, not a dismissible flag: the file's own bytes are the one source of
+    truth, so this keeps warning for as long as the placeholder is still in
+    place and self-resolves the instant it's replaced — no separate
+    acknowledgment state to hand-maintain.
+
+    Deliberately a FOURTH standalone check, like `check_resume_archive()`/
+    `check_redis()` above: sending with a placeholder résumé is exactly the
+    kind of thing this app warns about rather than blocks (CLAUDE.md's single
+    hard gate is the >1-page LaTeX check, and this must never become a
+    second one) — so this is wired into `print_report()` only, NEVER into
+    `run_campaign_checks()`, which `_run_doctor_or_exit` uses to gate every
+    `send`/`drain` preflight. `slap.py::_prep_one_recipient` also calls this
+    directly (a plain `display.warn`, not through doctor at all) so the
+    warning is visible at `send` time too, every single recipient, for as
+    long as the placeholder is still in place — not just when `doctor` is
+    run by hand.
+
+    Not applicable to latex-enabled campaigns (no static `attachment_file` to
+    compare — the résumé is pasted fresh per recipient at send time) or to a
+    campaign whose `attachment_file` doesn't exist at all (that's
+    `check_attachment()`'s own job to flag, already covered elsewhere in the
+    same report)."""
+    if campaign.latex_enabled:
+        return CheckResult("resume placeholder", True, "not applicable — latex.enabled is true")
+    attachment_path = campaign.path / campaign.attachment_file
+    if not attachment_path.exists():
+        return CheckResult("resume placeholder", True, "attachment_file not found — see attachment_file check above")
+    if attachment_path.read_bytes() == placeholder_pdf():
+        return CheckResult(
+            "resume placeholder", False,
+            f"{attachment_path} is still the placeholder PDF scaffolded by onboard-campaign/init — "
+            f"replace it with your real résumé before sending to real recipients"
+        )
+    return CheckResult("resume placeholder", True)
+
+
 def check_resume_archive() -> CheckResult:
     """RESUME_ARCHIVE_DIR (post-launch feature, slap/archive.py). Deliberately
     NOT folded into run_global_checks(): that battery gates every `send`/
@@ -167,7 +218,7 @@ def check_redis(global_config: GlobalConfig) -> CheckResult:
         )
 
 
-def _print_check(result: CheckResult, *, indent: str = "") -> None:
+def print_check(result: CheckResult, *, indent: str = "") -> None:
     from slap import display
     if result.ok:
         suffix = f" ({result.detail})" if result.detail else ""
@@ -202,14 +253,14 @@ def print_report(global_config: GlobalConfig) -> bool:
 
     ok = True
     for result in run_global_checks(global_config):
-        _print_check(result)
+        print_check(result)
         ok = ok and result.ok
 
     archive_result = check_resume_archive()
-    _print_check(archive_result)
+    print_check(archive_result)
     ok = ok and archive_result.ok
 
-    _print_check(check_redis(global_config))  # visible, but never gates doctor's pass/fail — see docstring
+    print_check(check_redis(global_config))  # visible, but never gates doctor's pass/fail — see docstring
 
     names = discover_campaigns()
     if not names:
@@ -221,13 +272,18 @@ def print_report(global_config: GlobalConfig) -> bool:
             display.error(f"campaign '{name}': FAIL — {e}")
             ok = False
             continue
-        campaign_results = run_campaign_checks(campaign)
+        # check_placeholder_resume() is appended here, NOT inside
+        # run_campaign_checks() itself — that list is also what
+        # _run_doctor_or_exit uses to gate every send/drain preflight, and a
+        # placeholder résumé must never be able to block a send (see that
+        # check's own docstring).
+        campaign_results = run_campaign_checks(campaign) + [check_placeholder_resume(campaign)]
         campaign_ok = all(r.ok for r in campaign_results)
         if campaign_ok:
             display.success(f"campaign '{name}': OK")
         else:
             display.error(f"campaign '{name}': FAIL")
         for result in campaign_results:
-            _print_check(result, indent="  ")
+            print_check(result, indent="  ")
         ok = ok and campaign_ok
     return ok

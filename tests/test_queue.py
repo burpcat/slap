@@ -173,7 +173,7 @@ def test_resend_bounced_stages_new_recipient_with_recovered_content(tmp_path):
     assert len(events) == 1
     meta = json.loads(events[0]["meta"])
     assert meta == {"persona": "recruiter", "company": "Acme", "role": "SWE", "req_id": "",
-                     "corrected_from": "jane@acme.com"}
+                     "cadence": [2, 3, 5], "corrected_from": "jane@acme.com"}
 
     row = conn.execute("SELECT * FROM recipients WHERE recipient = ?", ("jane.doe@acme.com",)).fetchone()
     assert row["status"] == "active"  # always restarts fresh, never inherits the bounced one's state

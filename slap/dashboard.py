@@ -555,15 +555,20 @@ def stop_outreach(conn, recipient: str, *, api_key: str = None, unsubscribe_fn=N
 
 
 def _followups_scheduled(conn, global_config, *, today: date = None) -> dict:
+    """Prefers each recipient's own recorded `cadence` (set at stage time,
+    possibly truncated from the persona's full default by a per-send
+    override — see slap.tracking's module docstring) over the persona
+    lookup; a `queued` event written before that column existed leaves it
+    NULL, falling back to the persona default exactly like before."""
     today = today or date.today()
     tomorrow = today + timedelta(days=1)
     rows = conn.execute(
-        "SELECT recipient, persona, current_stage, first_sent_at FROM recipients "
+        "SELECT recipient, persona, current_stage, first_sent_at, cadence FROM recipients "
         "WHERE status = 'active' AND first_sent_at IS NOT NULL"
     ).fetchall()
     due_today, due_tomorrow = [], []
     for row in rows:
-        cadence = global_config.personas.get(row["persona"])
+        cadence = json.loads(row["cadence"]) if row["cadence"] else global_config.personas.get(row["persona"])
         if not cadence:
             continue
         next_stage = row["current_stage"] + 1
