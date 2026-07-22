@@ -153,6 +153,7 @@ class CampaignConfig:
     subject_template: str
     body_template: str
     stage_bodies: list
+    name_field: str | None = None
 
 
 def load_global_config(path: Path = CONFIG_PATH) -> GlobalConfig:
@@ -310,6 +311,16 @@ def load_campaign(name: str, global_config: GlobalConfig, campaigns_dir: Path = 
     if not any(f.key == "email" for f in fields):
         raise ConfigError(f"{yaml_path}: 'fields' must include a field with key 'email' — send needs it")
 
+    name_field = raw.get("name_field")
+    if name_field is not None:
+        if not isinstance(name_field, str):
+            raise ConfigError(f"{yaml_path}: 'name_field' must be a string — got {name_field!r}")
+        if not any(f.key == name_field for f in fields):
+            raise ConfigError(
+                f"{yaml_path}: name_field '{name_field}' is not one of the declared fields "
+                f"({sorted(f.key for f in fields)})"
+            )
+
     subject_template, body_template = _validate_initial_txt(campaign_path / "initial.txt")
     _validate_stage_files(campaign_path, cadence)
     stage_bodies = _read_stage_bodies(campaign_path, cadence)
@@ -329,6 +340,7 @@ def load_campaign(name: str, global_config: GlobalConfig, campaigns_dir: Path = 
         subject_template=subject_template,
         body_template=body_template,
         stage_bodies=stage_bodies,
+        name_field=name_field,
     )
 
 

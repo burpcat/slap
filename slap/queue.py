@@ -57,7 +57,8 @@ MANIFEST_NAME = "staged.json"
 def stage_recipient(conn, *, campaign: str, recipient: str, persona: str, cadence: list,
                      subject: str, body: str, stage_bodies: list,
                      attachment_path: Path, attachment_name: str, latex_enabled: bool,
-                     company: str = "", role: str = "", req_id: str = "", archive_dir: Path = None,
+                     company: str = "", role: str = "", req_id: str = "", name: str = "",
+                     archive_dir: Path = None,
                      when: date = None, workdir_root: Path = WORKDIR_ROOT, extra_meta: dict = None,
                      field_values: dict = None) -> Path:
     """Write the queued event + staged manifest for one recipient (does not
@@ -95,6 +96,15 @@ def stage_recipient(conn, *, campaign: str, recipient: str, persona: str, cadenc
     tracks them. Additive and backward-compatible: a `queued` event written
     before this change simply lacks these keys, and every reader treats a
     missing key as blank/unknown, never a guessed value.
+
+    `name` rides in the same `meta` on the identical precedent — the
+    recipient's personal name (whichever drop field the campaign's
+    `name_field` points at, e.g. `recruiter_name`/`hm_name`/`founder_name`;
+    the caller resolves which one). Previously used only to fill the
+    template greeting and then discarded; persisting it is what makes the
+    Reach-outs page searchable/displayable by name. Same backward-compat
+    rule: a `queued` event written before this existed simply lacks the
+    key, read as blank, never guessed.
 
     `cadence` (post-launch: per-recipient follow-up override) also rides in
     this same `meta` — it's the EFFECTIVE cadence actually being staged for
@@ -149,7 +159,7 @@ def stage_recipient(conn, *, campaign: str, recipient: str, persona: str, cadenc
 
     append_event(conn, type="queued", recipient=recipient, campaign=campaign, stage=0,
                  meta={"persona": persona, "company": company, "role": role, "req_id": req_id,
-                       "cadence": cadence, **(extra_meta or {})})
+                       "name": name, "cadence": cadence, **(extra_meta or {})})
     return workdir
 
 
@@ -255,6 +265,7 @@ def resend_bounced(conn, *, original_recipient: str, corrected_email: str,
     ).fetchone()
     drop_meta = json.loads(drop_meta_row["meta"]) if drop_meta_row and drop_meta_row["meta"] else {}
     company, role, req_id = drop_meta.get("company", ""), drop_meta.get("role", ""), drop_meta.get("req_id", "")
+    name = drop_meta.get("name", "")
 
     latex_enabled = manifest.get("attachment_source") is None
     if not latex_enabled:
@@ -289,7 +300,7 @@ def resend_bounced(conn, *, original_recipient: str, corrected_email: str,
         conn, campaign=campaign, recipient=corrected_email, persona=persona, cadence=cadence,
         subject=subject, body=body, stage_bodies=stage_bodies, attachment_path=attachment_path,
         attachment_name=attachment_name, latex_enabled=latex_enabled, company=company, role=role,
-        req_id=req_id, archive_dir=archive_dir, when=when, workdir_root=workdir_root,
+        req_id=req_id, name=name, archive_dir=archive_dir, when=when, workdir_root=workdir_root,
         extra_meta={"corrected_from": original_recipient},
         # Carries the original recipient's own field_values through (if
         # they have any — see stage_recipient()'s own docstring) so the

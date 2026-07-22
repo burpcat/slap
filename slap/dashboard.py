@@ -1107,13 +1107,13 @@ def follow_up_reminders(conn, *, today: date = None) -> list:
 
 
 def _recipient_drop_meta(conn) -> dict:
-    """Per recipient, the company/role/req_id captured at their MOST RECENT
-    `queued` event (see slap.queue.stage_recipient's docstring for why
-    these ride in meta — the exact same precedent already established for
-    persona). A recipient staged before this capture existed, or whose drop
-    simply left a field blank, has an empty string here — never fabricated,
-    never backfilled from anywhere else (e.g. never guessed from a
-    rendered email body, which DOES contain the filled-in value as
+    """Per recipient, the company/role/req_id/name captured at their MOST
+    RECENT `queued` event (see slap.queue.stage_recipient's docstring for
+    why these ride in meta — the exact same precedent already established
+    for persona). A recipient staged before this capture existed, or whose
+    drop simply left a field blank, has an empty string here — never
+    fabricated, never backfilled from anywhere else (e.g. never guessed
+    from a rendered email body, which DOES contain the filled-in value as
     unstructured prose but is not a reliable, parseable source of it)."""
     rows = conn.execute(
         "SELECT recipient, meta FROM events WHERE type = 'queued' ORDER BY id ASC"
@@ -1125,6 +1125,7 @@ def _recipient_drop_meta(conn) -> dict:
             "company": meta.get("company") or "",
             "role": meta.get("role") or "",
             "req_id": meta.get("req_id") or "",
+            "name": meta.get("name") or "",
         }
     return result
 
@@ -1272,9 +1273,9 @@ def reachouts_rows(conn) -> list:
       with their queued timestamp instead of leaving them dateless.
     - domain: domains.domain_of(recipient) — always reliable (derived live
       from the recipient's own email), unlike company below.
-    - company / req_id_present: _recipient_drop_meta() — only reliable for
-      recipients staged after that capture shipped; blank/False for older
-      ones, never guessed.
+    - company / name / req_id_present: _recipient_drop_meta() — only
+      reliable for recipients staged after that capture shipped; blank/False
+      for older ones, never guessed.
     - ooo_resume_date: ONLY set while status == 'ooo_requeued' — investigated
       before building (see CONTROL_SHEET.md): status and reply_tag already
       correctly reflect an unconditional Mark-OOO with zero prior reply (both
@@ -1365,7 +1366,7 @@ def reachouts_rows(conn) -> list:
             bounce_category = bounce_meta.get("category", "bounce")
             bounce_reason = bounce_meta.get("bounce_reason") or None
 
-        meta = drop_meta.get(recipient, {"company": "", "role": "", "req_id": ""})
+        meta = drop_meta.get(recipient, {"company": "", "role": "", "req_id": "", "name": ""})
         row_date = row["first_sent_at"] or row["last_event_at"]
         clicks = click_details.get(recipient, [])
         is_stopped = recipient in stopped_recipients
@@ -1379,6 +1380,7 @@ def reachouts_rows(conn) -> list:
             "reply_tag": tags.get(recipient),
             "domain": domains.domain_of(recipient),
             "company": meta["company"],
+            "name": meta["name"],
             "req_id_present": bool(meta["req_id"]),
             "date": row_date,
             "ooo_resume_date": ooo_resume_date,
