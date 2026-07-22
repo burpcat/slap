@@ -141,9 +141,9 @@ slap/                       # package:
     domains.py                  #   domain/recipient dedup (hard/soft warn), `domains` command
     latex.py                    #   xelatex compile loop, >1-page hard gate, recipient_workdir()
     queue.py                    #   stage_recipient(), due_recipients(), OOO tag_ooo()/due_for_ooo_resend()
-    runner.py                   #   drain(), wait_for_fire_window(), is_active_day(), OOO resend
+    runner.py                   #   drain() (log_fn per-recipient progress), wait_for_fire_window(), is_active_day(), OOO resend
     reload.py                    #   template-reload: scan()/apply_changes()/write_failures()/load_failures()
-    dashboard.py + dashboard_templates/{dashboard,reachouts,template_failures}.html   # Flask app, all pages
+    dashboard.py + dashboard_templates/{base,dashboard,pipeline,engagement,deliverability,reachouts,template_failures,logs}.html   # Flask app, all pages
     doctor.py                    #   preflight checks (global + per-campaign), wired into send + drain
     cleanup.py                   #   stale-PDF classification/deletion (`cleanup` command)
     archive.py                   #   résumé archive (RESUME_ARCHIVE_DIR) + résumé-reuse lookup
@@ -371,15 +371,17 @@ but still the only place with any *data* interaction logic.)
 **Dashboard — current shipped state, not a wishlist (see §8 for full detail).** The
 single-scrolling-page layout this doc described through the multi-page redesign (below)
 is gone — confirm any future dashboard claim against `slap/dashboard_templates/*.html`
-directly rather than this doc's prose. As of this snapshot the dashboard is five pages
+directly rather than this doc's prose. As of this snapshot the dashboard is six pages
 sharing one `base.html` layout (nav, theme toggle, sync/cache-status banner): **Home**
 (`/`: Metrics, Replies needing triage, Next drain, Today's runs), **Pipeline**
 (`/pipeline`: Active leads, Follow-up reminders, Pipeline, Companies contacted, zero
 GMass-cache dependency), **Engagement** (`/engagement`: Engagement intelligence, Warm but
-silent), **Deliverability** (`/deliverability`: Bounces & blocks, Stopped outreach), plus
-`/reachouts` and, only while at least one unresolved `template-reload` failure exists,
-`/template-failures` (see this section's `template-reload` entry and the "Dashboard
-multi-page redesign" entry below).
+silent), **Deliverability** (`/deliverability`: Bounces & blocks, Stopped outreach),
+**Logs** (`/logs`: every `events` row, filterable/sortable, plus a tail of the raw
+`runner.log`/`runner.err.log`/`sync.log`/`sync.err.log` launchd-job output — zero GMass-cache
+dependency, same as Pipeline), plus `/reachouts` and, only while at least one unresolved
+`template-reload` failure exists, `/template-failures` (see this section's `template-reload`
+entry and the "Dashboard multi-page redesign" entry below).
 
 **Bounces vs. blocks — a real, fixed bug, not an open item.** GMass reports bounces and
 blocks as two separate report categories (`/api/reports/{id}/bounces` vs. `.../blocks`,
@@ -605,6 +607,30 @@ hidden-row filter inline instead of reusing `visible_warm_but_silent()` (moved v
 from the old `index()`, not a new drift risk, just an unreduced duplication); and this doc
 itself needed the sync pass you're reading now.
 
+**Logs page (`/logs`) — a sixth page, added post-launch, prompted by a real missed-schedule
+incident.** Investigating why the launchd-scheduled `runner` hadn't fired for two days
+surfaced that there was no single place to check — `events` had to be queried by hand, and
+`runner.log`/`sync.log` had to be opened directly, with no dashboard awareness of either.
+`recent_events()` is a new, deliberately generic `SELECT * FROM events ORDER BY id DESC LIMIT
+?` (every other dashboard query is a narrow, purpose-built projection for one widget; this
+is the one intentional exception, since "literally every event" is the whole point) —
+newest-first, capped at `EVENTS_DEFAULT_LIMIT = 500` with a "Show more" link that re-requests
+a larger `?limit=`, the same "no pagination state, just a bigger LIMIT" convention every
+other page already uses. `event_display()` maps each event type to a human label/chip-color/
+one-line detail string from that type's own `meta` shape, falling back to a plain neutral
+label for any future/unrecognized type rather than raising. `read_log_tail()` reads the last
+200 lines of each of the four launchd-job log files (`runner.log`/`runner.err.log`/
+`sync.log`/`sync.err.log`, always resolved as `db_path.parent` — the same "sibling of
+`slap.db`" convention `slap/launchd.py` already uses, now threaded through `create_app()`'s
+new `log_dir` param) — no rotation, since these are personal-scale, ever-growing files; a
+missing file (job never fired yet) is an explicit empty state, not an error. Reuses
+`reachouts.html`'s exact client-side filter/sort/expand-row JS pattern (no new interaction
+model to learn) and `_status_chip()`'s `{critical, good, serious, neutral}` chip vocabulary.
+Rode along in the same change: `drain()` gained an injectable `log_fn` (default `print`) that
+prints one progress line per recipient as each send resolves — previously `drain()` was
+completely silent per-recipient, so a real multi-minute throttled batch (run manually) looked
+indistinguishable from a hang, which is what actually prompted adding it.
+
 ---
 
 ## 6. Real GMass API facts (probe-verified — these OVERRIDE the build brief's assumptions)
@@ -762,6 +788,13 @@ don't assume a feature landed just because a task once existed for it):
   new `stopped_outreach_roster()` widget — see §5's dedicated entry for the full IA
   rationale, the two computed contrast/gauge fixes, and the iron-audit's three NITs (none
   blocking, none fixed yet).
+- **Dashboard Logs page** (`/logs`, 2026-07-17) — a sixth page: every `events` row
+  (`recent_events()`), filterable/sortable, plus a 200-line tail of `runner.log`/
+  `runner.err.log`/`sync.log`/`sync.err.log`; real route, real `event_display()`/
+  `read_log_tail()` code, prompted by a real missed-schedule incident (see §5's dedicated
+  entry). `runner.drain()` also gained an injectable `log_fn` (default `print`) in the same
+  change — one progress line per recipient as each send resolves, replacing total silence
+  until the final summary.
 
 **Genuinely still pending / unproven:**
 

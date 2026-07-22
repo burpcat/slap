@@ -221,6 +221,11 @@ the next scheduled runner fire:
 python slap.py send my-campaign --now
 ```
 
+Whether triggered by `--now` or the scheduled `runner`, a drain prints one progress line per
+recipient as each send resolves (`[i/N] recipient (campaign) -> sent`/`FAILED`) instead of
+staying silent until a single summary line at the end — useful since a big batch is throttled
+10-15s between sends and can otherwise look stuck for minutes.
+
 ### Editing a template after staging
 
 `send` freezes the rendered subject/body/stage text into the queue the moment you stage a
@@ -329,7 +334,7 @@ company, to reuse for the new recipient instead of the campaign's usual
 python slap.py dashboard
 ```
 
-Opens `http://127.0.0.1:5050`. Five pages share one header/nav bar, a light/dark theme
+Opens `http://127.0.0.1:5050`. Six pages share one header/nav bar, a light/dark theme
 toggle (top right — cycles Auto → Light → Dark, remembers your choice), and, only when
 the most recent `template-reload` run left at least one recipient un-reloaded, a
 **"Template Failures"** nav link listing who, in which campaign, and why (see "Editing a
@@ -393,6 +398,20 @@ depends on GMass's own report data):
   **Stop outreach** under Reach-outs below), with company/campaign/when. A roster, not a
   reply-tag view — a stopped recipient can independently still be tagged Real elsewhere;
   this just tracks the stop itself.
+
+**Logs** (`/logs`) — every event slap has ever recorded, in one place:
+
+- **Events** — every `queued`/`draft_created`/`sent`/`send_failed`/`run_started`/
+  `run_completed`/`run_failed`/`click`/`reply`/`bounce`/etc. event, newest first, filterable
+  by type/recipient/campaign and free-text search, sortable by clicking any column header.
+  Expand a row to see its raw event data (GMass draft/campaign IDs, full meta). This is a
+  direct, unfiltered view over the exact same append-only event log every other page's
+  widgets are derived from — nothing here is a separate log store.
+- **Raw job output** — the last 200 lines of `runner.log`/`runner.err.log`/`sync.log`/
+  `sync.err.log` (the scheduled jobs' actual stdout/stderr, launchd writes these — see
+  Scheduler below), newest first. This is the one place a *launchd-level* failure would show
+  up — a crash before `slap.py` ever gets far enough to write an event at all — so it's worth
+  checking here first if a scheduled run doesn't seem to have happened.
 
 ## Reach-outs (all campaigns, filterable)
 
@@ -479,6 +498,10 @@ Knobs, all in `config.yaml`'s `schedule:` block:
 **Your Mac needs to be on and logged in (sleep is fine, fully shut down is not) at some
 point during the fire window** — launchd can wake a sleeping Mac for a scheduled job, but
 can't run anything if the machine is powered off or the user isn't logged in.
+
+**To check whether a scheduled run actually fired**, open the dashboard's **Logs** page
+(`/logs`) — it shows every `run_started`/`run_completed`/`run_failed` event alongside the raw
+`runner.log`/`runner.err.log` tails, so you don't have to go find and open those files by hand.
 
 ## Tips
 

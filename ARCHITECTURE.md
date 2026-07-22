@@ -53,7 +53,10 @@ derived cache for fast current-state reads, and is fully rebuildable by replayin
 `events` from scratch (proven in tests: a rebuilt cache must exactly equal the live one).
 This means every piece of derived state in the app — dedup history, the domain index,
 the dashboard's every panel, cap accounting — is a pure function of one append-only log,
-never a second thing that can drift out of sync with it.
+never a second thing that can drift out of sync with it. The dashboard's **Logs** page
+(`/logs`) is a read-only UI view directly over this same table — no parallel log store —
+plus a tail of the raw launchd stdout/stderr files, the one place a failure before `slap.py`
+gets far enough to write an event at all would ever be visible.
 
 **Prep/fire split.** Staging a send (`send`) is interactive and does the risky,
 judgment-requiring work — paste the data, compile/preview the résumé, see dedup warnings,
@@ -61,7 +64,9 @@ preview the email — but never actually sends anything; it just appends a `queu
 Firing (`runner`) is a separate, unattended, stateless process: it asks the DB "what's
 queued and due?" and drains it. This split means the thing that runs unsupervised at 9am
 via `launchd` has no interactive prompts, no judgment calls, and the smallest possible
-surface area — it can only do exactly what was already explicitly staged.
+surface area — it can only do exactly what was already explicitly staged. `drain()` reports
+progress via an injectable `log_fn` (default `print`) — one line per recipient as each send
+resolves, rather than a single summary at the end of the whole batch.
 
 **Idempotent two-call send.** GMass's send is two HTTP calls: create a draft, then send
 it. The draft ID is recorded in the event log the instant the first call returns —
