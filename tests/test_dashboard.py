@@ -1872,10 +1872,10 @@ def test_dashboard_survives_real_concurrent_request_threads(tmp_path, monkeypatc
 
 # --- Reach-outs: all-campaigns, filterable, read-only recipient table ------
 
-def _stage_and_send(conn, *, recipient, campaign, persona, company="", role="", req_id="",
+def _stage_and_send(conn, *, recipient, campaign, persona, company="", role="", req_id="", name="",
                      timestamp=None, send=True):
     append_event(conn, type="queued", recipient=recipient, campaign=campaign, stage=0,
-                 meta={"persona": persona, "company": company, "role": role, "req_id": req_id},
+                 meta={"persona": persona, "company": company, "role": role, "req_id": req_id, "name": name},
                  timestamp=timestamp)
     if send:
         append_event(conn, type="sent", recipient=recipient, campaign=campaign, stage=0,
@@ -2239,24 +2239,25 @@ def test_reachouts_rows_chip_stays_stopped_after_a_later_bounce_overwrites_statu
 
 def test_recipient_drop_meta_reads_latest_queued_event(conn):
     _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter",
-                     company="Acme", role="Backend Engineer", req_id="REQ-1")
+                     company="Acme", role="Backend Engineer", req_id="REQ-1", name="Cassie")
     assert _recipient_drop_meta(conn)["a@x.com"] == {
-        "company": "Acme", "role": "Backend Engineer", "req_id": "REQ-1",
+        "company": "Acme", "role": "Backend Engineer", "req_id": "REQ-1", "name": "Cassie",
     }
 
 
 def test_recipient_drop_meta_blank_for_a_queued_event_without_these_keys(conn):
     # Backward compatibility: a queued event written before this capture
-    # existed simply has no company/role/req_id keys in its meta at all.
+    # existed simply has no company/role/req_id/name keys in its meta at all.
     append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0,
                  meta={"persona": "recruiter"})
-    assert _recipient_drop_meta(conn)["a@x.com"] == {"company": "", "role": "", "req_id": ""}
+    assert _recipient_drop_meta(conn)["a@x.com"] == {"company": "", "role": "", "req_id": "", "name": ""}
 
 
 def test_recipient_drop_meta_uses_the_most_recent_queued_event(conn):
-    _stage_and_send(conn, recipient="a@x.com", campaign="c1", persona="recruiter", company="Old Co")
-    _stage_and_send(conn, recipient="a@x.com", campaign="c2", persona="founder", company="New Co")
+    _stage_and_send(conn, recipient="a@x.com", campaign="c1", persona="recruiter", company="Old Co", name="Old Name")
+    _stage_and_send(conn, recipient="a@x.com", campaign="c2", persona="founder", company="New Co", name="New Name")
     assert _recipient_drop_meta(conn)["a@x.com"]["company"] == "New Co"
+    assert _recipient_drop_meta(conn)["a@x.com"]["name"] == "New Name"
 
 
 # --- reachouts_rows ------------------------------------------------------------
@@ -2394,14 +2395,16 @@ def test_reachouts_rows_chip_active_done_queued(conn):
 
 def test_reachouts_rows_domain_company_and_req_id_present(conn):
     _stage_and_send(conn, recipient="jane@acme.com", campaign="c", persona="recruiter",
-                     company="Acme", req_id="REQ-1")
+                     company="Acme", req_id="REQ-1", name="Jane Doe")
     _stage_and_send(conn, recipient="bob@x.com", campaign="c", persona="recruiter")
 
     rows = {r["recipient"]: r for r in reachouts_rows(conn)}
     assert rows["jane@acme.com"]["domain"] == "acme.com"
     assert rows["jane@acme.com"]["company"] == "Acme"
+    assert rows["jane@acme.com"]["name"] == "Jane Doe"
     assert rows["jane@acme.com"]["req_id_present"] is True
     assert rows["bob@x.com"]["company"] == ""
+    assert rows["bob@x.com"]["name"] == ""
     assert rows["bob@x.com"]["req_id_present"] is False
 
 

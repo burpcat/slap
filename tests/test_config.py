@@ -396,3 +396,32 @@ def test_load_campaign_latex_disabled_requires_attachment_file(tmp_path):
     campaigns_dir, _ = write_campaign(tmp_path, campaign_yaml=no_attachment_yaml)
     with pytest.raises(ConfigError, match="attachment_file"):
         load_campaign("coldpost", global_config, campaigns_dir)
+
+
+def test_load_campaign_name_field_absent_defaults_to_none(tmp_path):
+    # A campaign with no personal-name field to capture (e.g. a generic
+    # team@ outreach) legitimately has nothing here — not fail-loud.
+    global_config = load_global_config(write_global_config(tmp_path))
+    campaigns_dir, _ = write_campaign(tmp_path)
+    campaign = load_campaign("coldpost", global_config, campaigns_dir)
+    assert campaign.name_field is None
+
+
+def test_load_campaign_name_field_valid(tmp_path):
+    global_config = load_global_config(write_global_config(tmp_path))
+    yaml_with_name_field = VALID_CAMPAIGN_YAML.replace(
+        "persona: recruiter", "persona: recruiter\nname_field: company"
+    )
+    campaigns_dir, _ = write_campaign(tmp_path, campaign_yaml=yaml_with_name_field)
+    campaign = load_campaign("coldpost", global_config, campaigns_dir)
+    assert campaign.name_field == "company"
+
+
+def test_load_campaign_name_field_unknown_key_fails_loud(tmp_path):
+    global_config = load_global_config(write_global_config(tmp_path))
+    yaml_with_bad_name_field = VALID_CAMPAIGN_YAML.replace(
+        "persona: recruiter", "persona: recruiter\nname_field: nonexistent_field"
+    )
+    campaigns_dir, _ = write_campaign(tmp_path, campaign_yaml=yaml_with_bad_name_field)
+    with pytest.raises(ConfigError, match="nonexistent_field"):
+        load_campaign("coldpost", global_config, campaigns_dir)

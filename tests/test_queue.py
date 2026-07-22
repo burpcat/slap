@@ -37,6 +37,32 @@ def test_stage_recipient_writes_queued_event_only_not_sent(tmp_path):
     assert row["first_sent_at"] is None  # staged, not sent
 
 
+def test_stage_recipient_records_name_in_queued_event_meta(tmp_path):
+    conn = connect(tmp_path / "test.db")
+    attachment = make_attachment(tmp_path)
+    stage_recipient(
+        conn, campaign="c", recipient="jane@acme.com", persona="recruiter", cadence=[2, 3, 5],
+        subject="Hi", body="Body", stage_bodies=["s1", "s2", "s3"],
+        attachment_path=attachment, attachment_name="Jane_Resume.pdf", latex_enabled=True,
+        name="Jane Doe", workdir_root=tmp_path / "workdir",
+    )
+    events = [dict(r) for r in conn.execute("SELECT * FROM events WHERE type = 'queued'")]
+    assert json.loads(events[0]["meta"])["name"] == "Jane Doe"
+
+
+def test_stage_recipient_name_defaults_to_blank(tmp_path):
+    conn = connect(tmp_path / "test.db")
+    attachment = make_attachment(tmp_path)
+    stage_recipient(
+        conn, campaign="c", recipient="jane@acme.com", persona="recruiter", cadence=[2, 3, 5],
+        subject="Hi", body="Body", stage_bodies=["s1", "s2", "s3"],
+        attachment_path=attachment, attachment_name="Jane_Resume.pdf", latex_enabled=True,
+        workdir_root=tmp_path / "workdir",
+    )
+    events = [dict(r) for r in conn.execute("SELECT * FROM events WHERE type = 'queued'")]
+    assert json.loads(events[0]["meta"])["name"] == ""
+
+
 def test_stage_recipient_writes_manifest_and_copies_attachment(tmp_path):
     conn = connect(tmp_path / "test.db")
     attachment = make_attachment(tmp_path)
@@ -138,7 +164,7 @@ def _write_valid_pdf(path):
 
 
 def _stage_and_bounce(conn, tmp_path, *, recipient, campaign="c", persona="recruiter",
-                      company="", role="", req_id="", latex_enabled=True, workdir_root=None,
+                      company="", role="", req_id="", name="", latex_enabled=True, workdir_root=None,
                       reason="550 no such user"):
     workdir_root = workdir_root or (tmp_path / "workdir")
     attachment = make_attachment(tmp_path, name=f"orig-{recipient.replace('@', '-')}.pdf")
@@ -146,7 +172,7 @@ def _stage_and_bounce(conn, tmp_path, *, recipient, campaign="c", persona="recru
         conn, campaign=campaign, recipient=recipient, persona=persona, cadence=[2, 3, 5],
         subject="Hi {{company}}", body="Body text", stage_bodies=["s1", "s2", "s3"],
         attachment_path=attachment, attachment_name="Resume.pdf", latex_enabled=latex_enabled,
-        company=company, role=role, req_id=req_id, workdir_root=workdir_root,
+        company=company, role=role, req_id=req_id, name=name, workdir_root=workdir_root,
     )
     append_event(conn, type="sent", recipient=recipient, campaign=campaign, stage=0, gmass_campaign_id="1")
     append_event(conn, type="bounce", recipient=recipient, campaign=campaign,
@@ -172,7 +198,7 @@ def test_resend_bounced_stages_new_recipient_with_recovered_content(tmp_path):
     )]
     assert len(events) == 1
     meta = json.loads(events[0]["meta"])
-    assert meta == {"persona": "recruiter", "company": "Acme", "role": "SWE", "req_id": "",
+    assert meta == {"persona": "recruiter", "company": "Acme", "role": "SWE", "req_id": "", "name": "",
                      "cadence": [2, 3, 5], "corrected_from": "jane@acme.com"}
 
     row = conn.execute("SELECT * FROM recipients WHERE recipient = ?", ("jane.doe@acme.com",)).fetchone()
@@ -181,6 +207,19 @@ def test_resend_bounced_stages_new_recipient_with_recovered_content(tmp_path):
     # The original bounced row is untouched -- a new recipient, not a mutation.
     original = conn.execute("SELECT * FROM recipients WHERE recipient = ?", ("jane@acme.com",)).fetchone()
     assert original["status"] == "bounced"
+
+
+def test_resend_bounced_carries_name_through(tmp_path):
+    conn = connect(tmp_path / "test.db")
+    workdir_root = _stage_and_bounce(conn, tmp_path, recipient="jane@acme.com", name="Jane Doe")
+
+    resend_bounced(conn, original_recipient="jane@acme.com",
+                    corrected_email="jane.doe@acme.com", workdir_root=workdir_root)
+
+    events = [dict(r) for r in conn.execute(
+        "SELECT * FROM events WHERE recipient = ? AND type = 'queued'", ("jane.doe@acme.com",)
+    )]
+    assert json.loads(events[0]["meta"])["name"] == "Jane Doe"
 
 
 def test_resend_bounced_raises_for_unknown_recipient(tmp_path):
