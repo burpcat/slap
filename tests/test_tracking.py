@@ -88,6 +88,19 @@ def test_queued_creates_active_recipient_with_persona_from_meta(conn):
     assert row["current_stage"] == 0
     assert row["persona"] == "recruiter"
     assert row["first_sent_at"] is None
+    assert row["cadence"] is None  # no cadence key in meta -- never fabricated
+
+
+def test_queued_populates_cadence_column_from_meta(conn):
+    # Per-recipient follow-up override (post-launch): slap.queue.stage_recipient
+    # always includes the effective cadence in the queued event's own meta --
+    # this is what lets slap.runner/slap.dashboard/slap.cleanup prefer a
+    # recipient's real, possibly-truncated cadence over the persona default.
+    import json
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter", "cadence": [2, 4]})
+    row = recipient_row(conn, "a@x.com")
+    assert json.loads(row["cadence"]) == [2, 4]
 
 
 def test_sent_sets_first_sent_at_once_and_advances_stage(conn):
@@ -337,6 +350,27 @@ def test_rebuild_reproduces_cache_identically(conn):
     rebuilt_state = all_recipients(conn)
 
     assert rebuilt_state == live_state
+
+
+def test_rebuild_reproduces_cadence_column_identically(conn):
+    # Dedicated rebuild-equivalence case for the cadence column (post-launch:
+    # per-recipient follow-up override) with a REAL, non-null, truncated
+    # cadence -- test_rebuild_reproduces_cache_identically above already
+    # covers the all-NULL case implicitly, but this repo's own convention
+    # ("tests must prove a rebuilt cache equals the live one") deserves an
+    # explicit case for the actually-new, interesting value too.
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter", "cadence": [2]}, timestamp=_ts(1))
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=0,
+                 gmass_campaign_id="1", timestamp=_ts(2))
+
+    live_row = recipient_row(conn, "a@x.com")
+    assert live_row["cadence"] == "[2]"
+
+    rebuild(conn)
+    rebuilt_row = recipient_row(conn, "a@x.com")
+
+    assert rebuilt_row == live_row
 
 
 def test_rebuild_fixes_a_corrupted_cache(conn):

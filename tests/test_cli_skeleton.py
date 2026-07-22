@@ -19,7 +19,7 @@ from pathlib import Path
 
 SLAP_PY = Path(__file__).resolve().parent.parent / "slap.py"
 ALL_COMMANDS = ["list", "send", "dashboard", "doctor", "domains", "rebuild", "runner", "sync",
-                "cleanup", "plist", "init", "template-reload", "bounced"]
+                "cleanup", "plist", "init", "onboard-campaign", "template-reload", "bounced"]
 
 
 def run(*args, cwd=None, env=None, input=None):
@@ -155,7 +155,8 @@ def test_send_never_leaks_ansi_into_the_staged_message_even_with_color_forced(tm
     conn.close()
 
     drop = f"Email: {recipient}\nCompany: Acme\n"
-    scripted_stdin = f"{drop}\n<<<EOF>>>\ny\ny\nn\n"  # drop, proceed-anyway, stage-this-send, no-more
+    # drop, proceed-anyway, follow-ups-default, stage-this-send, no-more
+    scripted_stdin = f"{drop}\n<<<EOF>>>\ny\n\ny\nn\n"
 
     env_with_key = {**os.environ, "GMASS_API_KEY": "fake-key", "FORCE_COLOR": "1"}
     env_with_key.pop("NO_COLOR", None)
@@ -210,7 +211,7 @@ def test_send_warns_about_empty_declared_fields_but_does_not_block(tmp_path):
     _setup_three_field_campaign(tmp_path)
     recipient = "jane@acme.com"
     drop = f"Email: {recipient}\nCompany: Acme\n"  # Req ID deliberately omitted -- stays empty
-    scripted_stdin = f"{drop}\n<<<EOF>>>\ny\nn\n"  # drop, stage-this-send, no-more
+    scripted_stdin = f"{drop}\n<<<EOF>>>\n\ny\nn\n"  # drop, follow-ups-default, stage-this-send, no-more
 
     env_with_key = {**os.environ, "GMASS_API_KEY": "fake-key"}
     result = run("send", "coldpost", cwd=tmp_path, env=env_with_key, input=scripted_stdin)
@@ -224,7 +225,7 @@ def test_send_no_empty_fields_warning_when_everything_is_filled(tmp_path):
     _setup_three_field_campaign(tmp_path)
     recipient = "jane@acme.com"
     drop = f"Email: {recipient}\nCompany: Acme\nReq ID: 6900\n"
-    scripted_stdin = f"{drop}\n<<<EOF>>>\ny\nn\n"
+    scripted_stdin = f"{drop}\n<<<EOF>>>\n\ny\nn\n"  # drop, follow-ups-default, stage-this-send, no-more
 
     env_with_key = {**os.environ, "GMASS_API_KEY": "fake-key"}
     result = run("send", "coldpost", cwd=tmp_path, env=env_with_key, input=scripted_stdin)
@@ -243,7 +244,7 @@ def test_send_stray_old_terminator_line_inside_paste_does_not_truncate(tmp_path)
     _setup_three_field_campaign(tmp_path)
     recipient = "jane@acme.com"
     drop = f"Email: {recipient}\nCompany: Acme\nEOF\nReq ID: 6900\n"
-    scripted_stdin = f"{drop}\n<<<EOF>>>\ny\nn\n"
+    scripted_stdin = f"{drop}\n<<<EOF>>>\n\ny\nn\n"  # drop, follow-ups-default, stage-this-send, no-more
 
     env_with_key = {**os.environ, "GMASS_API_KEY": "fake-key"}
     result = run("send", "coldpost", cwd=tmp_path, env=env_with_key, input=scripted_stdin)
@@ -670,7 +671,8 @@ def test_send_offers_resume_reuse_on_soft_warn_and_accepted(tmp_path):
 
     recipient = "jane@acme.com"
     drop = f"Email: {recipient}\nCompany: Acme\nRole: Staff Engineer\n"
-    scripted_stdin = f"{drop}\n<<<EOF>>>\ny\n1\ny\nn\n"  # drop, proceed-anyway, reuse #1, stage, no-more
+    # drop, proceed-anyway, reuse #1, follow-ups-default, stage, no-more
+    scripted_stdin = f"{drop}\n<<<EOF>>>\ny\n1\n\ny\nn\n"
 
     env = {**os.environ, "GMASS_API_KEY": "fake-key", "RESUME_ARCHIVE_DIR": str(archive_dir)}
     result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
@@ -706,7 +708,7 @@ def test_send_offers_resume_reuse_multiple_matches_selects_correct_one(tmp_path)
 
     recipient = "jane@acme.com"
     drop = f"Email: {recipient}\nCompany: Acme\nRole: Staff Engineer\n"
-    scripted_stdin = f"{drop}\n<<<EOF>>>\ny\n2\ny\nn\n"  # pick the 2nd listed match
+    scripted_stdin = f"{drop}\n<<<EOF>>>\ny\n2\n\ny\nn\n"  # pick the 2nd listed match, follow-ups-default
 
     env = {**os.environ, "GMASS_API_KEY": "fake-key", "RESUME_ARCHIVE_DIR": str(archive_dir)}
     result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
@@ -731,7 +733,8 @@ def test_send_soft_warn_no_archive_matches_falls_through_no_prompt(tmp_path):
 
     recipient = "jane@acme.com"
     drop = f"Email: {recipient}\nCompany: Acme\nRole: Staff Engineer\n"
-    scripted_stdin = f"{drop}\n<<<EOF>>>\ny\ny\nn\n"  # drop, proceed-anyway, stage, no-more (NO reuse prompt)
+    # drop, proceed-anyway, stage, no-more (NO reuse prompt), follow-ups-default before stage
+    scripted_stdin = f"{drop}\n<<<EOF>>>\ny\n\ny\nn\n"
 
     env = {**os.environ, "GMASS_API_KEY": "fake-key", "RESUME_ARCHIVE_DIR": str(archive_dir)}
     result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
@@ -748,7 +751,7 @@ def test_send_soft_warn_archive_dir_unset_falls_through_no_prompt_no_error(tmp_p
 
     recipient = "jane@acme.com"
     drop = f"Email: {recipient}\nCompany: Acme\nRole: Staff Engineer\n"
-    scripted_stdin = f"{drop}\n<<<EOF>>>\ny\ny\nn\n"
+    scripted_stdin = f"{drop}\n<<<EOF>>>\ny\n\ny\nn\n"  # proceed-anyway, follow-ups-default, stage, no-more
 
     env = {**os.environ, "GMASS_API_KEY": "fake-key"}  # RESUME_ARCHIVE_DIR left unset
     result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
@@ -771,7 +774,8 @@ def test_send_declining_resume_reuse_uses_default(tmp_path):
 
     recipient = "jane@acme.com"
     drop = f"Email: {recipient}\nCompany: Acme\nRole: Staff Engineer\n"
-    scripted_stdin = f"{drop}\n<<<EOF>>>\ny\n0\ny\nn\n"  # drop, proceed-anyway, DECLINE reuse, stage, no-more
+    # drop, proceed-anyway, DECLINE reuse, follow-ups-default, stage, no-more
+    scripted_stdin = f"{drop}\n<<<EOF>>>\ny\n0\n\ny\nn\n"
 
     env = {**os.environ, "GMASS_API_KEY": "fake-key", "RESUME_ARCHIVE_DIR": str(archive_dir)}
     result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
@@ -810,6 +814,7 @@ def test_send_reuse_of_broken_archive_entry_fails_loud_for_that_recipient_only(t
         "<<<EOF>>>",
         "y",   # proceed anyway (soft-warn, recipient2 -- jane was never staged, so still just 'other@acme.com')
         "0",   # decline reuse this time
+        "",    # follow-ups: default persona cadence
         "y",   # Stage this send?
         "n",   # Add another? -> end
         "",
@@ -897,7 +902,7 @@ def test_send_substitutes_configured_signature_in_initial_and_stage_files(tmp_pa
     _setup_signature_campaign(tmp_path)
     recipient = "jane@acme.com"
     drop = f"Email: {recipient}\nCompany: Acme\nSignoff: Best\n"
-    scripted_stdin = f"{drop}\n<<<EOF>>>\ny\nn\n"  # drop, stage, no-more
+    scripted_stdin = f"{drop}\n<<<EOF>>>\n\ny\nn\n"  # drop, follow-ups-default, stage, no-more
 
     env = {**os.environ, "GMASS_API_KEY": "fake-key"}
     result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
@@ -929,7 +934,7 @@ def test_send_empty_signature_renders_blank_with_no_error(tmp_path):
     _setup_signature_campaign(tmp_path, config_signature="")
     recipient = "jane@acme.com"
     drop = f"Email: {recipient}\nCompany: Acme\nSignoff: Best\n"
-    scripted_stdin = f"{drop}\n<<<EOF>>>\ny\nn\n"
+    scripted_stdin = f"{drop}\n<<<EOF>>>\n\ny\nn\n"  # drop, follow-ups-default, stage, no-more
 
     env = {**os.environ, "GMASS_API_KEY": "fake-key"}
     result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
@@ -1077,7 +1082,7 @@ def _stage_via_send(tmp_path, *, recipient="jane@acme.com", company="Acme"):
     call slap.reload itself is unit-tested against (see tests/test_reload.py)."""
     _setup_three_field_campaign(tmp_path)
     drop = f"Email: {recipient}\nCompany: {company}\n"
-    scripted_stdin = f"{drop}\n<<<EOF>>>\ny\nn\n"  # drop, stage-this-send, no-more
+    scripted_stdin = f"{drop}\n<<<EOF>>>\n\ny\nn\n"  # drop, follow-ups-default, stage-this-send, no-more
     env = {**os.environ, "GMASS_API_KEY": "fake-key"}
     result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
     assert result.returncode == 0, result.stdout + result.stderr

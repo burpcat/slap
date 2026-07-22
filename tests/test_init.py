@@ -341,7 +341,7 @@ def test_step_launchd_prints_plist_on_macos(tmp_path, monkeypatch, capsys):
 
 # --- full run_init() integration ------------------------------------------
 
-def test_run_init_end_to_end(tmp_path, monkeypatch):
+def test_run_init_end_to_end(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
     _copy_example_files(tmp_path)
     monkeypatch.setattr(init.platform, "system", lambda: "Linux")  # skip launchd step deterministically
@@ -361,7 +361,15 @@ def test_run_init_end_to_end(tmp_path, monkeypatch):
 
     from slap.doctor import print_report
     gc = load_global_config(tmp_path / "config.yaml")
-    assert print_report(gc) is True
+    capsys.readouterr()  # discard run_init's own output before the standalone report below
+    # The scaffolded example campaign's resume.pdf is the exact placeholder
+    # `check_placeholder_resume` (post-launch, onboard-campaign) exists to
+    # flag -- print_report correctly returns False here until it's replaced,
+    # not a regression. Assert THAT's the one and only thing wrong.
+    assert print_report(gc) is False
+    out = capsys.readouterr().out
+    assert "resume placeholder: FAIL" in out
+    assert "attachment_file: OK" in out
 
 
 def test_run_init_is_fully_idempotent_on_second_run(tmp_path, monkeypatch):

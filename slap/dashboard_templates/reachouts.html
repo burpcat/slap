@@ -21,7 +21,7 @@
 <div class="filters">
   <div class="field">
     <label for="f-search">Search</label>
-    <input type="search" id="f-search" placeholder="recipient or company">
+    <input type="search" id="f-search" placeholder="recipient, company, or name">
   </div>
   <div class="field">
     <label for="f-campaign">Campaign</label>
@@ -102,6 +102,7 @@
 <table class="data-table" id="reachouts-table">
   <thead>
     <tr>
+      <th data-sort="name">Name <span class="arrow"></span></th>
       <th data-sort="recipient">Recipient <span class="arrow"></span></th>
       <th data-sort="company">Company <span class="arrow"></span></th>
       <th data-sort="campaign">Campaign <span class="arrow"></span></th>
@@ -116,6 +117,7 @@
   <tbody>
     {% for r in rows %}
     <tr class="row"
+        data-name="{{ r.name }}"
         data-recipient="{{ r.recipient }}"
         data-company="{{ r.company }}"
         data-campaign="{{ r.campaign or '' }}"
@@ -126,7 +128,8 @@
         data-domain="{{ r.domain }}"
         data-req-id="{{ 'present' if r.req_id_present else 'blank' }}"
         data-date="{{ r.date_local or '' }}"
-        data-search="{{ (r.recipient ~ ' ' ~ r.company) | lower }}">
+        data-search="{{ (r.recipient ~ ' ' ~ r.company ~ ' ' ~ r.name) | lower }}">
+      <td>{{ r.name if r.name else '—' }}</td>
       <td>{{ r.recipient }}</td>
       <td>{{ r.company if r.company else '—' }}</td>
       <td>{{ r.campaign or '—' }}</td>
@@ -189,7 +192,7 @@
     </tr>
     {% if r.clicks or r.corrected_from or r.already_corrected_to %}
     <tr class="detail-row">
-      <td colspan="9">
+      <td colspan="10">
         {% if r.corrected_from %}
         <div>&#8617; corrected from <strong>{{ r.corrected_from }}</strong></div>
         {% endif %}

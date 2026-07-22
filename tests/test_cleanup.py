@@ -108,6 +108,24 @@ def test_classify_active_within_cadence_window_is_not_yet_even_if_idle_15_days(t
     assert "cadence window" in v.reason
 
 
+def test_classify_prefers_recipients_own_cadence_over_persona_default(tmp_path):
+    # Per-recipient follow-up override (post-launch): this recipient's own
+    # queued-event cadence ([2,3,5], sum 10d) must drive the cadence-window
+    # check -- not the persona's config default ([10,15,15], sum 40d), which
+    # would keep this recipient "not_yet" long after its OWN shorter cadence
+    # window has actually elapsed.
+    conn = connect(tmp_path / "t.db")
+    long_cadence_config = make_global_config(tmp_path, personas={"recruiter": [10, 15, 15]})
+    append_event(conn, type="queued", recipient="f@x.com", campaign="c1", stage=0,
+                 meta={"persona": "recruiter", "cadence": [2, 3, 5]}, timestamp=days_ago(17))
+    append_event(conn, type="sent", recipient="f@x.com", campaign="c1", stage=0,
+                 meta={"is_final_stage": False}, timestamp=days_ago(16))
+
+    v = classify_recipient(conn, "c1", "f@x.com", long_cadence_config, now=NOW)
+    assert v.status == "eligible"
+    assert "cadence window elapsed" in v.reason
+
+
 def test_classify_replied_is_never_eligible(tmp_path):
     conn = connect(tmp_path / "t.db")
     append_event(conn, type="queued", recipient="e@x.com", campaign="c1", stage=0,

@@ -24,7 +24,14 @@ from pathlib import Path
 import yaml
 
 from slap import display, doctor
-from slap.config import VALID_DAYS, ConfigError, load_global_config
+from slap.config import ConfigError, load_global_config
+from slap.prompts import ask as _ask
+from slap.prompts import ask_days as _ask_days
+from slap.prompts import ask_email as _ask_email
+from slap.prompts import ask_int as _ask_int
+from slap.prompts import ask_time as _ask_time
+from slap.prompts import ask_yn as _ask_yn
+from slap.prompts import placeholder_pdf as _placeholder_pdf
 
 CONFIG_PATH = Path("config.yaml")
 CONFIG_EXAMPLE_PATH = Path("config.yaml.example")
@@ -32,87 +39,18 @@ ENV_PATH = Path(".env")
 ENV_EXAMPLE_PATH = Path(".env.example")
 CAMPAIGNS_DIR = Path("campaigns")
 
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-_TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
-
 
 class InitError(Exception):
     """Raised on a fail-loud structural problem init cannot recover from
     (e.g. a required .example template is missing from the repo)."""
 
 
-# --- small interactive helpers ----------------------------------------------
-
-def _ask(prompt: str, *, default: str = None, read_line=input) -> str:
-    suffix = f" [{default}]" if default is not None else ""
-    while True:
-        raw = read_line(f"{prompt}{suffix}: ").strip()
-        if raw:
-            return raw
-        if default is not None:
-            return default
-        display.warn("  This field is required — please enter a value.")
-
-
-def _ask_yn(prompt: str, *, default: bool = True, read_line=input) -> bool:
-    suffix = " [Y/n]" if default else " [y/N]"
-    while True:
-        raw = read_line(f"{prompt}{suffix}: ").strip().lower()
-        if not raw:
-            return default
-        if raw in ("y", "yes"):
-            return True
-        if raw in ("n", "no"):
-            return False
-        display.warn("  Please answer y or n.")
-
-
-def _ask_email(prompt: str, *, default: str = None, read_line=input) -> str:
-    while True:
-        value = _ask(prompt, default=default, read_line=read_line)
-        if _EMAIL_RE.match(value):
-            return value
-        display.warn(f"  {value!r} doesn't look like a valid email address — try again.")
-
-
-def _ask_int(prompt: str, *, default: int, min_value: int = None, read_line=input) -> int:
-    while True:
-        raw = _ask(prompt, default=str(default), read_line=read_line)
-        try:
-            value = int(raw)
-        except ValueError:
-            display.warn(f"  {raw!r} is not a whole number — try again.")
-            continue
-        if min_value is not None and value < min_value:
-            display.warn(f"  Must be >= {min_value} — try again.")
-            continue
-        return value
-
-
-def _ask_time(prompt: str, *, default: str, read_line=input) -> str:
-    while True:
-        raw = _ask(prompt, default=default, read_line=read_line)
-        if _TIME_RE.match(raw):
-            return raw
-        display.warn(f"  {raw!r} isn't 24-hour HH:MM time — try again (e.g. 09:00).")
-
-
-def _ask_days(prompt: str, *, default: list, read_line=input) -> list:
-    default_str = ",".join(default)
-    while True:
-        raw = _ask(f"{prompt} (comma-separated)", default=default_str, read_line=read_line)
-        days = [d.strip().lower() for d in raw.split(",") if d.strip()]
-        invalid = [d for d in days if d not in VALID_DAYS]
-        if invalid:
-            display.warn(f"  Not a valid day name: {invalid} — use one of {VALID_DAYS}")
-            continue
-        if len(set(days)) != len(days):
-            display.warn("  Duplicate day(s) in that list — try again.")
-            continue
-        if not days:
-            display.warn("  Need at least one active day.")
-            continue
-        return days
+# --- small interactive helpers -----------------------------------------------
+# `_ask`/`_ask_yn`/`_ask_email`/`_ask_int`/`_ask_time`/`_ask_days` (and
+# `_placeholder_pdf` below) used to be defined here; they moved to
+# `slap/prompts.py` once `slap/onboard.py` needed the exact same primitives,
+# and are re-imported under their original private names above so nothing
+# else in this module (or its tests) has to change.
 
 
 # --- config.yaml patching (preserves comments/formatting) -------------------
@@ -151,18 +89,6 @@ def _set_env_value(path: Path, key: str, value: str) -> None:
             return
     lines.append(f"{key}={value}")
     path.write_text("\n".join(lines) + "\n")
-
-
-def _placeholder_pdf() -> bytes:
-    """Smallest valid one-page PDF — a scaffold placeholder only, clearly
-    meant to be replaced before a real send (doctor still passes with it in
-    place, so a fresh init doesn't show a false-negative right after setup)."""
-    return (
-        b"%PDF-1.1\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
-        b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
-        b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]>>endobj\n"
-        b"trailer<</Root 1 0 R>>\n%%EOF"
-    )
 
 
 EXAMPLE_CAMPAIGN_FILES = {

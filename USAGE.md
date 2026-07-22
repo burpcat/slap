@@ -38,6 +38,26 @@ send  ──stages──>  queue (SQLite events)  ──drains──>  GMass  �
 Campaigns are auto-discovered: any folder under `campaigns/` with a valid
 `campaign.yaml` is live — no registry to update, nothing else to wire up.
 
+The easiest way to create one is the interactive wizard:
+
+```bash
+python slap.py onboard-campaign
+```
+
+It walks you through: a campaign folder name, picking a persona (which fixes how many
+follow-ups you'll author, since a persona's cadence length is fixed), composing the
+initial email, declaring its variables (auto-detected from `{{key}}` placeholders as you
+paste — you're only asked to label/optional-flag ones it doesn't already know), composing
+exactly as many follow-ups as the persona's cadence needs, a review panel showing the
+whole template set with every placeholder highlighted, then the rest of `campaign.yaml`
+(LaTeX on/off, attachment filename, and — for a static campaign — a path to a real résumé
+PDF, or a scaffolded placeholder if you don't have one ready yet). Nothing is written to
+disk until you confirm the review. The result is validated the same way `send`/`doctor`
+validate any other campaign before it declares success.
+
+The rest of this section describes the folder shape by hand, for reference or if you'd
+rather write the files yourself:
+
 ```
 campaigns/
   my-campaign/
@@ -179,10 +199,17 @@ python slap.py send my-campaign
      **reuse** it instead of the campaign's default résumé — see "Résumé archive
      (optional)" below. `0` (or just pressing enter) declines and uses the default; this
      is an offer, never forced.
-4. **Preview** — the exact rendered subject + body, the attachment name (or which archived
-   résumé you chose to reuse, if you did), and the cadence about to be applied. Nothing is
-   sent yet.
-5. **`Stage this send? [y/N]`** — `y` writes a `queued` event and staged message data to
+4. **`Follow-ups for this recipient? [0-N, default N]`** — per-recipient cadence override.
+   Press enter to keep the persona's full cadence (the default), or type a smaller number
+   (down to `0`, meaning only the initial email goes out, no follow-ups at all) if this
+   particular recipient doesn't warrant the persona's usual follow-up intensity. This
+   truncates the persona's cadence to a PREFIX — there's no way to skip stage 2 but keep
+   stage 3, since a cadence is an ordered sequence of day-offsets, not independently
+   pickable stages.
+5. **Preview** — the exact rendered subject + body, the attachment name (or which archived
+   résumé you chose to reuse, if you did), and the cadence that will actually be staged
+   (reflecting your answer to the previous prompt). Nothing is sent yet.
+6. **`Stage this send? [y/N]`** — `y` writes a `queued` event and staged message data to
    `workdir/`; the recipient now sits in the queue until the runner (or `--now`) drains
    it. `n` discards this recipient.
 6. **`Add another? [Y/n]`** — loops back to step 1 for the next recipient, or exits.
