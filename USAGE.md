@@ -334,7 +334,7 @@ company, to reuse for the new recipient instead of the campaign's usual
 python slap.py dashboard
 ```
 
-Opens `http://127.0.0.1:5050`. Six pages share one header/nav bar, a light/dark theme
+Opens `http://127.0.0.1:5050`. Seven pages share one header/nav bar, a light/dark theme
 toggle (top right — cycles Auto → Light → Dark, remembers your choice), and, only when
 the most recent `template-reload` run left at least one recipient un-reloaded, a
 **"Template Failures"** nav link listing who, in which campaign, and why (see "Editing a
@@ -383,6 +383,23 @@ depends on GMass's own report data):
 - **Warm but silent — clicked, no reply** — the highest-value signal on the whole
   dashboard: someone opened a tracked link but hasn't replied yet. The message landed and
   was read; it's just unanswered. Worth a manual nudge.
+
+**Analytics** (`/analytics`) — the dashboard's charts, always instant (nothing here
+depends on GMass's own report data):
+
+- **Sent & replies trend** — a line chart of daily new-sends, follow-up-sends, and
+  replies, with a 7/30/90-day toggle.
+- **Bounce & block volume** and **top bounce/block reasons** — the same category/reason
+  data as Deliverability's Bounces & Blocks widget, charted as a weekly trend and a
+  most-common-reasons bar chart.
+- **Reply rate by persona** and **time to first reply** — chart versions of Engagement
+  intelligence's tables.
+- **Weekly goal pacing** — only shown if you've set `schedule.weekly_target` in
+  `config.yaml`: a progress gauge for new-recipient sends against your own weekly target.
+  Omit the config key to hide this widget entirely.
+
+Every chart has a "View as table" link underneath showing the same numbers as plain rows —
+nothing here is chart-only.
 
 **Deliverability** (`/deliverability`) — why a recipient stopped moving:
 

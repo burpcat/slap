@@ -17,7 +17,10 @@ event-sourced SQLite store with a localhost dashboard for monitoring and reply t
 **Stack:** Python 3, stdlib `argparse` for the CLI, SQLite for storage, Flask for the
 localhost dashboard, `requests` for the GMass HTTP client, `PyYAML` for config, `pypdf`
 for LaTeX page-counting. No ORM, no task queue, no background worker framework — the
-"runner" is a plain script fired by macOS `launchd`.
+"runner" is a plain script fired by macOS `launchd`. The dashboard's only non-Python
+frontend dependency is a single vendored Chart.js build (`slap/static/vendor/chart.min.js`,
+Analytics page only) — no CDN reference at runtime, no npm/bundler step; every other
+dashboard page is still plain server-rendered HTML/CSS/vanilla JS.
 
 **Build approach — verify before building, then build in dependency order.** Rather than
 implementing against the GMass API's documented shape, the project started with a

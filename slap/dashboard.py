@@ -404,6 +404,89 @@ def engagement_intelligence(conn) -> dict:
     }
 
 
+# --- Analytics page ------------------------------------------------------
+
+def sent_reply_trend(conn, days: int = 30, *, today: date = None) -> list:
+    """Daily new-sent / follow-up-sent / reply counts for the trailing
+    `days` days (oldest first) — the Analytics page's trend line. Reuses
+    the same per-day helpers (_sent_split/_count_events_on) every other stat
+    strip on this dashboard already uses, rather than a second independent
+    query, so this can never disagree with today_strip()/this_week() about
+    what counts as "today"."""
+    today = today or date.today()
+    series = []
+    for offset in range(days - 1, -1, -1):
+        day = today - timedelta(days=offset)
+        split = _sent_split(conn, day, day)
+        series.append({
+            "date": day.isoformat(),
+            "new": split["new"],
+            "follow_up": split["follow_up"],
+            "replies": _count_events_on(conn, "reply", day),
+        })
+    return series
+
+
+def bounce_breakdown(conn, weeks: int = 12, *, today: date = None) -> dict:
+    """Bounce/block volume trended by week, plus the most common reason
+    strings all-time — a chart-friendly rollup of the same
+    meta.category/meta.bounce_reason data bounces()/_latest_bounce_meta()
+    already surface per-recipient on the Deliverability page."""
+    rows = conn.execute("SELECT timestamp, meta FROM events WHERE type = 'bounce'").fetchall()
+    today = today or date.today()
+    earliest_week_start = (today - timedelta(days=7 * (weeks - 1)))
+    earliest_week_start -= timedelta(days=earliest_week_start.weekday())
+
+    by_week: dict = {}
+    reason_counts: dict = {}
+    for row in rows:
+        meta = json.loads(row["meta"]) if row["meta"] else {}
+        d = _local_date(row["timestamp"])
+        week_start = d - timedelta(days=d.weekday())
+        if week_start < earliest_week_start:
+            continue
+        bucket = by_week.setdefault(week_start, {"bounce": 0, "block": 0})
+        category = meta.get("category", "bounce")
+        bucket["block" if category == "block" else "bounce"] += 1
+        reason = meta.get("bounce_reason") or "(no reason given)"
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+    by_category_over_time = []
+    for i in range(weeks):
+        week_start = earliest_week_start + timedelta(days=7 * i)
+        bucket = by_week.get(week_start, {"bounce": 0, "block": 0})
+        by_category_over_time.append({
+            "week_start": week_start.isoformat(),
+            "bounce": bucket["bounce"],
+            "block": bucket["block"],
+        })
+
+    ranked = sorted(reason_counts.items(), key=lambda kv: kv[1], reverse=True)
+    top_reasons = [{"reason": reason, "count": count} for reason, count in ranked[:5]]
+    other_count = sum(count for _, count in ranked[5:])
+    if other_count:
+        top_reasons.append({"reason": "other", "count": other_count})
+
+    return {"by_category_over_time": by_category_over_time, "top_reasons": top_reasons}
+
+
+def weekly_goal_progress(conn, weekly_target: int = None, *, today: date = None) -> dict | None:
+    """None when schedule.weekly_target isn't configured (feature off) —
+    the Analytics page's pacing gauge is simply omitted, never shown with a
+    fabricated target. `actual` counts only NEW-recipient sends this
+    rolling week (this_week()'s own "new" split), not follow-ups — those
+    fire automatically via GMass's own cadence and aren't a deliberate,
+    goal-worthy action the owner paces against."""
+    if weekly_target is None:
+        return None
+    actual = this_week(conn, today=today)["sent"]["new"]
+    return {
+        "target": weekly_target,
+        "actual": actual,
+        "pct": round(100 * actual / weekly_target),
+    }
+
+
 def needs_triage(conn) -> list:
     """Recipients who replied but haven't been tagged real/OOO/not-interested
     yet (§8's actionable Replies section). A later `ooo_tagged` or
@@ -1874,6 +1957,26 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
             cache_status=gmass_data["cache_status"],
             bounces=gmass_data["bounces"],
             stopped_outreach=stopped_outreach_roster(conn),
+        )
+
+    @app.route("/analytics")
+    def analytics_page():
+        # Analytics: trend/comparison charts, all derived from local
+        # events + config — deliberately zero GMass/Redis dependency (same
+        # as Pipeline/Reachouts/Logs), so this page is always instant and
+        # never shows the stale-cache banner.
+        conn = get_conn()
+        days = request.args.get("days", 30, type=int)
+        if days not in (7, 30, 90):
+            days = 30
+        return render_template(
+            "analytics.html",
+            trend=sent_reply_trend(conn, days=days),
+            trend_days=days,
+            bounce_data=bounce_breakdown(conn),
+            reply_rate_by_persona=_reply_rate_by_persona(conn),
+            time_to_first_reply=_time_to_first_reply_distribution(conn),
+            weekly_goal=weekly_goal_progress(conn, global_config.schedule.weekly_target),
         )
 
     @app.route("/warm-but-silent/<string:recipient>/hide", methods=["POST"])

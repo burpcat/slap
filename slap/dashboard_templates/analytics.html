@@ -1,0 +1,270 @@
+{% extends "base.html" %}
+{% block title %}slap dashboard — analytics{% endblock %}
+{% block content %}
+
+<div class="panels">
+
+  {% if weekly_goal %}
+  <div class="panel">
+    <h2>Weekly goal pacing</h2>
+    <div class="label">
+      New outreach this week: {{ weekly_goal.actual }} / {{ weekly_goal.target }} ({{ weekly_goal.pct }}%)
+    </div>
+    {% set severity = 'good' if weekly_goal.pct >= 100 else ('warning' if weekly_goal.pct >= 50 else 'critical') %}
+    <div class="gauge-track {{ severity }}">
+      <div class="gauge-fill {{ severity }}" style="width: {{ [weekly_goal.pct, 100] | min }}%"></div>
+    </div>
+  </div>
+  {% endif %}
+
+  <div class="panel full">
+    <h2>Sent &amp; replies trend</h2>
+    <div class="range-toggle">
+      {% for d in [7, 30, 90] %}
+      <a href="{{ url_for('analytics_page', days=d) }}" class="{{ 'current' if trend_days == d }}">{{ d }}d</a>
+      {% endfor %}
+    </div>
+    {% if trend | sum(attribute='new') or trend | sum(attribute='follow_up') or trend | sum(attribute='replies') %}
+    <div class="chart-container"><canvas id="trendChart"></canvas></div>
+    {% else %}
+    <p class="empty">No send/reply activity in this window yet.</p>
+    {% endif %}
+    <details class="table-view">
+      <summary>View as table</summary>
+      <table>
+        <tr><th>Date</th><th class="num">New</th><th class="num">Follow-up</th><th class="num">Replies</th></tr>
+        {% for row in trend %}
+        <tr><td>{{ row.date }}</td><td class="num">{{ row.new }}</td><td class="num">{{ row.follow_up }}</td><td class="num">{{ row.replies }}</td></tr>
+        {% endfor %}
+      </table>
+    </details>
+  </div>
+
+  <div class="panel">
+    <h2>Bounce &amp; block volume</h2>
+    {% if bounce_data.by_category_over_time | sum(attribute='bounce') or bounce_data.by_category_over_time | sum(attribute='block') %}
+    <div class="chart-container short"><canvas id="bounceTrendChart"></canvas></div>
+    {% else %}
+    <p class="empty">No bounces or blocks yet.</p>
+    {% endif %}
+    <details class="table-view">
+      <summary>View as table</summary>
+      <table>
+        <tr><th>Week of</th><th class="num">Bounce</th><th class="num">Block</th></tr>
+        {% for row in bounce_data.by_category_over_time %}
+        <tr><td>{{ row.week_start }}</td><td class="num">{{ row.bounce }}</td><td class="num">{{ row.block }}</td></tr>
+        {% endfor %}
+      </table>
+    </details>
+  </div>
+
+  <div class="panel">
+    <h2>Top bounce/block reasons</h2>
+    {% if bounce_data.top_reasons %}
+    <div class="chart-container short"><canvas id="bounceReasonsChart"></canvas></div>
+    {% else %}
+    <p class="empty">No bounces or blocks yet.</p>
+    {% endif %}
+    <details class="table-view">
+      <summary>View as table</summary>
+      <table>
+        <tr><th>Reason</th><th class="num">Count</th></tr>
+        {% for row in bounce_data.top_reasons %}
+        <tr><td class="reason" title="{{ row.reason }}">{{ row.reason }}</td><td class="num">{{ row.count }}</td></tr>
+        {% else %}
+        <tr><td colspan="2" class="empty">no data yet</td></tr>
+        {% endfor %}
+      </table>
+    </details>
+  </div>
+
+  <div class="panel">
+    <h2>Reply rate by persona</h2>
+    {% if reply_rate_by_persona %}
+    <div class="chart-container short"><canvas id="personaChart"></canvas></div>
+    {% else %}
+    <p class="empty">No persona data yet.</p>
+    {% endif %}
+    <details class="table-view">
+      <summary>View as table</summary>
+      <table>
+        <tr><th>Persona</th><th class="num">Reply rate</th></tr>
+        {% for persona, rate in reply_rate_by_persona.items() %}
+        <tr><td>{{ persona }}</td><td class="num">{{ rate }}%</td></tr>
+        {% else %}
+        <tr><td colspan="2" class="empty">no data yet</td></tr>
+        {% endfor %}
+      </table>
+    </details>
+  </div>
+
+  <div class="panel">
+    <h2>Time to first reply</h2>
+    {% if time_to_first_reply.values() | sum %}
+    <div class="chart-container short"><canvas id="timeToReplyChart"></canvas></div>
+    {% else %}
+    <p class="empty">No replies yet.</p>
+    {% endif %}
+    <details class="table-view">
+      <summary>View as table</summary>
+      <table>
+        <tr><th>Time to first reply</th><th class="num">Count</th></tr>
+        <tr><td>Same day</td><td class="num">{{ time_to_first_reply.same_day }}</td></tr>
+        <tr><td>1-2 days</td><td class="num">{{ time_to_first_reply['1_2_days'] }}</td></tr>
+        <tr><td>3-7 days</td><td class="num">{{ time_to_first_reply['3_7_days'] }}</td></tr>
+        <tr><td>8+ days</td><td class="num">{{ time_to_first_reply['8_plus_days'] }}</td></tr>
+      </table>
+    </details>
+  </div>
+
+</div>
+
+{% endblock %}
+{% block extra_js %}
+<script src="{{ url_for('static', filename='vendor/chart.min.js') }}"></script>
+<script>
+(function () {
+  var TREND = {{ trend | tojson }};
+  var BOUNCE = {{ bounce_data | tojson }};
+  var PERSONA = {{ reply_rate_by_persona | tojson }};
+  var TIME_TO_REPLY = {{ time_to_first_reply | tojson }};
+
+  // Validated categorical/ordinal steps — see the dataviz skill's
+  // palette.md. Not eyeballed: run scripts/validate_palette.js against
+  // any of these before changing a hex here.
+  var PALETTE = {
+    light: { s1: '#2a78d6', s2: '#008300', s3: '#e87ba4',
+             ink: '#0b0b0b', inkSecondary: '#52514e', inkMuted: '#898781',
+             grid: '#e1e0d9', surface: '#fcfcfb' },
+    dark:  { s1: '#3987e5', s2: '#008300', s3: '#d55181',
+             ink: '#ffffff', inkSecondary: '#c3c2b7', inkMuted: '#898781',
+             grid: '#2c2c2a', surface: '#1a1a19' }
+  };
+  var ORDINAL = {
+    light: ['#86b6ef', '#5598e7', '#2a78d6', '#1c5cab'],
+    dark:  ['#9ec5f4', '#5598e7', '#256abf', '#184f95']
+  };
+
+  var charts = [];
+  function destroyAll() {
+    charts.forEach(function (c) { c.destroy(); });
+    charts = [];
+  }
+
+  function baseOptions(colors) {
+    return {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: colors.inkSecondary } } },
+      scales: {
+        x: { grid: { color: colors.grid, drawTicks: false }, ticks: { color: colors.inkMuted } },
+        y: { beginAtZero: true, grid: { color: colors.grid }, ticks: { color: colors.inkMuted, precision: 0 } }
+      }
+    };
+  }
+
+  function buildCharts() {
+    var mode = window.slapEffectiveTheme ? window.slapEffectiveTheme() : 'light';
+    var colors = PALETTE[mode];
+    var ordinal = ORDINAL[mode];
+    Chart.defaults.font.family = "system-ui, -apple-system, 'Segoe UI', sans-serif";
+    Chart.defaults.color = colors.inkMuted;
+
+    var trendEl = document.getElementById('trendChart');
+    if (trendEl) {
+      var opts = baseOptions(colors);
+      opts.interaction = { mode: 'index', intersect: false };
+      charts.push(new Chart(trendEl, {
+        type: 'line',
+        data: {
+          labels: TREND.map(function (r) { return r.date; }),
+          datasets: [
+            { label: 'New', data: TREND.map(function (r) { return r.new; }),
+              borderColor: colors.s1, backgroundColor: colors.s1, borderWidth: 2, pointRadius: 2, tension: 0.15 },
+            { label: 'Follow-up', data: TREND.map(function (r) { return r.follow_up; }),
+              borderColor: colors.s2, backgroundColor: colors.s2, borderWidth: 2, pointRadius: 2, tension: 0.15 },
+            { label: 'Replies', data: TREND.map(function (r) { return r.replies; }),
+              borderColor: colors.s3, backgroundColor: colors.s3, borderWidth: 2, pointRadius: 2, tension: 0.15 }
+          ]
+        },
+        options: opts
+      }));
+    }
+
+    var bounceTrendEl = document.getElementById('bounceTrendChart');
+    if (bounceTrendEl) {
+      var bOpts = baseOptions(colors);
+      bOpts.scales.x.stacked = true;
+      bOpts.scales.y.stacked = true;
+      charts.push(new Chart(bounceTrendEl, {
+        type: 'bar',
+        data: {
+          labels: BOUNCE.by_category_over_time.map(function (r) { return r.week_start; }),
+          datasets: [
+            { label: 'Bounce', data: BOUNCE.by_category_over_time.map(function (r) { return r.bounce; }),
+              backgroundColor: colors.s1, borderColor: colors.surface, borderWidth: 2, borderRadius: 4,
+              maxBarThickness: 24, stack: 'x' },
+            { label: 'Block', data: BOUNCE.by_category_over_time.map(function (r) { return r.block; }),
+              backgroundColor: colors.s2, borderColor: colors.surface, borderWidth: 2, borderRadius: 4,
+              maxBarThickness: 24, stack: 'x' }
+          ]
+        },
+        options: bOpts
+      }));
+    }
+
+    var reasonsEl = document.getElementById('bounceReasonsChart');
+    if (reasonsEl) {
+      var rOpts = baseOptions(colors);
+      rOpts.indexAxis = 'y';
+      rOpts.plugins.legend.display = false;
+      charts.push(new Chart(reasonsEl, {
+        type: 'bar',
+        data: {
+          labels: BOUNCE.top_reasons.map(function (r) { return r.reason; }),
+          datasets: [{ data: BOUNCE.top_reasons.map(function (r) { return r.count; }),
+                       backgroundColor: colors.s1, borderRadius: 4, maxBarThickness: 24 }]
+        },
+        options: rOpts
+      }));
+    }
+
+    var personaEl = document.getElementById('personaChart');
+    if (personaEl) {
+      var pOpts = baseOptions(colors);
+      pOpts.plugins.legend.display = false;
+      pOpts.scales.y.suggestedMax = 100;
+      charts.push(new Chart(personaEl, {
+        type: 'bar',
+        data: {
+          labels: Object.keys(PERSONA),
+          datasets: [{ data: Object.values(PERSONA), backgroundColor: colors.s1, borderRadius: 4, maxBarThickness: 24 }]
+        },
+        options: pOpts
+      }));
+    }
+
+    var ttrEl = document.getElementById('timeToReplyChart');
+    if (ttrEl) {
+      var tOpts = baseOptions(colors);
+      tOpts.plugins.legend.display = false;
+      var labels = ['Same day', '1-2 days', '3-7 days', '8+ days'];
+      var values = [TIME_TO_REPLY.same_day, TIME_TO_REPLY['1_2_days'], TIME_TO_REPLY['3_7_days'], TIME_TO_REPLY['8_plus_days']];
+      charts.push(new Chart(ttrEl, {
+        type: 'bar',
+        data: { labels: labels, datasets: [{ data: values, backgroundColor: ordinal, borderRadius: 4, maxBarThickness: 24 }] },
+        options: tOpts
+      }));
+    }
+  }
+
+  function rebuild() {
+    destroyAll();
+    buildCharts();
+  }
+
+  rebuild();
+  window.addEventListener('slap-theme-changed', rebuild);
+})();
+</script>
+{% endblock %}

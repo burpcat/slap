@@ -81,6 +81,11 @@ class ScheduleConfig:
     daily_cap: int
     drain_retries: int
     active_days: list  # e.g. ["mon", "tue", "wed", "thu", "fri"] — days the unattended runner may drain
+    # Optional (unlike every other ScheduleConfig field, all of which are
+    # _require()'d below) — the dashboard's weekly-goal-pacing widget on the
+    # Analytics page. None means "not configured," so the widget is simply
+    # omitted rather than shown with a fabricated target.
+    weekly_target: int = None
 
 
 @dataclass
@@ -206,6 +211,16 @@ def load_global_config(path: Path = CONFIG_PATH) -> GlobalConfig:
     active_days_raw = _require(sched_raw, "active_days", schedule_ctx)
     active_days = _validate_day_list(active_days_raw, f"{schedule_ctx}.active_days")
 
+    # Optional, unlike every field above — absent entirely -> None -> the
+    # Analytics page's weekly-goal-pacing widget is simply not shown (see
+    # dashboard.weekly_goal_progress()). Present-but-invalid still fails
+    # loud, same as every other malformed schedule value here.
+    weekly_target = sched_raw.get("weekly_target")
+    if weekly_target is not None and (
+        not isinstance(weekly_target, int) or isinstance(weekly_target, bool) or weekly_target <= 0
+    ):
+        raise ConfigError(f"{schedule_ctx}.weekly_target must be a positive integer — got {weekly_target!r}")
+
     schedule = ScheduleConfig(
         fire_window_start=schedule_values["fire_window_start"],
         fire_window_end=schedule_values["fire_window_end"],
@@ -214,6 +229,7 @@ def load_global_config(path: Path = CONFIG_PATH) -> GlobalConfig:
         daily_cap=schedule_values["daily_cap"],
         drain_retries=schedule_values["drain_retries"],
         active_days=active_days,
+        weekly_target=weekly_target,
     )
 
     consumer_domains_file = _require(raw, "tracking.consumer_domains_file", path)
