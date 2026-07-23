@@ -143,7 +143,8 @@ slap/                       # package:
     queue.py                    #   stage_recipient(), due_recipients(), OOO tag_ooo()/due_for_ooo_resend()
     runner.py                   #   drain() (log_fn per-recipient progress), wait_for_fire_window(), is_active_day(), OOO resend
     reload.py                    #   template-reload: scan()/apply_changes()/write_failures()/load_failures()
-    dashboard.py + dashboard_templates/{base,dashboard,pipeline,engagement,deliverability,reachouts,template_failures,logs}.html   # Flask app, all pages
+    dashboard.py + dashboard_templates/{base,dashboard,pipeline,engagement,analytics,deliverability,reachouts,template_failures,logs}.html   # Flask app, all pages
+    static/{dashboard.css,vendor/chart.min.js}   #   dashboard's shared stylesheet + vendored Chart.js (Analytics page's charts)
     doctor.py                    #   preflight checks (global + per-campaign), wired into send + drain
     cleanup.py                   #   stale-PDF classification/deletion (`cleanup` command)
     archive.py                   #   résumé archive (RESUME_ARCHIVE_DIR) + résumé-reuse lookup
@@ -371,12 +372,15 @@ but still the only place with any *data* interaction logic.)
 **Dashboard — current shipped state, not a wishlist (see §8 for full detail).** The
 single-scrolling-page layout this doc described through the multi-page redesign (below)
 is gone — confirm any future dashboard claim against `slap/dashboard_templates/*.html`
-directly rather than this doc's prose. As of this snapshot the dashboard is six pages
+directly rather than this doc's prose. As of this snapshot the dashboard is seven pages
 sharing one `base.html` layout (nav, theme toggle, sync/cache-status banner): **Home**
 (`/`: Metrics, Replies needing triage, Next drain, Today's runs), **Pipeline**
 (`/pipeline`: Active leads, Follow-up reminders, Pipeline, Companies contacted, zero
 GMass-cache dependency), **Engagement** (`/engagement`: Engagement intelligence, Warm but
-silent), **Deliverability** (`/deliverability`: Bounces & blocks, Stopped outreach),
+silent), **Analytics** (`/analytics`: sent/replies trend, bounce/block breakdown, reply
+rate by persona, time-to-first-reply histogram, an optional weekly-goal-pacing gauge —
+zero GMass-cache dependency, the dashboard's first charts, see the dedicated entry below),
+**Deliverability** (`/deliverability`: Bounces & blocks, Stopped outreach),
 **Logs** (`/logs`: every `events` row, filterable/sortable, plus a tail of the raw
 `runner.log`/`runner.err.log`/`sync.log`/`sync.err.log` launchd-job output — zero GMass-cache
 dependency, same as Pipeline), plus `/reachouts` and, only while at least one unresolved
@@ -631,6 +635,41 @@ prints one progress line per recipient as each send resolves — previously `dra
 completely silent per-recipient, so a real multi-minute throttled batch (run manually) looked
 indistinguishable from a hang, which is what actually prompted adding it.
 
+**Analytics page (`/analytics`) — a seventh page, the dashboard's first charts.** Every prior
+page rendered engagement/pipeline/deliverability data as plain HTML tables and CSS stat
+tiles/gauges; this is the first use of a charting library. Vendored **Chart.js** (a single
+pinned UMD build, `slap/static/vendor/chart.min.js`, ~200KB, no CDN reference at runtime, no
+npm/bundler step — matches the project's zero-build-step convention) rather than hand-rolling
+canvas drawing. Colors/mark specs follow the `dataviz` skill's method exactly (validated via
+its `scripts/validate_palette.js`, not eyeballed): the trend line's 3 series and the bounce
+stacked bar's 2 series use the documented categorical slots in fixed order (never reused
+per-bar); the single-measure bar charts (reply-rate-by-persona, top-bounce-reasons) use ONE
+color for every bar per the "nominal categories, one series" rule (never a rainbow); the
+time-to-first-reply histogram is the one **ordinal** context (buckets are ordered by
+elapsed time) and uses a monotone one-hue ramp instead. Every chart ships a `<details>`
+table-view twin (the skill's accessibility relief requirement, and a natural fit for an app
+that already leans on tables everywhere). Like Pipeline/Reachouts/Logs, `analytics_page()`
+has zero GMass/Redis dependency — pure local SQLite + config reads (`sent_reply_trend()`,
+`bounce_breakdown()`, `weekly_goal_progress()`, all in `slap/dashboard.py`, reusing
+`_sent_split()`/`_count_events_on()`/`_reply_rate_by_persona()`/
+`_time_to_first_reply_distribution()` rather than a second independent query path) — so it's
+always instant, never shows the stale-cache banner. The one new config knob, optional
+`schedule.weekly_target` (positive int; absent → the pacing gauge is simply omitted, same
+"optional block, feature quietly off" precedent as `redis:`), drives a weekly-goal-pacing
+meter reusing the exact `.gauge-track`/`.gauge-fill` CSS the daily-cap gauge already
+established. Chart colors redraw on theme toggle: `base.html`'s theme script now exposes
+`window.slapEffectiveTheme()` and fires a `slap-theme-changed` window event (on both the
+manual toggle and an OS-level `prefers-color-scheme` change while a page is open) that
+`analytics.html` listens for to destroy and rebuild its charts with the other mode's
+validated hex set — canvases can't read CSS custom properties the way every other themed
+element on this dashboard already does.
+
+Explicitly out of scope for this pass (discussed, deferred): an engagement funnel
+(sent→clicked→replied→real), a cadence stage drop-off funnel, a company/domain response-rate
+leaderboard, a day-of-week reply-rate heatmap, real open-tracking (GMass `open_tracking`
+defaults off and no `_sync_opens()` exists), and a job-outcome funnel (interview/offer tags
+beyond the existing real/not_interested/unreal reply triage).
+
 ---
 
 ## 6. Real GMass API facts (probe-verified — these OVERRIDE the build brief's assumptions)
@@ -795,6 +834,12 @@ don't assume a feature landed just because a task once existed for it):
   entry). `runner.drain()` also gained an injectable `log_fn` (default `print`) in the same
   change — one progress line per recipient as each send resolves, replacing total silence
   until the final summary.
+- **Dashboard Analytics page** (`/analytics`, 2026-07-23) — a seventh page and the
+  dashboard's first charts: sent/replies trend line, bounce/block breakdown, reply rate by
+  persona, time-to-first-reply histogram, all via a vendored Chart.js
+  (`slap/static/vendor/chart.min.js`); plus an optional `schedule.weekly_target` config
+  knob driving a weekly-goal-pacing gauge. See §5's dedicated entry for the full palette/
+  chart-form rationale and what was deliberately left out of this pass.
 
 **Genuinely still pending / unproven:**
 

@@ -44,6 +44,9 @@ schedule:
   daily_cap: 500 # Gmail ceiling; drain stops here, overflow re-queues
   drain_retries: 3 # transient-failure retries before surfacing run_failed
   active_days: [mon, tue, wed, thu, fri] # days the unattended runner may drain (skip weekends here)
+  # Optional — new-recipient sends per rolling week. Drives the Analytics
+  # page's weekly-goal-pacing gauge; omit entirely to hide that widget.
+  # weekly_target: 20
 
 tracking:
   consumer_domains_file: consumer_domains.txt

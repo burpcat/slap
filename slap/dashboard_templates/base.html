@@ -14,6 +14,7 @@
     <a href="{{ url_for('index') }}" class="{{ 'current' if request.endpoint == 'index' }}">Home</a>
     <a href="{{ url_for('pipeline_page') }}" class="{{ 'current' if request.endpoint == 'pipeline_page' }}">Pipeline</a>
     <a href="{{ url_for('engagement_page') }}" class="{{ 'current' if request.endpoint == 'engagement_page' }}">Engagement</a>
+    <a href="{{ url_for('analytics_page') }}" class="{{ 'current' if request.endpoint == 'analytics_page' }}">Analytics</a>
     <a href="{{ url_for('deliverability_page') }}" class="{{ 'current' if request.endpoint == 'deliverability_page' }}">Deliverability</a>
     <a href="{{ url_for('reachouts') }}" class="{{ 'current' if request.endpoint == 'reachouts' }}">Reach-outs</a>
     <a href="{{ url_for('logs_page') }}" class="{{ 'current' if request.endpoint == 'logs_page' }}">Logs</a>
@@ -65,6 +66,14 @@
     btn.textContent = t === 'dark' ? 'Dark' : t === 'light' ? 'Light' : 'Auto';
   }
   label();
+  // Exposed for any page with theme-aware canvas rendering (Analytics'
+  // charts can't read CSS custom properties, so they need a JS-readable
+  // answer to "which mode is actually in effect right now").
+  window.slapEffectiveTheme = function () {
+    var explicit = document.documentElement.getAttribute('data-theme');
+    if (explicit === 'dark' || explicit === 'light') return explicit;
+    return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  };
   btn.addEventListener('click', function () {
     var cur = document.documentElement.getAttribute('data-theme');
     var next = ORDER[(ORDER.indexOf(cur) + 1) % ORDER.length];
@@ -76,6 +85,14 @@
       localStorage.setItem('slap-theme', next);
     }
     label();
+    window.dispatchEvent(new CustomEvent('slap-theme-changed'));
+  });
+  // "Auto" mode itself doesn't touch data-theme, so an OS-level scheme
+  // change while the page is open wouldn't otherwise notify anything.
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function () {
+    if (!document.documentElement.getAttribute('data-theme')) {
+      window.dispatchEvent(new CustomEvent('slap-theme-changed'));
+    }
   });
 })();
 </script>

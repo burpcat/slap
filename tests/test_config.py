@@ -200,6 +200,31 @@ def test_load_global_config_duplicate_day_fails_loud(tmp_path):
         load_global_config(path)
 
 
+# --- schedule.weekly_target (optional — Analytics page's pacing gauge) ----
+
+def test_load_global_config_weekly_target_none_when_absent(tmp_path):
+    path = write_global_config(tmp_path)  # VALID_CONFIG_YAML has no weekly_target key
+    cfg = load_global_config(path)
+    assert cfg.schedule.weekly_target is None
+
+
+def test_load_global_config_weekly_target_parsed_when_present(tmp_path):
+    text = VALID_CONFIG_YAML.replace("active_days: [mon, tue, wed, thu, fri]",
+                                      "active_days: [mon, tue, wed, thu, fri]\n  weekly_target: 20")
+    path = write_global_config(tmp_path, text)
+    cfg = load_global_config(path)
+    assert cfg.schedule.weekly_target == 20
+
+
+@pytest.mark.parametrize("bad_value", ["0", "-5", '"twenty"', "true"])
+def test_load_global_config_weekly_target_invalid_fails_loud(tmp_path, bad_value):
+    text = VALID_CONFIG_YAML.replace("active_days: [mon, tue, wed, thu, fri]",
+                                      f"active_days: [mon, tue, wed, thu, fri]\n  weekly_target: {bad_value}")
+    path = write_global_config(tmp_path, text)
+    with pytest.raises(ConfigError, match="weekly_target"):
+        load_global_config(path)
+
+
 # --- gmass.allowed_days / gmass.skip_holidays (independent of schedule.active_days) ---
 
 def test_load_global_config_gmass_allowed_days_and_skip_holidays_default_when_absent(tmp_path):

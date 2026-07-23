@@ -20,11 +20,12 @@ from slap import gmass_cache, ui_state
 from slap.queue import stage_recipient
 from slap.dashboard import (
     _click_details, _clicked_recipients, _recipient_drop_meta, active_leads, actionable_replies,
-    bounces, companies_contacted, compute_gmass_dependent_data, create_app, engagement_intelligence,
-    event_display, filter_reachouts, follow_up_reminders, get_gmass_dependent_data, needs_triage,
-    next_drain, pipeline, reachouts_rows, read_log_tail, recent_events, reply_tags, stop_outreach,
-    stopped_outreach_roster, sync_reports, tag_reply, template_failures, this_week, today_strip,
-    todays_runs, visible_warm_but_silent, warm_but_silent,
+    bounce_breakdown, bounces, companies_contacted, compute_gmass_dependent_data, create_app,
+    engagement_intelligence, event_display, filter_reachouts, follow_up_reminders,
+    get_gmass_dependent_data, needs_triage, next_drain, pipeline, reachouts_rows, read_log_tail,
+    recent_events, reply_tags, sent_reply_trend, stop_outreach, stopped_outreach_roster,
+    sync_reports, tag_reply, template_failures, this_week, today_strip, todays_runs,
+    visible_warm_but_silent, warm_but_silent, weekly_goal_progress,
 )
 from slap.reload import ReloadFailure, write_failures
 from slap.tracking import append_event, connect
@@ -107,14 +108,15 @@ def sync_background_thread(monkeypatch):
     monkeypatch.setattr("slap.dashboard.threading.Thread", _ImmediateThread)
 
 
-def make_global_config(*, daily_cap=500, drain_retries=3):
+def make_global_config(*, daily_cap=500, drain_retries=3, weekly_target=None):
     return GlobalConfig(
         from_email="owner@gmail.com", from_name="Owner", api_key_env="GMASS_API_KEY",
         personas={"recruiter": [2, 3, 5], "founder": [2, 5, 7], "hiring_manager": [2, 4, 6]},
         schedule=ScheduleConfig(fire_window_start="09:00", fire_window_end="09:15",
                                  send_delay_min=10, send_delay_max=15,
                                  daily_cap=daily_cap, drain_retries=drain_retries,
-                                 active_days=["mon", "tue", "wed", "thu", "fri", "sat", "sun"]),
+                                 active_days=["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+                                 weekly_target=weekly_target),
         consumer_domains_file="consumer_domains.txt", path="config.yaml",
     )
 
@@ -710,6 +712,76 @@ def test_time_to_first_reply_distribution_buckets(conn):
     result = engagement_intelligence(conn)
     assert result["time_to_first_reply"]["same_day"] == 1
     assert result["time_to_first_reply"]["8_plus_days"] == 1
+
+
+# --- Analytics page: sent_reply_trend / bounce_breakdown / weekly_goal_progress
+
+def test_sent_reply_trend_buckets_by_local_day(conn):
+    today = date(2026, 1, 15)
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=0, timestamp=_ts(-2))
+    append_event(conn, type="requeued", recipient="b@x.com", campaign="c", stage=1, timestamp=_ts(-1))
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c", timestamp=_ts(0))
+
+    series = sent_reply_trend(conn, days=3, today=today)
+
+    assert [row["date"] for row in series] == ["2026-01-13", "2026-01-14", "2026-01-15"]
+    assert series[0] == {"date": "2026-01-13", "new": 1, "follow_up": 0, "replies": 0}
+    assert series[1] == {"date": "2026-01-14", "new": 0, "follow_up": 1, "replies": 0}
+    assert series[2] == {"date": "2026-01-15", "new": 0, "follow_up": 0, "replies": 1}
+
+
+def test_bounce_breakdown_groups_by_category_and_reason(conn):
+    today = date(2026, 1, 15)
+    for i in range(3):
+        append_event(conn, type="bounce", recipient=f"full{i}@x.com", campaign="c",
+                     meta={"category": "bounce", "bounce_reason": "Mailbox full"}, timestamp=_ts(-1))
+    for i in range(2):
+        append_event(conn, type="bounce", recipient=f"invalid{i}@x.com", campaign="c",
+                     meta={"category": "bounce", "bounce_reason": "Invalid address"}, timestamp=_ts(-2))
+    append_event(conn, type="bounce", recipient="blocked@x.com", campaign="c",
+                 meta={"category": "block", "bounce_reason": "Blocked by policy"}, timestamp=_ts(-3))
+
+    result = bounce_breakdown(conn, weeks=4, today=today)
+
+    assert result["top_reasons"] == [
+        {"reason": "Mailbox full", "count": 3},
+        {"reason": "Invalid address", "count": 2},
+        {"reason": "Blocked by policy", "count": 1},
+    ]
+    assert sum(w["bounce"] for w in result["by_category_over_time"]) == 5
+    assert sum(w["block"] for w in result["by_category_over_time"]) == 1
+
+
+def test_bounce_breakdown_folds_extra_reasons_into_other(conn):
+    counts = [7, 6, 5, 4, 3, 2, 1]
+    for reason_idx, count in enumerate(counts):
+        for i in range(count):
+            append_event(conn, type="bounce", recipient=f"r{reason_idx}-{i}@x.com", campaign="c",
+                         meta={"category": "bounce", "bounce_reason": f"reason{reason_idx}"},
+                         timestamp=_ts(-1))
+
+    result = bounce_breakdown(conn, weeks=4, today=date(2026, 1, 15))
+
+    assert result["top_reasons"][:5] == [
+        {"reason": "reason0", "count": 7}, {"reason": "reason1", "count": 6},
+        {"reason": "reason2", "count": 5}, {"reason": "reason3", "count": 4},
+        {"reason": "reason4", "count": 3},
+    ]
+    assert result["top_reasons"][5] == {"reason": "other", "count": 3}  # reason5(2) + reason6(1)
+
+
+def test_weekly_goal_progress_none_when_not_configured():
+    assert weekly_goal_progress(None, None) is None
+
+
+def test_weekly_goal_progress_reports_pct_when_configured(conn):
+    today = date(2026, 1, 15)
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=0, timestamp=_ts(0))
+    append_event(conn, type="sent", recipient="b@x.com", campaign="c", stage=0, timestamp=_ts(-1))
+
+    result = weekly_goal_progress(conn, 10, today=today)
+
+    assert result == {"target": 10, "actual": 2, "pct": 20}
 
 
 # --- needs_triage / actionable_replies / tag_reply --------------------
@@ -1341,6 +1413,36 @@ def test_create_app_deliverability_page_renders(app):
     assert b"No stopped outreach." in resp.data
 
 
+def test_create_app_analytics_page_renders(app):
+    # Local-only, same as Pipeline/Reachouts/Logs — no GMass dependency, so
+    # no gmass.get_reports patch needed for this one to render cleanly.
+    resp = app.test_client().get("/analytics")
+    assert resp.status_code == 200
+    assert b"Sent" in resp.data
+    assert b"Bounce" in resp.data
+    assert b"Reply rate by persona" in resp.data
+    assert b"Time to first reply" in resp.data
+    assert b"Weekly goal pacing" not in resp.data  # weekly_target unset in make_global_config()
+
+
+def test_create_app_analytics_page_shows_weekly_goal_when_configured(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("slap.dashboard.threading.Thread", _ImmediateThread)
+    db_path = tmp_path / "test.db"
+    connect(db_path).close()
+    app = create_app(db_path, make_global_config(weekly_target=10), consumer_domains=set(),
+                      api_key="fake-key", redis_client=FakeRedis())
+    resp = app.test_client().get("/analytics")
+    assert resp.status_code == 200
+    assert b"Weekly goal pacing" in resp.data
+    assert b"0 / 10" in resp.data
+
+
+def test_create_app_analytics_page_days_toggle_clamps_unknown_values(app):
+    resp = app.test_client().get("/analytics?days=999")
+    assert resp.status_code == 200
+
+
 def test_create_app_nav_present_and_highlights_current_page_on_every_route(app):
     # Every page's nav must resolve all six url_for() targets with no
     # BuildError (a missing endpoint would 500 the whole page, not just
@@ -1349,6 +1451,7 @@ def test_create_app_nav_present_and_highlights_current_page_on_every_route(app):
         client = app.test_client()
         for path, current_label in [
             ("/", "Home"), ("/pipeline", "Pipeline"), ("/engagement", "Engagement"),
+            ("/analytics", "Analytics"),
             ("/deliverability", "Deliverability"), ("/reachouts", "Reach-outs"), ("/logs", "Logs"),
         ]:
             resp = client.get(path)
