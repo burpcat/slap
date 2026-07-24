@@ -11,9 +11,11 @@
 {% if total_count == 0 %}
 <p class="empty">No reach-outs yet — nothing staged or sent.</p>
 {% else %}
+<div class="panels">
+<div class="panel full">
 <div class="stat-strip">
   <div class="stat-tile">
-    <div class="value"><span id="count-line">{{ total_count }}</span> <span class="muted" style="font-size:13px;font-weight:400;">of {{ total_count }}</span></div>
+    <div class="value"><span id="count-line">{{ total_count }}</span> <span class="muted count-suffix">of {{ total_count }}</span></div>
     <div class="label">reach-outs shown</div>
   </div>
 </div>
@@ -194,10 +196,10 @@
     <tr class="detail-row">
       <td colspan="10">
         {% if r.corrected_from %}
-        <div>&#8617; corrected from <strong>{{ r.corrected_from }}</strong></div>
+        <div><span class="muted">&#8617; corrected from</span> <strong>{{ r.corrected_from }}</strong></div>
         {% endif %}
         {% if r.already_corrected_to %}
-        <div>&#8618; already corrected to:
+        <div><span class="muted">&#8618; already corrected to:</span>
           <ul class="plain">
             {% for c in r.already_corrected_to %}
             <li><strong>{{ c.recipient }}</strong> ({{ c.status or '—' }})</li>
@@ -220,6 +222,8 @@
     {% endfor %}
   </tbody>
 </table>
+</div>
+</div>
 {% endif %}
 {% endblock %}
 

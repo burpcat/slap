@@ -51,6 +51,10 @@ a { color: inherit; }
 h1 { font-size: 18px; margin: 0 0 4px; }
 h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.04em;
      color: var(--text-secondary); margin: 0 0 12px; }
+/* A small inline action link inside an h2 (e.g. "show hidden (3)") reads as
+   a normal link, not a second heading -- undoes h2's uppercase/tracking/weight
+   via a class instead of a one-off inline style. */
+h2 a.inline-action { font-size: 11px; text-transform: none; letter-spacing: 0; font-weight: 400; }
 
 /* Page chrome: header/nav/theme toggle, shared by every page via base.html. */
 header.topbar {
@@ -73,14 +77,14 @@ main { padding: 24px; max-width: 1400px; margin: 0 auto; }
 
 .synced { color: var(--text-muted); font-size: 12px; margin: 0 24px 20px; }
 a.back { color: var(--text-secondary); font-size: 13px; }
-.count { color: var(--text-muted); font-size: 12px; margin: 8px 0 16px; }
 
 /* Stat tiles (Metrics panel, Reachouts summary strip). */
 .stat-row { display: flex; gap: 24px; flex-wrap: wrap; margin-bottom: 8px; }
 .stat-strip { display: flex; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
 .stat-tile { min-width: 90px; }
 .stat-tile .value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
-.stat-tile .label { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
+.count-suffix { font-size: 13px; font-weight: 400; }
+.label { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
 
 /* Panels (the grid every page's content lives in). */
 .panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
@@ -127,16 +131,24 @@ details.table-view { margin-top: 4px; }
 details.table-view summary { cursor: pointer; font-size: 12px; color: var(--text-secondary); }
 details.table-view summary:hover { color: var(--text-primary); }
 
-/* Reachouts-page table variant: rounded/bordered card, sortable headers. */
-table.data-table { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+/* Reachouts-page table variant: rounded/bordered card, sortable headers.
+   No overflow: hidden here -- it used to clip the table's own square
+   corners to the border-radius, but as a side effect also clipped
+   details.row-menu's absolutely-positioned popover any time the table's
+   rendered height shrank to near the last visible row (e.g. a client-side
+   search narrowing to one match) -- the popover would open but render
+   fully invisible. No cell in this table has its own background, so the
+   rounded outer border still renders cleanly without the clip. */
+table.data-table { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; }
 table.data-table th { cursor: pointer; user-select: none; white-space: nowrap; }
 table.data-table th:hover { color: var(--text-primary); }
 table.data-table th .arrow { font-size: 10px; color: var(--text-muted); }
 
 /* Badges (small inline status labels — errors, "seen before", RUN FAILED). */
 .badge { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 11px; }
-.badge.critical { background: var(--critical); color: white; }
-.badge.warn { background: var(--warning); color: var(--text-primary); }
+.badge.critical { background: var(--critical); color: #ffffff; }
+.badge.warn { background: var(--warning); color: var(--ink-on-status); }
+.badge.good { background: var(--good); color: var(--ink-on-status); }
 
 /* Status chips (Reachouts row status). chip-good/chip-serious use the
    fixed --ink-on-status dark ink, not white -- computed WCAG contrast
@@ -158,9 +170,12 @@ button.tag-btn {
 }
 button.tag-btn:hover { background: var(--hairline); }
 button.tag-btn.danger { border-color: var(--critical); color: var(--critical); }
-button.tag-btn.danger:hover { background: var(--critical); color: white; }
+button.tag-btn.danger:hover { background: var(--critical); color: #ffffff; }
 input.ooo-date { font-size: 12px; padding: 2px 4px; margin-right: 4px; border: 1px solid var(--border); border-radius: 4px; }
-.warning-banner { background: #fdf3d9; border: 1px solid var(--warning); border-radius: 6px; padding: 8px 12px; margin: 12px 0; font-size: 13px; }
+.warning-banner {
+  background: color-mix(in oklab, var(--warning) 12%, var(--surface-1));
+  border: 1px solid var(--warning); border-radius: 6px; padding: 8px 12px; margin: 12px 0; font-size: 13px;
+}
 
 /* Reachouts row-action menu: one unified overflow menu instead of N
    conditional inline buttons -- native <details>/<summary>, zero new JS

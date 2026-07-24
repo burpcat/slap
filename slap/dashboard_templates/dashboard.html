@@ -2,6 +2,8 @@
 {% block title %}slap dashboard{% endblock %}
 {% block content %}
 
+<h1>Home</h1>
+
 <div class="panels">
 
   <div class="panel">
@@ -82,7 +84,7 @@
           {% if run.run_failed %}
             <span class="badge critical">RUN FAILED</span> {{ run.error }} (retries: {{ run.retry_count }})
           {% else %}
-            ok
+            <span class="badge good">ok</span>
           {% endif %}
         </td>
       </tr>

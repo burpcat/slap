@@ -7,13 +7,15 @@
   runner/sync jobs — one place to check instead of <code>runner.log</code>/<code>sync.log</code>
   and their <code>.err</code> twins by hand.</p>
 
+<div class="panels">
+<div class="panel full">
 <h2>Events</h2>
 {% if total_count == 0 %}
 <p class="empty">No events recorded yet.</p>
 {% else %}
 <div class="stat-strip">
   <div class="stat-tile">
-    <div class="value"><span id="count-line">{{ total_count }}</span> <span class="muted" style="font-size:13px;font-weight:400;">of {{ total_count }}</span></div>
+    <div class="value"><span id="count-line">{{ total_count }}</span> <span class="muted count-suffix">of {{ total_count }}</span></div>
     <div class="label">events shown</div>
   </div>
 </div>
@@ -89,8 +91,8 @@
     {% if ev.meta or ev.gmass_campaign_id or ev.gmass_draft_id %}
     <tr class="detail-row">
       <td colspan="7">
-        {% if ev.gmass_campaign_id %}<div>gmass_campaign_id: <strong>{{ ev.gmass_campaign_id }}</strong></div>{% endif %}
-        {% if ev.gmass_draft_id %}<div>gmass_draft_id: <strong>{{ ev.gmass_draft_id }}</strong></div>{% endif %}
+        {% if ev.gmass_campaign_id %}<div><span class="muted">gmass_campaign_id:</span> <strong>{{ ev.gmass_campaign_id }}</strong></div>{% endif %}
+        {% if ev.gmass_draft_id %}<div><span class="muted">gmass_draft_id:</span> <strong>{{ ev.gmass_draft_id }}</strong></div>{% endif %}
         {% if ev.meta %}<pre class="log-pre">{{ ev.meta | tojson(indent=2) }}</pre>{% endif %}
       </td>
     </tr>
@@ -103,6 +105,8 @@
 <p class="muted"><a href="{{ url_for('logs_page', limit=limit * 2) }}">Show more (currently showing the most recent {{ limit }})</a></p>
 {% endif %}
 {% endif %}
+</div>
+</div>
 
 <h2>Raw job output</h2>
 <p class="muted">Last 200 lines of each scheduled job's stdout/stderr, newest first — the only
@@ -110,7 +114,7 @@
 <div class="panels">
   {% for name, lines in logs.items() %}
   <div class="panel">
-    <h3>{{ name }}</h3>
+    <h2>{{ name }}</h2>
     {% if lines %}
     <pre class="log-pre">{{ lines | join('\n') }}</pre>
     {% else %}

@@ -7,9 +7,16 @@
 {% if total_count == 0 %}
 <p class="empty">No template-reload failures — nothing unresolved from the most recent run.</p>
 {% else %}
-<p class="count">{{ total_count }} recipient(s) could not be reloaded against current templates (left untouched)</p>
+<div class="panels">
+<div class="panel full">
+<div class="stat-strip">
+  <div class="stat-tile">
+    <div class="value">{{ total_count }}</div>
+    <div class="label">recipient(s) could not be reloaded against current templates (left untouched)</div>
+  </div>
+</div>
 
-<table>
+<table class="data-table">
   <thead>
     <tr>
       <th>Recipient</th>
@@ -37,5 +44,7 @@
     {% endfor %}
   </tbody>
 </table>
+</div>
+</div>
 {% endif %}
 {% endblock %}
