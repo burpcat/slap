@@ -55,6 +55,15 @@ PDF, or a scaffolded placeholder if you don't have one ready yet). Nothing is wr
 disk until you confirm the review. The result is validated the same way `send`/`doctor`
 validate any other campaign before it declares success.
 
+`onboard-campaign` only scaffolds this app-facing half — the config and templates
+`slap.py` reads. It has no opinion on how you produce the real per-recipient values that
+fill those templates (a tailored résumé, this campaign's seed-drop field values,
+sometimes a LinkedIn DM) — that's a separate step, done by pasting a generation prompt
+into a Claude conversation once per recipient. If you're working in Claude Code,
+`prompt-store/CLAUDE.md` holds the reusable template for writing that generation prompt
+for a new campaign, plus a browsable symlink index (`prompt-store/<name>.md`) of every
+campaign's own `campaigns/<name>/prompt.md`.
+
 The rest of this section describes the folder shape by hand, for reference or if you'd
 rather write the files yourself:
 

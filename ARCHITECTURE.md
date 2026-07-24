@@ -92,6 +92,16 @@ next stage itself, as an explicit threaded reply (`sendAsReply` + a specific
 `campaignIdToReplyTo`) rather than depending on GMass's own conversation-matching
 heuristics — deterministic threading was worth the small amount of extra code.
 
+**Per-recipient content generation is deliberately outside the app.** `slap.py` never
+writes the actual per-recipient résumé tailoring or drop field values — a `campaign.yaml`
+declares the field *contract* (labels, optional flags), but producing real values for a
+real recipient happens in a separate Claude conversation, fed a per-campaign generation
+prompt plus external reference files (an achievement bank, narrative notes, a base
+résumé) that don't live in this repo. `prompt-store/` (Claude-Code-only, no application
+code) is a convenience layer over that step: a reusable meta-prompt template for writing
+a new campaign's generation prompt, plus a symlinked index of every campaign's real one —
+see `prompt-store/CLAUDE.md`.
+
 **Dedup is derived, not stored.** "Have I already emailed this person / this company?"
 is answered by querying the event log live at send time — an exact-recipient match is a
 hard warning (always), a same-domain-different-person match is a soft warning (skipped
