@@ -2,6 +2,8 @@
 {% block title %}slap dashboard — deliverability{% endblock %}
 {% block content %}
 
+<h1>Deliverability</h1>
+
 <div class="panels">
 
   <div class="panel">
@@ -13,7 +15,7 @@
       <tr>
         <td>{{ b.recipient }}</td>
         <td>{{ b.campaign }}</td>
-        <td>{% if b.category == 'block' %}<span class="badge warn">Blocked</span>{% else %}Bounced{% endif %}</td>
+        <td>{% if b.category == 'block' %}<span class="badge warn">Blocked</span>{% else %}<span class="badge critical">Bounced</span>{% endif %}</td>
         <td class="reason" title="{{ b.reason }}">{{ b.reason | truncate(60) if b.reason else '—' }}</td>
         <td>{{ b.last_event_at | to_local }}</td>
       </tr>

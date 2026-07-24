@@ -2,13 +2,15 @@
 {% block title %}slap dashboard — engagement{% endblock %}
 {% block content %}
 
+<h1>Engagement</h1>
+
 <div class="panels">
 
   <div class="panel full">
     <h2>Engagement intelligence</h2>
     {% if engagement.has_data %}
     <div class="panels">
-      <div>
+      <div class="panel">
         <table>
           <tr><th>Persona</th><th class="num">Reply rate</th></tr>
           {% for persona, rate in engagement.reply_rate_by_persona.items() %}
@@ -18,7 +20,7 @@
           {% endfor %}
         </table>
       </div>
-      <div>
+      <div class="panel">
         <table>
           <tr><th>Stage</th><th class="num">Replies</th><th class="num">Clicks</th></tr>
           {% for stage in [0, 1, 2, 3] %}
@@ -30,7 +32,7 @@
           {% endfor %}
         </table>
       </div>
-      <div>
+      <div class="panel">
         <table>
           <tr><th>Time to first reply</th><th class="num">Count</th></tr>
           <tr><td>Same day</td><td class="num">{{ engagement.time_to_first_reply.same_day }}</td></tr>
@@ -49,7 +51,7 @@
     <h2>Warm but silent &mdash; clicked, no reply
       {% if warm_but_silent_hidden_count %}
       <a href="{{ url_for('engagement_page') if show_hidden else url_for('engagement_page', show_hidden=1) }}"
-         style="font-size: 11px; text-transform: none; letter-spacing: 0; font-weight: 400;">
+         class="inline-action">
         {{ 'hide dismissed rows again' if show_hidden else 'show hidden (' ~ warm_but_silent_hidden_count ~ ')' }}
       </a>
       {% endif %}

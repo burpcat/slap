@@ -221,6 +221,22 @@ def test_build_campaign_settings_uses_english_ordinal_field_names():
     assert "stage2Days" not in settings
 
 
+def test_build_campaign_settings_converts_stage_bodies_to_html_for_click_tracking():
+    # Follow-up stages are fired by GMass from within the same campaign
+    # object as the initial email -- a stage body with a bare URL needs the
+    # exact same _plain_text_to_html() treatment create_draft() already
+    # applies to the initial message, or clickTracking silently no-ops on
+    # every follow-up (see the module docstring's click-tracking landmine).
+    settings = build_campaign_settings(
+        [2, 4], ["See https://www.linkedin.com/in/test for more.", "no links here"]
+    )
+    assert settings["stageOneCampaignText"] == (
+        'See <a href="https://www.linkedin.com/in/test">www.linkedin.com</a> for more.'
+    )
+    assert "href" not in settings["stageTwoCampaignText"]
+    assert settings["stageTwoCampaignText"] == "no links here"
+
+
 def test_build_campaign_settings_defaults():
     settings = build_campaign_settings([2], ["body"])
     assert settings["openTracking"] is False

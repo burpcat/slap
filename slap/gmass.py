@@ -267,6 +267,14 @@ def build_campaign_settings(cadence: list, stage_bodies: list, *, open_tracking:
     send-as-reply shape (sendAsReply/campaignIdToReplyTo) — that's a
     distinct, simpler payload built by step 10's re-queue path.
 
+    Each `stageNCampaignText` is run through `_plain_text_to_html()`, same as
+    `create_draft()`'s `message` — GMass's follow-up stages are fired from
+    within this same campaign object, so a stage body with a bare URL is just
+    as un-anchored (and just as invisible to `clickTracking`) as the initial
+    email was before that conversion was added there. Every real campaign's
+    stageN.txt ends in `{{signature}}`, which carries real links, so this
+    isn't a theoretical gap.
+
     This one call is the entire reason `slap.py template-reload` (post-
     launch, see `slap.reload`'s module docstring) can only ever touch a
     recipient with nothing sent at all: every stage's wording gets flattened
@@ -316,7 +324,7 @@ def build_campaign_settings(cadence: list, stage_bodies: list, *, open_tracking:
     for i, (days, body) in enumerate(zip(cadence, stage_bodies)):
         ordinal = _ORDINALS[i]
         settings[f"stage{ordinal}Days"] = days
-        settings[f"stage{ordinal}CampaignText"] = body
+        settings[f"stage{ordinal}CampaignText"] = _plain_text_to_html(body)
         settings[f"stage{ordinal}Action"] = stop_action
     if allowed_days:
         settings["allowedDays"] = _allowed_days_value(allowed_days)
