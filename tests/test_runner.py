@@ -13,7 +13,8 @@ import pytest
 from slap.config import GlobalConfig, ScheduleConfig
 from slap.queue import due_for_ooo_resend, due_recipients, load_manifest, stage_recipient, tag_ooo
 from slap.runner import (
-    DrainResult, cap_headroom, drain, is_active_day, wait_for_fire_window, _roll_fire_time,
+    DrainResult, cap_headroom, drain, is_active_day, staleness_warning, wait_for_fire_window,
+    _roll_fire_time,
 )
 from slap.tracking import append_event, connect, latest_open_draft_id
 
@@ -732,6 +733,84 @@ def test_is_active_day_true_every_day_when_all_seven_configured(tmp_path):
 def test_is_active_day_defaults_to_todays_real_local_date(tmp_path):
     gc = make_global_config(tmp_path, active_days=["mon", "tue", "wed", "thu", "fri", "sat", "sun"])
     assert is_active_day(gc.schedule) is True  # every day active — today always passes
+
+
+# --- staleness_warning (dashboard "silent runner failure" banner) ----------
+# Found via a real incident: the launchd LaunchAgent stopped firing for a
+# week straight with zero run_failed events (launchd-level EX_CONFIG never
+# even gets the Python process started) -- so nothing was on the dashboard
+# to say the runner had gone silent, only a slowly-backing-up queue.
+
+def test_staleness_warning_none_when_runner_has_never_fired(conn, tmp_path):
+    gc = make_global_config(tmp_path)
+    assert staleness_warning(conn, gc.schedule, today=date(2026, 1, 10)) is None
+
+
+def test_staleness_warning_none_the_same_day_a_run_completed(conn, tmp_path):
+    gc = make_global_config(tmp_path)
+    append_event(conn, type="run_completed", meta={"sent": 1, "failed": 0, "remaining_queued": 0},
+                 timestamp=datetime(2026, 1, 10, 16, 0, tzinfo=timezone.utc))
+    assert staleness_warning(conn, gc.schedule, today=date(2026, 1, 10),
+                              now=datetime(2026, 1, 10, 12, 0)) is None
+
+
+def test_staleness_warning_none_while_todays_window_hasnt_closed_yet(conn, tmp_path):
+    gc = make_global_config(tmp_path)  # all 7 days active
+    append_event(conn, type="run_completed", meta={"sent": 1, "failed": 0, "remaining_queued": 0},
+                 timestamp=datetime(2026, 1, 9, 16, 0, tzinfo=timezone.utc))
+    result = staleness_warning(conn, gc.schedule, today=date(2026, 1, 10),
+                                now=datetime(2026, 1, 10, 9, 10))
+    assert result is None
+
+
+def test_staleness_warning_fires_once_todays_window_has_closed(conn, tmp_path):
+    gc = make_global_config(tmp_path)
+    append_event(conn, type="run_completed", meta={"sent": 1, "failed": 0, "remaining_queued": 0},
+                 timestamp=datetime(2026, 1, 9, 16, 0, tzinfo=timezone.utc))
+    result = staleness_warning(conn, gc.schedule, today=date(2026, 1, 10),
+                                now=datetime(2026, 1, 10, 12, 0))
+    assert result is not None
+    assert "2026-01-09" in result
+    assert "2026-01-10" in result
+    assert "1 day ago" in result
+
+
+def test_staleness_warning_counts_days_since_last_run_correctly(conn, tmp_path):
+    gc = make_global_config(tmp_path)
+    append_event(conn, type="run_completed", meta={"sent": 1, "failed": 0, "remaining_queued": 0},
+                 timestamp=datetime(2026, 1, 3, 16, 0, tzinfo=timezone.utc))
+    result = staleness_warning(conn, gc.schedule, today=date(2026, 1, 10),
+                                now=datetime(2026, 1, 10, 12, 0))
+    assert "7 days ago" in result
+    assert "2026-01-04" in result  # expected on the day right after the last run
+
+
+def test_staleness_warning_skips_inactive_days(conn, tmp_path):
+    gc = make_global_config(tmp_path, active_days=["mon", "tue", "wed", "thu", "fri"])
+    # Last run Friday 2026-01-09; Sat/Sun inactive; Monday 2026-01-12 is the
+    # next active day.
+    append_event(conn, type="run_completed", meta={"sent": 1, "failed": 0, "remaining_queued": 0},
+                 timestamp=datetime(2026, 1, 9, 16, 0, tzinfo=timezone.utc))
+    assert staleness_warning(conn, gc.schedule, today=date(2026, 1, 10),
+                              now=datetime(2026, 1, 10, 12, 0)) is None
+    assert staleness_warning(conn, gc.schedule, today=date(2026, 1, 11),
+                              now=datetime(2026, 1, 11, 12, 0)) is None
+    result = staleness_warning(conn, gc.schedule, today=date(2026, 1, 12),
+                                now=datetime(2026, 1, 12, 12, 0))
+    assert result is not None
+    assert "2026-01-12" in result
+
+
+def test_staleness_warning_run_failed_event_also_counts_as_activity(conn, tmp_path):
+    # run_failed is a LOUD failure, already surfaced by the dashboard's
+    # "today's runs" panel — it still counts as "the runner is alive", just
+    # unhealthy in a different, already-visible way. Only total silence is
+    # what this warning exists to catch.
+    gc = make_global_config(tmp_path)
+    append_event(conn, type="run_failed", meta={"error": "no api key", "retry_count": 3},
+                 timestamp=datetime(2026, 1, 10, 16, 0, tzinfo=timezone.utc))
+    assert staleness_warning(conn, gc.schedule, today=date(2026, 1, 10),
+                              now=datetime(2026, 1, 10, 12, 0)) is None
 
 
 class _FixedRng:

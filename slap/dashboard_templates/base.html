@@ -25,6 +25,10 @@
   <button id="theme-toggle" type="button">Auto</button>
 </header>
 
+{% if runner_staleness_warning %}
+<div class="warning-banner global-banner">⚠ {{ runner_staleness_warning }}</div>
+{% endif %}
+
 {% if sync_result is defined %}
 <p class="synced">
   last synced: {{ sync_result.synced_at | to_local }}

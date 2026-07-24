@@ -50,7 +50,7 @@ from slap.queue import (
     QueueError, _pending_ooo_resume_date, due_for_ooo_resend, due_recipients, resend_bounced,
     tag_ooo as _tag_ooo,
 )
-from slap.runner import cap_headroom
+from slap.runner import cap_headroom, staleness_warning as _runner_staleness_warning
 from slap.tracking import append_event
 
 TEMPLATE_FOLDER = str(Path(__file__).parent / "dashboard_templates")
@@ -1862,6 +1862,17 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
         # every render_template() call automatically, so no route has to
         # remember to pass it (the way only index() used to).
         return {"template_failures_count": len(template_failures())}
+
+    @app.context_processor
+    def inject_runner_staleness_warning():
+        # Every page's shared header (base.html) surfaces this — a launchd-
+        # level failure (e.g. EX_CONFIG) writes ZERO events at all, unlike an
+        # in-app failure which at least logs run_failed (see todays_runs()'s
+        # own "today's runs" panel) — so without this, a launchd job that's
+        # silently stopped firing is invisible until someone notices the
+        # queue backing up (see slap.runner.staleness_warning's docstring for
+        # the real incident this was found from).
+        return {"runner_staleness_warning": _runner_staleness_warning(get_conn(), global_config.schedule)}
 
     @app.route("/")
     def index():
