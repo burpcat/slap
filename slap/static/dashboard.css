@@ -176,6 +176,9 @@ input.ooo-date { font-size: 12px; padding: 2px 4px; margin-right: 4px; border: 1
   background: color-mix(in oklab, var(--warning) 12%, var(--surface-1));
   border: 1px solid var(--warning); border-radius: 6px; padding: 8px 12px; margin: 12px 0; font-size: 13px;
 }
+/* Site-wide banner (base.html) lives outside <main>, which owns its own
+   24px gutter — this one needs its own horizontal margin to match. */
+.warning-banner.global-banner { margin: 12px 24px; }
 
 /* Reachouts row-action menu: one unified overflow menu instead of N
    conditional inline buttons -- native <details>/<summary>, zero new JS

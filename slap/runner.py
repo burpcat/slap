@@ -35,7 +35,7 @@ import json
 import random
 import time
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from datetime import time as dt_time
 from datetime import timedelta
 from pathlib import Path
@@ -67,6 +67,57 @@ def is_active_day(schedule, *, today: date = None) -> bool:
     (see module docstring)."""
     today = today or date.today()
     return _WEEKDAY_ABBR[today.weekday()] in schedule.active_days
+
+
+def last_run_event_at(conn) -> datetime | None:
+    """Local-time timestamp of the most recent run_started/run_completed/
+    run_failed event, or None if the runner has never fired at all (a fresh
+    install — not staleness, just nothing yet to compare against)."""
+    row = conn.execute(
+        "SELECT timestamp FROM events WHERE type IN "
+        "('run_started', 'run_completed', 'run_failed') ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return None
+    ts = datetime.fromisoformat(row["timestamp"])
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone()
+
+
+def staleness_warning(conn, schedule, *, today: date = None, now: datetime = None) -> str | None:
+    """Detects a SILENT runner failure — e.g. launchd itself failing to spawn
+    the job (macOS EX_CONFIG), which writes zero events at all, unlike an
+    in-app preflight/send failure that at least logs `run_failed` (already
+    surfaced by the dashboard's "today's runs" panel). Found via a real
+    incident: the launchd LaunchAgent stopped firing for a week with no
+    run_failed event anywhere, so the queue silently piled up with nothing
+    on the dashboard calling it out.
+
+    Walks forward, in LOCAL time (matching is_active_day/the fire window's
+    own local-time interpretation), from the day after the last recorded run
+    event to today. If any active day in that span has already closed its
+    fire window with still no newer run event, the runner has gone silent.
+    Returns None when healthy, or when the runner has never fired yet."""
+    today = today or date.today()
+    now = now or datetime.now().astimezone()
+    last_at = last_run_event_at(conn)
+    if last_at is None:
+        return None
+    last_date = last_at.date()
+    d = last_date + timedelta(days=1)
+    while d <= today:
+        if is_active_day(schedule, today=d):
+            end_h, end_m = (int(x) for x in schedule.fire_window_end.split(":"))
+            window_closed = d < today or now.time() >= dt_time(end_h, end_m)
+            if window_closed:
+                days_late = (today - last_date).days
+                plural = "s" if days_late != 1 else ""
+                return (f"No runner activity since {last_date.isoformat()} ({days_late} day{plural} ago) — "
+                        f"expected a drain on {d.isoformat()}. The launchd job may have silently stopped "
+                        f"firing; check `launchctl print gui/<uid>/com.slap.runner` for a stuck/failed job.")
+        d += timedelta(days=1)
+    return None
 
 
 @dataclass
