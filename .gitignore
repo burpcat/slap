@@ -43,3 +43,10 @@ marketing_dashboard_sample.html
 CONTROL_SHEET.md
 SLAP_BUILD_PROMPT.md
 CLAUDE.md
+
+# prompt-store: Claude-Code-only prompt-builder layer (see prompt-store/CLAUDE.md).
+# Everything else prompt-store/ ever holds — real per-recipient generation-prompt content
+# and the symlinks into campaigns/<name>/prompt.md — is exactly as sensitive as campaigns/
+# itself and must never be committed. Only the generic builder/workflow file is tracked.
+prompt-store/*
+!prompt-store/CLAUDE.md

@@ -129,6 +129,14 @@ The number of `stageN.txt` files must exactly match the chosen persona's cadence
 (e.g. `recruiter`'s default `[2, 3, 5]` needs `stage1.txt`/`stage2.txt`/`stage3.txt`) —
 `doctor` and `send` both fail loud if it doesn't.
 
+Setting up a campaign this way gets you the app-facing half — the config and templates
+`slap.py` actually reads. It says nothing about how you come up with the real
+per-recipient values that fill those templates (a tailored résumé, the seed-drop field
+values, sometimes a LinkedIn DM) — that's a separate content-generation step done in a
+Claude conversation, not by `slap.py` itself. If you're editing this repo in Claude Code,
+see `prompt-store/CLAUDE.md` for a reusable template/workflow for writing that
+per-campaign generation prompt.
+
 ## Commands
 
 See [`USAGE.md`](USAGE.md) for the full guide (writing drops, the send flow, the

@@ -158,6 +158,11 @@ campaigns/<name>/           # per campaign, auto-discovered:
     initial.txt             #   "Subject: ..." line + blank line + body, {{key}} + {{signature}} placeholders
     stage1.txt stage2.txt stage3.txt   # follow-up bodies (no subject; thread as replies; end in {{signature}})
     resume.pdf              #   static attachment (latex-off campaigns only)
+    prompt.md               #   per-recipient generation prompt (gitignored — see prompt-store/CLAUDE.md)
+prompt-store/               # Claude-Code-only convenience layer (no app code, not read by
+                             #   slap.py) — CLAUDE.md (tracked: reusable meta-prompt
+                             #   template + workflow) + a `<name>.md` symlink per campaign
+                             #   pointing at campaigns/<name>/prompt.md (gitignored)
 workdir/<campaign>/<recipient>/   # per-recipient working files (gitignored) — resume.tex, compiled/reused
                              #   PDF (latex-on and reused-résumé recipients only — see §5), .pdf.hash, staged.json
                              #   (staged.json also carries `field_values`, the raw pre-fill drop dict, added when
@@ -896,6 +901,21 @@ on every NIT the auditor surfaces.
 
 `CLAUDE.md` in the repo encodes the iron rules + points at `SLAP_BUILD_PROMPT.md`. Hooks:
 test-after-edit, and a PreToolUse guard blocking edits/reads of `.env`.
+
+**A second, directory-scoped memory file, `prompt-store/CLAUDE.md`, is a genuinely
+different thing from the root `CLAUDE.md` above** — it's not app-build guidance, it's a
+Claude-Code-only convenience layer over the *other* half of setting up a campaign:
+writing the per-recipient content-generation prompt (tailored résumé + seed-drop fields +
+sometimes a LinkedIn DM) that gets pasted into a separate Claude conversation once per
+recipient, fed by external reference files (an achievement bank, narrative notes, a base
+résumé) that live outside this repo entirely. Before `prompt-store/` existed, that
+generation prompt was written ad hoc per campaign, with no reusable template and no
+single place to find a campaign's current one. `prompt-store/CLAUDE.md` is now both the
+reusable template (a distilled, campaign-agnostic version of that prompt's structure) and
+the workflow for using it — see the file itself, and README.md/USAGE.md's short pointers
+to it. Only this one file is tracked; the real generation prompts
+(`campaigns/<name>/prompt.md`) and their `prompt-store/<name>.md` symlinks are exactly as
+sensitive as `campaigns/` itself and are never committed.
 
 The repo also ships to a second remote, `slap-dist` (see §8) — a genuinely public
 distribution mirror with its own git history. Propagating a change there is a distinct,
