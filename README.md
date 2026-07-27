@@ -36,6 +36,13 @@ source .venv/bin/activate
 pip install -r requirements-dev.txt   # includes requirements.txt + pytest
 ```
 
+**Clone this somewhere outside `~/Documents`, `~/Desktop`, or `~/Downloads`.** macOS's TCC
+privacy protections for those folders can silently block the unattended `runner` from ever
+being spawned by launchd — even though everything works fine when run by hand, which makes
+this easy to miss. See
+[`LAUNCHD.md`'s Troubleshooting section](LAUNCHD.md#troubleshooting-runner-silently-stops-firing)
+if you hit this.
+
 Then run the interactive installer:
 
 ```bash
@@ -185,7 +192,10 @@ since cron doesn't catch up if your Mac was asleep at the scheduled time. Setup
 instructions, how the wake-catch-up timing works, and a one-time manual test checklist
 (this behavior can only be verified on real hardware) are in [`LAUNCHD.md`](LAUNCHD.md).
 To confirm a scheduled run actually fired, check the dashboard's **Logs** page
-(`/logs`) rather than opening `runner.log`/`sync.log` by hand.
+(`/logs`) rather than opening `runner.log`/`sync.log` by hand. If a scheduled run stops
+happening altogether (not just late — genuinely silent), see
+[`LAUNCHD.md`'s Troubleshooting section](LAUNCHD.md#troubleshooting-runner-silently-stops-firing)
+before assuming it's a `slap.py` bug.
 
 ## Running the tests
 
