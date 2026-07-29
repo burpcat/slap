@@ -136,6 +136,17 @@ class GlobalConfig:
     # "explicitly false" would look identical). True/False (explicitly
     # configured) always sends that literal value.
     gmass_skip_holidays: bool = None
+    # The command used to open a scratch file for authoring in `slap.py send
+    # custom` (and `remind --new`). A FULL command string, not just a binary
+    # name, because it must be able to BLOCK until the file is closed: a bare
+    # `code <file>` returns immediately (it hands the file to an existing VS
+    # Code window and exits), so the caller would read back an empty/stale
+    # file — `code --wait` is required. Terminal editors (`vim`, `nvim`) block
+    # natively and need no flag. Defaulted (like signature) so the many tests
+    # that construct GlobalConfig directly don't care; load_global_config()
+    # supplies the same default when the key is absent. doctor.check_editor()
+    # verifies the FIRST token resolves on PATH (check-don't-install).
+    editor: str = "code --wait"
 
 
 @dataclass
@@ -260,6 +271,14 @@ def load_global_config(path: Path = CONFIG_PATH) -> GlobalConfig:
     if gmass_skip_holidays is not None and not isinstance(gmass_skip_holidays, bool):
         raise ConfigError(f"{path}: gmass.skip_holidays must be a boolean — got {gmass_skip_holidays!r}")
 
+    # Optional top-level knob (like redis.url): absent -> the dataclass default
+    # "code --wait". Must be a non-empty string if present — an empty editor
+    # command can't launch anything, so fail loud rather than silently no-op at
+    # `send custom` time.
+    editor = raw.get("editor", "code --wait")
+    if not isinstance(editor, str) or not editor.strip():
+        raise ConfigError(f"{path}: 'editor' must be a non-empty string — got {editor!r}")
+
     return GlobalConfig(
         from_email=from_email,
         from_name=from_name,
@@ -272,6 +291,7 @@ def load_global_config(path: Path = CONFIG_PATH) -> GlobalConfig:
         redis_url=redis_url,
         gmass_allowed_days=gmass_allowed_days,
         gmass_skip_holidays=gmass_skip_holidays,
+        editor=editor,
     )
 
 

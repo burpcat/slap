@@ -11,6 +11,13 @@ campaigns/
 __pycache__/
 *.pyc
 
+# React dashboard frontend: node deps and the built bundle are generated, not
+# source. `slap.py dashboard` fails loud with the build command if the bundle
+# is missing (same convention as requiring .env/config.yaml first), so it's
+# rebuilt via `npm --prefix slap/frontend run build`.
+slap/frontend/node_modules/
+slap/static/dist/
+
 # probe outputs (raw captures are auditable but not committed)
 probes/findings/
 

@@ -2144,4 +2144,17 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
             return str(e), 400
         return redirect(url_for("reachouts", warning=warning) if warning else url_for("reachouts"))
 
+    # JSON API layer (post-launch, purely additive -- see slap/api.py's own
+    # module docstring). Imported here, not at this module's own top level,
+    # since slap.api imports FROM slap.dashboard; keeping that a one-way
+    # dependency avoids a circular import at module-load time (by the time
+    # create_app() is actually CALLED, this module has already finished
+    # executing top-to-bottom, so slap.api's own `from slap import
+    # dashboard` sees a fully-initialized module either way).
+    from slap.api import register_api
+    register_api(
+        app, get_conn=get_conn, db_path=db_path, global_config=global_config,
+        consumer_domains=consumer_domains, api_key=api_key, redis_client=redis_client, log_dir=log_dir,
+    )
+
     return app

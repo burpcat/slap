@@ -39,6 +39,12 @@ Two check batteries:
   moment it's replaced — no dismiss flag to hand-maintain. Also called
   directly (not through doctor) from `slap.py::_prep_one_recipient`, so the
   warning shows at `send` time too, not just when `doctor` is run by hand.
+- `check_editor()` (post-launch, `send custom`) — a FIFTH standalone check,
+  same isolation as the two above: the configured `editor` command's binary
+  must be on PATH, but only `send custom`/`remind --new` ever need it, so it's
+  visible in `print_report()` yet never added to `run_global_checks()` (a
+  missing editor must not block an unattended drain). `send custom` calls it
+  directly to fail loud at the one moment it matters.
 """
 from __future__ import annotations
 
@@ -109,6 +115,24 @@ def run_global_checks(global_config: GlobalConfig, conn=None) -> list:
         check_db(conn),
         check_consumer_domains(global_config),
     ]
+
+
+def check_editor(global_config: GlobalConfig) -> CheckResult:
+    """Is the configured `editor` command's binary on PATH? (check-don't-install)
+
+    Deliberately a STANDALONE check, never added to `run_global_checks()`: the
+    editor is only ever needed by `slap.py send custom`/`remind --new`, never by
+    a normal send or an unattended drain — putting it in the global battery
+    would let a missing editor wrongly block `runner.drain()`. So it's shown in
+    the standalone `doctor` report (`print_report`) for visibility, and
+    `send custom` calls THIS function directly to fail loud at the one moment it
+    actually matters (see `slap.py::cmd_send_custom`).
+
+    Resolves only the FIRST token of the command (`"code --wait"` -> `code`), so
+    a configured wait-flag doesn't defeat the PATH lookup."""
+    binary = global_config.editor.split()[0]
+    found = shutil.which(binary) is not None
+    return CheckResult(f"editor ({binary})", found, "" if found else f"{binary} not found on PATH")
 
 
 def check_attachment(campaign: CampaignConfig) -> list:
@@ -261,6 +285,11 @@ def print_report(global_config: GlobalConfig) -> bool:
     ok = ok and archive_result.ok
 
     print_check(check_redis(global_config))  # visible, but never gates doctor's pass/fail — see docstring
+    # Visible but non-gating, same reasoning as check_redis/check_resume_archive:
+    # the editor is only needed by `send custom`, so a missing one must never
+    # fail `doctor` for an owner who never uses that command (send custom itself
+    # fails loud at the moment it's actually needed).
+    print_check(check_editor(global_config))
 
     names = discover_campaigns()
     if not names:

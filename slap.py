@@ -22,8 +22,6 @@ from slap.queue import AmbiguousArchiveChoice, QueueError, resend_bounced, stage
 from slap.templates import fill_template, merge_config_values, parse_drop
 from slap import archive, dashboard, doctor, domains, gmass, gmass_cache, init, launchd, onboard, reload, runner, tracking
 
-load_dotenv()
-
 
 def cmd_list(args):
     try:
@@ -719,6 +717,13 @@ def build_parser():
 
 
 def main(argv=None):
+    # Loaded here (the CLI entry point), NOT at module import time: importing
+    # slap.py for introspection only (slap.api._load_cli() walks build_parser()
+    # to derive the dashboard's Commands reference) must never mutate the
+    # calling process's os.environ by loading a real .env — that side effect
+    # once leaked RESUME_ARCHIVE_DIR into the test/dashboard process. Every real
+    # CLI invocation still goes through main(), so behavior is unchanged.
+    load_dotenv()
     args = build_parser().parse_args(argv)
     return args.func(args)
 
