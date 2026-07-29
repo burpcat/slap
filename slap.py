@@ -459,6 +459,27 @@ def cmd_rebuild(args):
     display.success(f"Rebuilt recipients cache ({recipient_count} recipients) from {event_count} events.")
 
 
+def cmd_interaction(args):
+    # The CLI backend for the dashboard's LinkedIn-replied toggle and follow-up
+    # "mark followed up" action (every dashboard write has a terminal command —
+    # slap stays GUI-agnostic/TUI-friendly). Both append an `interaction` event.
+    conn = tracking.connect()
+    try:
+        if args.channel == "linkedin-reply":
+            replied = not args.off
+            dashboard.mark_linkedin_replied(conn, args.recipient, replied)
+            display.success(
+                f"Marked {args.recipient} "
+                f"{'LinkedIn-replied' if replied else 'not LinkedIn-replied'}."
+            )
+        else:  # followed-up
+            dashboard.mark_followed_up(conn, args.recipient)
+            display.success(f"Recorded follow-up with {args.recipient} — reminder timer reset.")
+    except ValueError as e:
+        display.error(str(e))
+        return 1
+
+
 RELOAD_SAMPLE_DIFF_COUNT = 3
 
 
@@ -684,6 +705,16 @@ def build_parser():
     ).set_defaults(func=cmd_onboard_campaign)
     sub.add_parser("domains", help="Regenerate/print the domain index").set_defaults(func=cmd_domains)
     sub.add_parser("rebuild", help="Rebuild the recipients cache from events").set_defaults(func=cmd_rebuild)
+
+    p_interaction = sub.add_parser(
+        "interaction", help="Record a per-reachout interaction (LinkedIn-replied / followed-up)"
+    )
+    p_interaction.add_argument("recipient")
+    p_interaction.add_argument("--channel", choices=["linkedin-reply", "followed-up"], required=True,
+                                help="linkedin-reply: toggle the LinkedIn-replied flag; followed-up: reset the reminder timer")
+    p_interaction.add_argument("--off", action="store_true",
+                                help="With --channel linkedin-reply: CLEAR the flag instead of setting it")
+    p_interaction.set_defaults(func=cmd_interaction)
     sub.add_parser(
         "template-reload",
         help="Re-render every not-yet-sent recipient's staged content against current templates",

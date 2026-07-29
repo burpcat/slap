@@ -525,3 +525,38 @@ def test_api_survives_real_concurrent_request_threads(tmp_path, monkeypatch):
                 break
             time.sleep(0.05)
         assert cached is not None, "no background refresh completed within 5s — possible swallowed cross-thread error"
+
+
+# --- interaction endpoints: LinkedIn-replied + followed-up ------------------
+
+def test_api_linkedin_replied_marks_and_reflects_in_reachouts(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    seed_sent_recipient(conn, recipient="a@x.com", campaign="c")
+    conn.close()
+    client = app.test_client()
+
+    resp = client.post("/api/reachouts/a@x.com/linkedin-replied", json={"replied": True})
+    assert resp.status_code == 200
+    assert resp.get_json() == {"ok": True, "linkedin_replied": True}
+
+    rows = client.get("/api/reachouts").get_json()["rows"]
+    assert next(r for r in rows if r["recipient"] == "a@x.com")["linkedin_replied"] is True
+
+
+def test_api_linkedin_replied_unknown_recipient_404(app):
+    resp = app.test_client().post("/api/reachouts/ghost@x.com/linkedin-replied", json={"replied": True})
+    assert resp.status_code == 404
+
+
+def test_api_followed_up_ok(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    seed_sent_recipient(conn, recipient="a@x.com", campaign="c")
+    conn.close()
+    resp = app.test_client().post("/api/reachouts/a@x.com/followed-up", json={})
+    assert resp.status_code == 200
+    assert resp.get_json() == {"ok": True}
+
+
+def test_api_followed_up_unknown_recipient_404(app):
+    resp = app.test_client().post("/api/reachouts/ghost@x.com/followed-up", json={})
+    assert resp.status_code == 404

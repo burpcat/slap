@@ -383,6 +383,30 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, api
         ui_state.unhide(get_conn(), recipient, dashboard.WARM_BUT_SILENT_WIDGET)
         return jsonify({"ok": True})
 
+    @app.route("/api/reachouts/<string:recipient>/linkedin-replied", methods=["POST"])
+    def api_linkedin_replied(recipient):
+        # Toggle the LinkedIn-replied flag (req 8.3). Body {replied: bool},
+        # defaulting to True (the common "mark it" action). Append-only via an
+        # interaction event; no GMass call (pipeline bookkeeping, not
+        # suppression). Unknown recipient -> 404, same as any missing resource.
+        body = request.get_json(silent=True) or {}
+        replied = bool(body.get("replied", True))
+        try:
+            dashboard.mark_linkedin_replied(get_conn(), recipient, replied)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 404
+        return jsonify({"ok": True, "linkedin_replied": replied})
+
+    @app.route("/api/reachouts/<string:recipient>/followed-up", methods=["POST"])
+    def api_followed_up(recipient):
+        # "Mark followed up" (req 4): restarts the follow-up-reminder timer via
+        # an interaction event. Each call is a fresh marker (no toggle).
+        try:
+            dashboard.mark_followed_up(get_conn(), recipient)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 404
+        return jsonify({"ok": True})
+
     @app.route("/api/gmass/refresh", methods=["POST"])
     def api_gmass_refresh():
         # Mirrors gmass_refresh() -- manual escalation of

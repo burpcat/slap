@@ -1086,6 +1086,93 @@ def reply_tags(conn) -> dict:
     return tags
 
 
+def _latest_interaction_events(conn) -> dict:
+    """Per recipient, the latest `interaction` event on EACH channel, as
+    {recipient: {channel: {"timestamp", "meta"}}}. "Last write per (recipient,
+    channel) wins" via `ORDER BY id ASC` + overwrite — the exact same
+    resolution shape as _latest_reply_lifecycle_events() above, just keyed
+    additionally by channel (a recipient can be both LinkedIn-replied AND
+    followed-up, independently). `interaction` is the one append-only event
+    type backing the LinkedIn-replied toggle, the follow-up "mark followed up"
+    timer reset, and Remind markers (see slap.tracking's module docstring).
+    A channel-less interaction row (shouldn't happen) is skipped, never
+    fabricated into a channel."""
+    rows = conn.execute(
+        "SELECT recipient, timestamp, meta FROM events WHERE type = 'interaction' ORDER BY id ASC"
+    ).fetchall()
+    latest: dict = {}
+    for row in rows:
+        meta = json.loads(row["meta"]) if row["meta"] else {}
+        channel = meta.get("channel")
+        if not channel:
+            continue
+        latest.setdefault(row["recipient"], {})[channel] = {"timestamp": row["timestamp"], "meta": meta}
+    return latest
+
+
+def linkedin_replied_state(conn) -> dict:
+    """Per recipient, whether they are CURRENTLY marked LinkedIn-replied — the
+    latest `linkedin_reply`-channel interaction's `meta.state` (toggle-off is a
+    fresh append with state=False, append-only preserved). Absent = never
+    toggled = not LinkedIn-replied; reachouts_rows() defaults missing to False.
+    Derived live from the log, never a stored column (same discipline as
+    reply_tags()/_stopped_recipients())."""
+    latest = _latest_interaction_events(conn)
+    out = {}
+    for recipient, channels in latest.items():
+        ev = channels.get("linkedin_reply")
+        if ev is not None:
+            out[recipient] = bool(ev["meta"].get("state"))
+    return out
+
+
+def _latest_interaction_at(conn) -> dict:
+    """Per recipient, the ISO timestamp of their most recent interaction on ANY
+    channel (LinkedIn-replied toggle, "followed up" marker, Remind). Feeds
+    follow_up_reminders()'s timer reset: a recipient's reminder clock restarts
+    from whichever is more recent — when they were marked Real, or their latest
+    interaction. Absent for anyone with no interaction events (their reminder
+    behaves exactly as before this feature). ISO-8601 UTC strings compare
+    chronologically, so max() over them is a correct 'most recent'."""
+    latest = _latest_interaction_events(conn)
+    return {r: max(ev["timestamp"] for ev in channels.values()) for r, channels in latest.items()}
+
+
+def _recipient_exists(conn, recipient) -> bool:
+    return conn.execute("SELECT 1 FROM recipients WHERE recipient = ?", (recipient,)).fetchone() is not None
+
+
+def mark_linkedin_replied(conn, recipient: str, replied: bool) -> None:
+    """Record (or clear) the LinkedIn-replied flag for one recipient as an
+    append-only `interaction` event. Fail loud on an unknown recipient (mirrors
+    resend_bounced()/stop_outreach()'s "must be a real recipient" guard) rather
+    than silently logging an interaction for someone who was never contacted.
+    Unlike tag_reply()/stop_outreach(), this fires NO GMass suppression call —
+    LinkedIn-replied is pipeline bookkeeping, not delivery suppression (GMass
+    has no visibility into LinkedIn at all)."""
+    if not _recipient_exists(conn, recipient):
+        raise ValueError(f"unknown recipient {recipient!r} — never staged/contacted")
+    campaign = conn.execute(
+        "SELECT campaign FROM recipients WHERE recipient = ?", (recipient,)
+    ).fetchone()["campaign"]
+    tracking.append_event(conn, type="interaction", recipient=recipient, campaign=campaign,
+                          meta={"channel": "linkedin_reply", "state": bool(replied)})
+
+
+def mark_followed_up(conn, recipient: str) -> None:
+    """Record that the owner personally followed up with one recipient — an
+    append-only `interaction` event that (via _latest_interaction_at()) restarts
+    their follow-up-reminder timer. Each click is its own fresh marker (no
+    toggle). Fail loud on an unknown recipient, same as mark_linkedin_replied()."""
+    if not _recipient_exists(conn, recipient):
+        raise ValueError(f"unknown recipient {recipient!r} — never staged/contacted")
+    campaign = conn.execute(
+        "SELECT campaign FROM recipients WHERE recipient = ?", (recipient,)
+    ).fetchone()["campaign"]
+    tracking.append_event(conn, type="interaction", recipient=recipient, campaign=campaign,
+                          meta={"channel": "followed_up"})
+
+
 def _real_tagged_at(conn) -> dict:
     """Per recipient CURRENTLY resolved to reply_tags()=='real', the ISO
     timestamp of the event that put them there — reuses
@@ -1182,10 +1269,22 @@ def follow_up_reminders(conn, *, today: date = None) -> list:
     and they fall out of that panel entirely, so nothing else on this
     dashboard reminds the owner to personally follow up with a live lead)."""
     today = today or date.today()
+    latest_interaction_at = _latest_interaction_at(conn)
     result = []
     for lead in active_leads(conn):
-        tagged_date = _local_date(lead["real_tagged_at"])
-        result.append({**lead, "days_since": (today - tagged_date).days})
+        # The timer restarts from whichever is more recent: when they were
+        # marked Real, or their latest interaction (a "followed up" click or a
+        # LinkedIn-replied toggle — req 4's "mark followed up restarts the
+        # timer, and syncs with linkedin-replied"). ISO-8601 UTC strings compare
+        # chronologically, so a plain max() is the correct 'most recent'.
+        interaction_at = latest_interaction_at.get(lead["recipient"])
+        anchor_ts = max(lead["real_tagged_at"], interaction_at) if interaction_at else lead["real_tagged_at"]
+        anchor_date = _local_date(anchor_ts)
+        result.append({
+            **lead,
+            "days_since": (today - anchor_date).days,
+            "last_interaction_at": interaction_at,
+        })
     return sorted(result, key=lambda e: e["days_since"], reverse=True)
 
 
@@ -1420,6 +1519,7 @@ def reachouts_rows(conn) -> list:
     click_details = _click_details(conn)
     corrected_from_map = _corrected_from_by_recipient(conn)
     already_corrected_map = _already_corrected_to(conn)
+    linkedin_replied_map = linkedin_replied_state(conn)
     rows = conn.execute("SELECT * FROM recipients").fetchall()
 
     result = []
@@ -1472,6 +1572,10 @@ def reachouts_rows(conn) -> list:
             "corrected_from": corrected_from_map.get(recipient),
             "already_corrected_to": already_corrected_map.get(recipient, []),
             "clicks": clicks,
+            # LinkedIn-replied (req 8.3): the owner-controlled per-reachout flag,
+            # derived live from the interaction log. Drives the highlighted
+            # LinkedIn icon in the React table and feeds the follow-up timer.
+            "linkedin_replied": linkedin_replied_map.get(recipient, False),
             # stopped (Stop outreach, Part 2): from _stopped_recipients()'s
             # durable, append-only read — NOT `status == 'stopped'` — so a
             # later bounce/reply event can never silently un-mark this row
