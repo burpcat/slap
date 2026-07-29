@@ -23,7 +23,10 @@ from slap.latex import recipient_workdir, run_latex_loop
 from slap.prompts import PASTE_TERMINATOR, read_paste
 from slap.queue import AmbiguousArchiveChoice, QueueError, resend_bounced, stage_recipient
 from slap.templates import fill_template, merge_config_values, parse_drop
-from slap import archive, dashboard, doctor, domains, gmass, gmass_cache, init, launchd, onboard, reload, runner, tracking
+from slap import (
+    archive, dashboard, doctor, domains, followups, gmass, gmass_cache, init, launchd, onboard,
+    reload, runner, tracking,
+)
 
 
 def cmd_list(args):
@@ -663,6 +666,75 @@ def cmd_interaction(args):
         return 1
 
 
+def cmd_remind(args):
+    # CLI backend for the dashboard's Remind action (req 9): queue a one-shot
+    # follow-up that fires as a threaded reply on the next drain. Templates are
+    # authored content on disk (followups/*.txt).
+    conn = tracking.connect()
+
+    if args.list:
+        saved = followups.discover_followups()
+        if not saved:
+            display.plain("No saved follow-ups yet — author one with `remind <recipient> --new --title \"...\"`.")
+            return
+        display.plain("Saved follow-ups:")
+        for f in saved:
+            display.plain(f"  {f['slug']}: {f['title']}")
+        return
+
+    if not args.recipient:
+        display.error("A recipient is required (or use --list).")
+        return 1
+
+    used_slug = None
+    if args.use:
+        try:
+            body = followups.load_followup(args.use)["body"]
+            used_slug = args.use
+        except followups.FollowupError as e:
+            display.fail(f"slap: {e}")
+            return 1
+    elif args.new:
+        try:
+            global_config = load_global_config()
+        except ConfigError as e:
+            display.fail(f"slap: {e}")
+            sys.exit(1)
+        editor_check = doctor.check_editor(global_config)
+        if not editor_check.ok:
+            display.fail(f"slap: {editor_check.detail} — set a valid `editor:` in config.yaml")
+            sys.exit(1)
+        scratch = recipient_workdir(CUSTOM_CAMPAIGN, args.recipient) / "remind-draft.txt"
+        if not scratch.exists():
+            scratch.write_text("", encoding="utf-8")
+        print("\nOpening your editor to write the reminder body...")
+        _open_in_editor(global_config.editor, scratch)
+        body = scratch.read_text(encoding="utf-8")
+        if not body.strip():
+            display.error("Empty reminder body — nothing queued.")
+            return 1
+        if args.title:
+            # "Save and send": warn that a saved template is generic and should
+            # be edited before reuse (matches the dashboard's save-and-send copy).
+            try:
+                saved = followups.save_followup(args.title, body)
+                used_slug = saved["slug"]
+                display.success(f"Saved follow-up '{saved['slug']}' (edit before reusing — it's generic).")
+            except followups.FollowupError as e:
+                display.fail(f"slap: {e}")
+                return 1
+    else:
+        display.error("Choose --use <slug> or --new (see `remind --list`).")
+        return 1
+
+    try:
+        dashboard.queue_remind_for(conn, args.recipient, body, followup=used_slug)
+    except (ValueError, QueueError) as e:
+        display.error(str(e))
+        return 1
+    display.success(f"Queued a reminder for {args.recipient} — it fires on the next drain.")
+
+
 RELOAD_SAMPLE_DIFF_COUNT = 3
 
 
@@ -900,6 +972,16 @@ def build_parser():
     p_interaction.add_argument("--off", action="store_true",
                                 help="With --channel linkedin-reply: CLEAR the flag instead of setting it")
     p_interaction.set_defaults(func=cmd_interaction)
+
+    p_remind = sub.add_parser(
+        "remind", help="Queue a one-shot follow-up reminder (fires as a threaded reply on the next drain)"
+    )
+    p_remind.add_argument("recipient", nargs="?", help="Recipient to remind (omit when using --list)")
+    p_remind.add_argument("--list", action="store_true", help="List saved follow-up templates")
+    p_remind.add_argument("--use", metavar="SLUG", help="Send using a saved follow-up template")
+    p_remind.add_argument("--new", action="store_true", help="Author a new reminder body in your editor")
+    p_remind.add_argument("--title", help="With --new: also save the authored body as a reusable template")
+    p_remind.set_defaults(func=cmd_remind)
     sub.add_parser(
         "template-reload",
         help="Re-render every not-yet-sent recipient's staged content against current templates",

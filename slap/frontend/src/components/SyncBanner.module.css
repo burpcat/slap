@@ -1,0 +1,36 @@
+.bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 32px;
+  background: var(--page);
+  border-bottom: 1px solid var(--hairline);
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+
+.left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.status {
+  padding: 2px 9px;
+  border-radius: 10px;
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+.stale { background: color-mix(in oklab, var(--warning) 22%, var(--surface-1)); color: var(--text-primary); }
+.unavailable { background: color-mix(in oklab, var(--critical) 18%, var(--surface-1)); color: var(--text-primary); }
+.freshDot { color: var(--good); }
+
+.warning {
+  padding: 8px 32px;
+  background: color-mix(in oklab, var(--warning) 14%, var(--surface-1));
+  border-bottom: 1px solid var(--warning);
+  font-size: 0.85rem;
+  color: var(--text-primary);
+}

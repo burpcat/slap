@@ -377,12 +377,23 @@ def latest_open_draft_id(conn: sqlite3.Connection, recipient: str):
     it can never be the reverse (a real open draft going undetected)."""
     rows = conn.execute(
         "SELECT type, gmass_draft_id FROM events WHERE recipient = ? "
-        "AND type IN ('draft_created', 'sent', 'requeued') ORDER BY id DESC",
+        "AND type IN ('draft_created', 'sent', 'requeued', 'interaction') ORDER BY id DESC",
         (recipient,),
     ).fetchall()
     for row in rows:
         if row["type"] in ("sent", "requeued"):
             return None  # already resolved since the last draft_created — nothing open
+        if row["type"] == "interaction":
+            # A Remind send (runner._send_remind) records a `remind_sent`
+            # interaction carrying the draft it sent in gmass_draft_id — that
+            # closes the Remind's own draft exactly like a `sent`/`requeued`
+            # does, so a subsequent send never reuses a stale Remind draft.
+            # Every other interaction channel (linkedin_reply/followed_up) has
+            # no draft and is skipped, leaving any genuinely-open earlier draft
+            # visible.
+            if row["gmass_draft_id"]:
+                return None
+            continue
         if row["type"] == "draft_created":
             return row["gmass_draft_id"]
     return None

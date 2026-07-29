@@ -53,6 +53,7 @@ from slap import archive, gmass_cache, tracking, ui_state
 from slap.color import campaign_colors
 from slap.config import discover_campaigns
 from slap.domains import check_recipient
+from slap.followups import FollowupError, discover_followups, load_followup, save_followup
 from slap.queue import QueueError, resend_bounced
 
 # Cache for the lazily-loaded top-level CLI module (slap.py). See _load_cli().
@@ -288,6 +289,41 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, api
         # second, independent GMass sweep of its own.
         gmass_data = dashboard.get_gmass_dependent_data(api_key, consumer_domains, redis_client, db_path)
         return jsonify({"sync_result": gmass_data["sync_result"], "cache_status": gmass_data["cache_status"]})
+
+    @app.route("/api/followups")
+    def api_followups():
+        # Saved Remind templates (req 9) — the "list of previously-saved
+        # follow-ups" the Remind popup shows.
+        return jsonify({"followups": [
+            {"slug": f["slug"], "title": f["title"]} for f in discover_followups()
+        ]})
+
+    @app.route("/api/reachouts/<string:recipient>/remind", methods=["POST"])
+    def api_remind(recipient):
+        # Queue a one-shot Remind (req 9). Body accepts either a saved-template
+        # `slug`, or a raw `body` (optionally with `save_title` to save it as a
+        # reusable template first — fail loud on a title clash, never a silent
+        # overwrite). The send fires on the next drain (threaded reply).
+        data = request.get_json(silent=True) or {}
+        slug = data.get("slug")
+        body = data.get("body")
+        save_title = data.get("save_title")
+        used_slug = slug
+        try:
+            if slug:
+                body = load_followup(slug)["body"]
+            elif body is not None:
+                if save_title:
+                    used_slug = save_followup(save_title, body)["slug"]
+            else:
+                return jsonify({"error": "provide a saved-followup 'slug' or a 'body'"}), 400
+        except FollowupError as e:
+            return jsonify({"error": str(e)}), 409
+        try:
+            dashboard.queue_remind_for(get_conn(), recipient, body, followup=used_slug)
+        except (ValueError, QueueError) as e:
+            return jsonify({"error": str(e)}), 400
+        return jsonify({"ok": True, "followup": used_slug})
 
     @app.route("/api/commands")
     def api_commands():

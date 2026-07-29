@@ -6,6 +6,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiGet, apiPost } from './client';
 import type {
   CampaignsResponse,
+  CampaignSlice,
   CommandsResponse,
   EngagementResponse,
   HomeResponse,
@@ -40,6 +41,14 @@ export function useEngagement(showHidden: boolean) {
 
 export function useCampaigns() {
   return useQuery({ queryKey: ['campaigns'], queryFn: () => apiGet<CampaignsResponse>('/api/campaigns') });
+}
+
+export function useCampaignSlice(campaign: string | null) {
+  return useQuery({
+    queryKey: ['campaigns', campaign],
+    queryFn: () => apiGet<CampaignSlice>(`/api/campaigns?campaign=${encodeURIComponent(campaign as string)}`),
+    enabled: campaign !== null,
+  });
 }
 
 export function useReachouts() {

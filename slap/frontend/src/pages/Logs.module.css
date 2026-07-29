@@ -1,0 +1,24 @@
+.eventRow {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--hairline);
+  font-size: 0.85rem;
+}
+.timestamp { color: var(--text-muted); font-variant-numeric: tabular-nums; flex: none; width: 160px; }
+.detail { color: var(--text-secondary); }
+
+.logPre {
+  background: var(--page);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  padding: 10px;
+  font-size: 0.78rem;
+  line-height: 1.5;
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-primary);
+}

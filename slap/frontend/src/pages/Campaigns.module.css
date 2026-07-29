@@ -1,0 +1,36 @@
+.selector {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 24px;
+}
+
+.pill {
+  all: unset;
+  cursor: pointer;
+  padding: 6px 14px;
+  border-radius: 20px;
+  border: 1px solid var(--border);
+  background: var(--surface-1);
+  font-size: 0.85rem;
+  display: flex;
+  align-items: center;
+}
+.pillActive {
+  border-color: var(--series-1);
+  font-weight: 600;
+}
+
+.leadRow {
+  display: flex;
+  justify-content: space-between;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--hairline);
+  font-size: 0.9rem;
+}
+.leadRow:last-child { border-bottom: none; }
+
+.empty {
+  color: var(--text-muted);
+  font-style: italic;
+}

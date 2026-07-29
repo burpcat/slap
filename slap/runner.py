@@ -42,7 +42,7 @@ from pathlib import Path
 
 from slap import doctor, gmass
 from slap.latex import WORKDIR_ROOT, recipient_workdir
-from slap.queue import due_for_ooo_resend, due_recipients, load_manifest
+from slap.queue import due_for_ooo_resend, due_for_remind, due_recipients, load_manifest
 from slap.tracking import append_event, latest_open_draft_id
 
 
@@ -387,6 +387,63 @@ def _send_ooo_resend(conn, api_key: str, row: dict, *, workdir_root: Path = WORK
     return True
 
 
+def _send_remind(conn, api_key: str, row: dict, *, workdir_root: Path = WORKDIR_ROOT,
+                 create_draft_fn=gmass.create_draft, send_campaign_fn=gmass.send_campaign) -> bool:
+    """Fire a one-shot Remind (Engagement/reach-out Remind action) as a reply
+    threaded into the recipient's original conversation — the same app-initiated
+    reply-in-thread shape as _send_ooo_resend, but using the externally-authored
+    body SNAPSHOTTED into the queued event (slap.queue.queue_remind), never a
+    persona-cadence stage, and WITHOUT advancing current_stage or touching
+    status (a Remind is a nudge, not a sequence transition). No attachment
+    (a threaded follow-up doesn't re-attach the résumé, same as OOO).
+
+    Idempotent like every other send path: the draft is created and its id
+    recorded (draft_created) before send_campaign fires, so a send failure is
+    retried via latest_open_draft_id without orphaning/double-creating. The
+    completion marker is a `remind_sent` interaction carrying the sent draft id
+    in gmass_draft_id — which is exactly what closes this Remind's open draft in
+    latest_open_draft_id (see that function's own comment) so a later send never
+    reuses a stale Remind draft, and what removes this recipient from
+    due_for_remind() so the same Remind can never fire twice."""
+    recipient, campaign = row["recipient"], row["campaign"]
+    try:
+        body = row["body"]
+        reply_to_campaign_id = row.get("campaign_id_to_reply_to")
+        if not reply_to_campaign_id:
+            raise RunnerError("no prior gmass_campaign_id to reply into for remind")
+        subject_ref = (row.get("subject_ref") or "").strip()
+        subject = f"Re: {subject_ref}" if subject_ref else "Re: following up"
+        reply_settings = gmass.build_reply_settings(reply_to_campaign_id)
+    except Exception as e:
+        append_event(conn, type="send_failed", recipient=recipient, campaign=campaign,
+                     meta={"stage": "load_remind_data", "error": str(e)})
+        return False
+
+    draft_id = latest_open_draft_id(conn, recipient)
+    if draft_id is None:
+        try:
+            draft = create_draft_fn(api_key, recipient=recipient, subject=subject, message=body)
+        except Exception as e:
+            append_event(conn, type="send_failed", recipient=recipient, campaign=campaign,
+                         meta={"stage": "create_draft_remind", "error": str(e)})
+            return False
+        draft_id = draft["draft_id"]
+        append_event(conn, type="draft_created", recipient=recipient, campaign=campaign,
+                     gmass_draft_id=draft_id)
+
+    try:
+        sent = send_campaign_fn(api_key, draft_id, campaign_settings=reply_settings)
+    except Exception as e:
+        append_event(conn, type="send_failed", recipient=recipient, campaign=campaign,
+                     gmass_draft_id=draft_id, meta={"stage": "send_campaign_remind", "error": str(e)})
+        return False
+
+    append_event(conn, type="interaction", recipient=recipient, campaign=campaign,
+                 gmass_draft_id=draft_id, gmass_campaign_id=sent["campaign_id"],
+                 meta={"channel": "remind_sent", "followup": row.get("followup")})
+    return True
+
+
 def drain(conn, global_config, api_key: str, *, now: date = None, sleep_fn=time.sleep,
           random_fn=random.uniform, workdir_root: Path = WORKDIR_ROOT,
           create_draft_fn=gmass.create_draft, send_campaign_fn=gmass.send_campaign,
@@ -436,9 +493,17 @@ def drain(conn, global_config, api_key: str, *, now: date = None, sleep_fn=time.
     # query can never resend to the same recipient twice in one batch.
     due_initial = due_recipients(conn)
     due_ooo = due_for_ooo_resend(conn, today=today)
+    # Reminds (one-shot manual nudges) fire on the same runner cadence as
+    # everything else — just more rows in the same cap-bounded batch, dispatched
+    # via _send_remind. A recipient already dispatched this drain (initial or
+    # OOO) is excluded, belt-and-suspenders against any double-send.
+    due_remind = due_for_remind(conn)
     initial_recipients = {row["recipient"] for row in due_initial}
+    ooo_recipients = {row["recipient"] for row in due_ooo}
     due = ([(row, _send_one) for row in due_initial]
-           + [(row, _send_ooo_resend) for row in due_ooo if row["recipient"] not in initial_recipients])
+           + [(row, _send_ooo_resend) for row in due_ooo if row["recipient"] not in initial_recipients]
+           + [(row, _send_remind) for row in due_remind
+              if row["recipient"] not in initial_recipients and row["recipient"] not in ooo_recipients])
     to_send = due[:headroom]
 
     sent_count = 0
@@ -450,13 +515,15 @@ def drain(conn, global_config, api_key: str, *, now: date = None, sleep_fn=time.
                   "send_campaign_fn": send_campaign_fn}
         if send_fn is _send_ooo_resend:
             kwargs["today"] = today
-        else:
-            # Not threaded through to _send_ooo_resend: an OOO resend has no
-            # stage cadence of its own to restrict (build_reply_settings()
-            # never sets stageNDays at all) — the day restriction only means
-            # anything where there's a follow-up sequence for it to apply to.
+        elif send_fn is _send_one:
+            # Not threaded through to _send_ooo_resend/_send_remind: a threaded
+            # reply has no stage cadence of its own to restrict
+            # (build_reply_settings() never sets stageNDays at all) — the day
+            # restriction only means anything where there's a follow-up
+            # sequence for it to apply to.
             kwargs["gmass_allowed_days"] = global_config.gmass_allowed_days
             kwargs["gmass_skip_holidays"] = global_config.gmass_skip_holidays
+        # _send_remind takes no extra kwargs (single one-shot reply-in-thread).
         try:
             ok = send_fn(conn, api_key, row, **kwargs)
         except Exception as e:
@@ -475,7 +542,8 @@ def drain(conn, global_config, api_key: str, *, now: date = None, sleep_fn=time.
         else:
             failed_count += 1
 
-    remaining = len(due_recipients(conn)) + len(due_for_ooo_resend(conn, today=today))
+    remaining = (len(due_recipients(conn)) + len(due_for_ooo_resend(conn, today=today))
+                 + len(due_for_remind(conn)))
     append_event(conn, type="run_completed",
                  meta={"sent": sent_count, "failed": failed_count, "remaining_queued": remaining})
     return DrainResult(ran=True, sent=sent_count, failed=failed_count, remaining_queued=remaining)

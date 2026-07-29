@@ -50,6 +50,7 @@ from slap.queue import (
     QueueError, _pending_ooo_resume_date, due_for_ooo_resend, due_recipients, resend_bounced,
     tag_ooo as _tag_ooo,
 )
+from slap.queue import queue_remind as _queue_remind
 from slap.runner import cap_headroom, staleness_warning as _runner_staleness_warning
 from slap.tracking import append_event
 
@@ -1171,6 +1172,32 @@ def mark_followed_up(conn, recipient: str) -> None:
     ).fetchone()["campaign"]
     tracking.append_event(conn, type="interaction", recipient=recipient, campaign=campaign,
                           meta={"channel": "followed_up"})
+
+
+def remind_eligible(conn) -> set:
+    """Recipients a one-shot Remind may target (req 9): warm-but-silent
+    (clicked, no reply) ∪ LinkedIn-replied ∪ real leads. A union of three
+    EXISTING resolvers (warm_but_silent/linkedin_replied_state/active_leads),
+    reused rather than re-derived so this can never disagree with the pages
+    those rosters already drive."""
+    warm = {r["recipient"] for r in warm_but_silent(conn)}
+    linked = {r for r, on in linkedin_replied_state(conn).items() if on}
+    real = {lead["recipient"] for lead in active_leads(conn)}
+    return warm | linked | real
+
+
+def queue_remind_for(conn, recipient: str, body: str, *, followup: str = None) -> None:
+    """Queue a one-shot Remind for a recipient (the dashboard/CLI Remind
+    action). Enforces eligibility (fail loud if not warm-but-silent/LinkedIn-
+    replied/real), then delegates the actual snapshot-and-queue to
+    slap.queue.queue_remind (which fires on the normal drain as a threaded
+    reply — the only sanctioned post-initial send path, no scheduler)."""
+    if recipient not in remind_eligible(conn):
+        raise ValueError(
+            f"{recipient} is not remind-eligible — a Remind can only go to a warm-but-silent, "
+            f"LinkedIn-replied, or real lead"
+        )
+    _queue_remind(conn, recipient, body, followup=followup)
 
 
 def _real_tagged_at(conn) -> dict:

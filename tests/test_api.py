@@ -560,3 +560,53 @@ def test_api_followed_up_ok(app, tmp_path):
 def test_api_followed_up_unknown_recipient_404(app):
     resp = app.test_client().post("/api/reachouts/ghost@x.com/followed-up", json={})
     assert resp.status_code == 404
+
+
+# --- Remind endpoints -------------------------------------------------------
+
+def _seed_real_lead_api(conn, recipient="a@acme.com", campaign="c"):
+    append_event(conn, type="queued", recipient=recipient, campaign=campaign, stage=0,
+                 meta={"persona": "recruiter", "cadence": []})
+    append_event(conn, type="sent", recipient=recipient, campaign=campaign, stage=0, gmass_campaign_id="555")
+    append_event(conn, type="reply", recipient=recipient, campaign=campaign)
+    append_event(conn, type="reply_reviewed", recipient=recipient, campaign=campaign, meta={"tag": "real"})
+
+
+def test_api_remind_ineligible_returns_400(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    seed_sent_recipient(conn, recipient="a@x.com", campaign="c")  # sent, not eligible
+    conn.close()
+    resp = app.test_client().post("/api/reachouts/a@x.com/remind", json={"body": "hi"})
+    assert resp.status_code == 400
+
+
+def test_api_remind_body_queues_for_real_lead(app, tmp_path):
+    from slap.queue import due_for_remind
+    conn = connect(tmp_path / "test.db")
+    _seed_real_lead_api(conn, recipient="a@acme.com")
+    conn.close()
+    resp = app.test_client().post("/api/reachouts/a@acme.com/remind", json={"body": "circle back"})
+    assert resp.status_code == 200 and resp.get_json()["ok"] is True
+
+    conn = connect(tmp_path / "test.db")
+    assert len(due_for_remind(conn)) == 1
+
+
+def test_api_remind_save_title_creates_reusable_template(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    _seed_real_lead_api(conn, recipient="a@acme.com")
+    conn.close()
+    client = app.test_client()
+    resp = client.post("/api/reachouts/a@acme.com/remind", json={"body": "hi", "save_title": "My Nudge"})
+    assert resp.status_code == 200
+    assert resp.get_json()["followup"] == "my-nudge"
+    listed = client.get("/api/followups").get_json()["followups"]
+    assert any(f["slug"] == "my-nudge" for f in listed)
+
+
+def test_api_remind_missing_body_and_slug_returns_400(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    _seed_real_lead_api(conn, recipient="a@acme.com")
+    conn.close()
+    resp = app.test_client().post("/api/reachouts/a@acme.com/remind", json={})
+    assert resp.status_code == 400

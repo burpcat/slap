@@ -1,0 +1,17 @@
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--hairline);
+  font-size: 0.9rem;
+}
+.row:last-child { border-bottom: none; }
+
+.empty { color: var(--text-muted); font-style: italic; padding: 8px 0; }
+
+.stageList { display: flex; gap: 20px; flex-wrap: wrap; }
+.stageTile { min-width: 90px; }
+.stageValue { font-size: 1.4rem; font-weight: 600; font-family: Georgia, serif; }
+.stageLabel { font-size: 0.78rem; color: var(--text-secondary); }

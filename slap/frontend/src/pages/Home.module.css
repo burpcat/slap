@@ -1,0 +1,54 @@
+.pageTitle {
+  margin-bottom: 24px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--hairline);
+}
+.row:last-child { border-bottom: none; }
+
+.rowMain {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.rowTitle {
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+.rowMeta {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+
+.actions {
+  display: flex;
+  gap: 6px;
+  flex: none;
+}
+
+.empty {
+  color: var(--text-muted);
+  font-style: italic;
+  padding: 12px 0;
+}
+
+.companyList {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.companyList li {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.9rem;
+  padding: 3px 0;
+}
