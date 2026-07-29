@@ -7,6 +7,7 @@ current build state / package layout.
 import argparse
 import difflib
 import os
+import subprocess
 import sys
 from datetime import date
 from pathlib import Path
@@ -15,7 +16,9 @@ from dotenv import load_dotenv
 
 from slap import display
 from slap.cleanup import DEFAULT_MIN_DAYS_IDLE, delete_eligible, find_cleanup_candidates
-from slap.config import ConfigError, discover_campaigns, load_campaign, load_global_config
+from slap.config import (
+    ConfigError, discover_campaigns, load_campaign, load_global_config, parse_initial_txt_text,
+)
 from slap.latex import recipient_workdir, run_latex_loop
 from slap.prompts import PASTE_TERMINATOR, read_paste
 from slap.queue import AmbiguousArchiveChoice, QueueError, resend_bounced, stage_recipient
@@ -62,6 +65,11 @@ def _run_doctor_or_exit(global_config, campaign=None):
 
 
 def cmd_send(args):
+    # `slap.py send custom` is a distinct one-off mode, not a real campaign
+    # folder — "custom" is a reserved campaign token (a campaigns/custom/ folder
+    # would be shadowed by this branch; documented in USAGE).
+    if args.campaign == "custom":
+        return cmd_send_custom(args)
     try:
         global_config = load_global_config()
         campaign = load_campaign(args.campaign, global_config)
@@ -96,6 +104,181 @@ def cmd_send(args):
 
         if input("\nAdd another? [Y/n]: ").strip().lower() == "n":
             break
+
+    if args.now:
+        print("\n--now: draining the queue immediately...")
+        result = runner.drain(conn, global_config, os.environ.get(global_config.api_key_env, ""))
+        _print_drain_result(result)
+
+
+CUSTOM_CAMPAIGN = "__custom__"  # reserved pseudo-campaign label for `send custom`
+
+
+def _open_in_editor(editor_cmd: str, path: Path) -> None:
+    """Open `path` in the configured editor and BLOCK until it returns. The
+    editor command is a full string (`code --wait`, `vim`, ...) so GUI editors
+    can carry their own wait-flag — see config.editor's own docstring for why a
+    bare `code` would return immediately and read back stale content."""
+    parts = editor_cmd.split()
+    try:
+        subprocess.run([*parts, str(path)], check=False)
+    except FileNotFoundError:
+        raise ConfigError(
+            f"editor command {parts[0]!r} not found on PATH — set a valid `editor:` in config.yaml"
+        )
+
+
+def _ask_positive_int(prompt: str, *, read_line=input) -> int:
+    while True:
+        raw = read_line(prompt).strip()
+        try:
+            n = int(raw)
+        except ValueError:
+            display.warn("  Enter a whole number >= 1.")
+            continue
+        if n >= 1:
+            return n
+        display.warn("  Enter a whole number >= 1.")
+
+
+def _choose_custom_attachment(workdir: Path, recipient: str, *, read_line=input):
+    """Resolve the attachment for a custom send. Returns
+    (attachment_path|None, attachment_name|None, latex_enabled). Four modes
+    (per the owner's spec): pick a PDF already in this send's folder, paste an
+    absolute path, author LaTeX now (compile + the >1-page hard gate), or none."""
+    while True:
+        display.plain("\nAttachment:")
+        display.plain(f"  1. Pick a PDF already placed in this send's folder ({workdir})")
+        display.plain("  2. Paste an absolute path to a PDF")
+        display.plain("  3. Write a LaTeX résumé now (compile + >1-page gate)")
+        display.plain("  4. No attachment")
+        choice = read_line("Choose [1-4]: ").strip()
+        if choice == "1":
+            pdfs = sorted(workdir.glob("*.pdf"))
+            if not pdfs:
+                display.warn(f"  No PDFs found in {workdir} — place one there first, or pick another option.")
+                continue
+            for i, p in enumerate(pdfs, start=1):
+                display.plain(f"  {i}. {p.name}")
+            sel = read_line(f"Pick [1-{len(pdfs)}]: ").strip()
+            try:
+                picked = pdfs[int(sel) - 1]
+            except (ValueError, IndexError):
+                display.warn("  Not understood.")
+                continue
+            return picked, picked.name, False
+        if choice == "2":
+            p = Path(read_line("Absolute path to a PDF: ").strip()).expanduser()
+            if not p.is_file():
+                display.warn(f"  {p} is not a file.")
+                continue
+            if p.suffix.lower() != ".pdf":
+                display.warn(f"  {p} is not a .pdf.")
+                continue
+            return p, p.name, False
+        if choice == "3":
+            name = read_line("Attachment filename the recipient sees [Resume.pdf]: ").strip() or "Resume.pdf"
+            tex_source = read_paste(f"\nPaste the LaTeX résumé source for {recipient}")
+            staged = run_latex_loop(workdir, tex_source, name)
+            if staged is None:
+                display.warn("  LaTeX aborted — choose an attachment option again.")
+                continue
+            return staged.path, name, True
+        if choice == "4":
+            return None, None, False
+        display.warn("  Enter 1, 2, 3, or 4.")
+
+
+def cmd_send_custom(args):
+    """`slap.py send custom` — author a one-off message (+ optional custom-cadence
+    follow-ups) in the configured editor, choose an attachment, and stage it via
+    the SAME queue/runner machinery as a normal send (campaign='__custom__',
+    persona='custom', an explicit per-recipient cadence). No campaign.yaml is
+    ever created; auto-discovery never sees this."""
+    try:
+        global_config = load_global_config()
+    except ConfigError as e:
+        display.fail(f"slap: {e}")
+        sys.exit(1)
+
+    # Fail loud NOW if the editor isn't usable (this command's one hard prereq).
+    editor_check = doctor.check_editor(global_config)
+    if not editor_check.ok:
+        display.fail(f"slap: {editor_check.detail} — set a valid `editor:` in config.yaml")
+        sys.exit(1)
+
+    try:
+        consumer_domains = domains.load_consumer_domains(Path(global_config.consumer_domains_file))
+    except domains.DomainsError as e:
+        display.fail(f"slap: {e}")
+        sys.exit(1)
+
+    conn = tracking.connect()
+    recipient = input("\nRecipient email: ").strip()
+    if not recipient:
+        display.error("No recipient email — aborting.")
+        return 1
+
+    workdir = recipient_workdir(CUSTOM_CAMPAIGN, recipient)
+
+    # Initial email: Subject: line + blank line + body, authored in the editor
+    # (same shape every initial.txt uses, validated by the same parser).
+    initial_path = workdir / "initial.txt"
+    if not initial_path.exists():
+        initial_path.write_text("Subject: \n\n", encoding="utf-8")
+    print("\nOpening your editor for the initial email (first line 'Subject: ...', blank line, then body)...")
+    _open_in_editor(global_config.editor, initial_path)
+    try:
+        subject, body = parse_initial_txt_text(initial_path.read_text(encoding="utf-8"), ctx=str(initial_path))
+    except ConfigError as e:
+        display.fail(f"slap: {e}")
+        return 1
+
+    # Custom cadence: each follow-up asks its own day-gap, then opens the editor
+    # for that stage's body. This per-stage day-gap list IS the cadence staged
+    # for this recipient (recipients.cadence), no persona involved.
+    cadence, stage_bodies = [], []
+    while True:
+        if input(f"\nAdd a follow-up (stage {len(cadence) + 1})? [y/N]: ").strip().lower() != "y":
+            break
+        gap = _ask_positive_int(f"Days after the previous message before stage {len(cadence) + 1} fires: ")
+        stage_path = workdir / f"stage{len(cadence) + 1}.txt"
+        if not stage_path.exists():
+            stage_path.write_text("", encoding="utf-8")
+        print(f"Opening your editor for stage {len(cadence) + 1}'s body...")
+        _open_in_editor(global_config.editor, stage_path)
+        cadence.append(gap)
+        stage_bodies.append(stage_path.read_text(encoding="utf-8"))
+
+    attachment_path, attachment_name, latex_enabled = _choose_custom_attachment(workdir, recipient)
+
+    # Dedup awareness — warn, never block (same as a normal send).
+    dedup = domains.check_recipient(conn, recipient, consumer_domains)
+    if dedup.hard_warning:
+        w = dedup.hard_warning
+        display.error(f"\n⚠ HARD WARN: {recipient} already contacted — campaign={w.campaign} status={w.status}")
+    if dedup.soft_warning_contacts:
+        display.warn(f"\n⚠ SOFT WARN: {len(dedup.soft_warning_contacts)} other contact(s) on domain "
+                     f"{dedup.soft_warning_domain}")
+    if (dedup.hard_warning or dedup.soft_warning_contacts) and \
+            input(display.styled_prompt("Proceed anyway? [y/N]: ", style=display.YELLOW)).strip().lower() != "y":
+        print("Skipped.")
+        return
+
+    display.preview_panel(recipient, subject, body)
+    print(f"Attachment: {attachment_name if attachment_name else '(none)'}")
+    print(f"Cadence (custom): {cadence}" if cadence else "Cadence: initial send only (no follow-ups)")
+    if input("\nStage this custom send? [y/N]: ").strip().lower() != "y":
+        print("Skipped.")
+        return
+
+    stage_recipient(
+        conn, campaign=CUSTOM_CAMPAIGN, recipient=recipient, persona="custom",
+        cadence=cadence, subject=subject, body=body, stage_bodies=stage_bodies,
+        attachment_path=attachment_path, attachment_name=attachment_name, latex_enabled=latex_enabled,
+        archive_dir=archive.archive_dir_from_env(),
+    )
+    display.success(f"Staged {recipient} (custom send).")
 
     if args.now:
         print("\n--now: draining the queue immediately...")
@@ -690,8 +873,10 @@ def build_parser():
 
     sub.add_parser("list", help="List auto-discovered campaigns").set_defaults(func=cmd_list)
 
-    p_send = sub.add_parser("send", help="Prep flow: stage a recipient to the queue")
-    p_send.add_argument("campaign")
+    p_send = sub.add_parser(
+        "send", help="Prep flow: stage a recipient to the queue (use `send custom` for a one-off editor-authored send)"
+    )
+    p_send.add_argument("campaign", help="Campaign name, or the literal 'custom' for an editor-authored one-off send")
     p_send.add_argument("--now", action="store_true", help="Also drain immediately after staging")
     p_send.set_defaults(func=cmd_send)
 

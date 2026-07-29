@@ -243,9 +243,16 @@ def _send_one(conn, api_key: str, row: dict, *, workdir_root: Path = WORKDIR_ROO
         # Absent/None (latex-enabled campaigns, and any staged.json written
         # before this field existed): read the per-recipient compiled PDF
         # already sitting in this recipient's own workdir, as before.
-        attachment_source = manifest.get("attachment_source")
-        attachment_path = Path(attachment_source) if attachment_source else workdir / attachment_name
-        attachment_bytes = attachment_path.read_bytes()
+        # attachment_name is None (no sentinel file) for a no-attachment
+        # `send custom` (mode 4) — send with no attachment at all. Otherwise
+        # resolve bytes as before (attachment_source for static campaigns, or
+        # the per-recipient workdir file for latex).
+        if attachment_name is None:
+            attachment_arg = None
+        else:
+            attachment_source = manifest.get("attachment_source")
+            attachment_path = Path(attachment_source) if attachment_source else workdir / attachment_name
+            attachment_arg = (attachment_name, attachment_path.read_bytes(), "application/pdf")
         campaign_settings = gmass.build_campaign_settings(
             cadence, stage_bodies, allowed_days=gmass_allowed_days, skip_holidays=gmass_skip_holidays,
         )
@@ -259,7 +266,7 @@ def _send_one(conn, api_key: str, row: dict, *, workdir_root: Path = WORKDIR_ROO
         try:
             draft = create_draft_fn(
                 api_key, recipient=recipient, subject=subject, message=body,
-                attachment=(attachment_name, attachment_bytes, "application/pdf"),
+                attachment=attachment_arg,
             )
         except Exception as e:
             append_event(conn, type="send_failed", recipient=recipient, campaign=campaign,

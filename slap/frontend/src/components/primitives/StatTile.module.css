@@ -1,0 +1,45 @@
+.row {
+  display: flex;
+  gap: 28px;
+  flex-wrap: wrap;
+}
+
+.tile {
+  min-width: 100px;
+}
+
+.value {
+  font-family: Georgia, "Iowan Old Style", serif;
+  font-size: 2rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+  line-height: 1.15;
+}
+
+.suffix {
+  font-size: 1rem;
+  font-weight: 400;
+  color: var(--text-secondary);
+}
+
+.label {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  margin-top: 2px;
+}
+
+.gaugeTrack {
+  background: var(--hairline);
+  border-radius: 6px;
+  height: 10px;
+  overflow: hidden;
+  margin: 8px 0 4px;
+}
+.gaugeFill { height: 100%; border-radius: 6px; }
+.good { background: var(--good); }
+.warningFill { background: var(--warning); }
+.criticalFill { background: var(--critical); }
+.goodTrack { background: color-mix(in oklab, var(--good) 22%, var(--surface-1)); }
+.warningTrack { background: color-mix(in oklab, var(--warning) 22%, var(--surface-1)); }
+.criticalTrack { background: color-mix(in oklab, var(--critical) 22%, var(--surface-1)); }

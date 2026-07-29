@@ -140,6 +140,14 @@ def stage_recipient(conn, *, campaign: str, recipient: str, persona: str, cadenc
             shutil.copyfile(attachment_path, staged_attachment)
         attachment_source = None  # None means "read from workdir/attachment_name"
         real_attachment_path = staged_attachment
+    elif attachment_path is None:
+        # No-attachment send (`slap.py send custom` mode 4): `attachment_name`
+        # is also None, and that None is the sentinel _send_one keys on to send
+        # with no attachment at all (attachment_source=None here does NOT mean
+        # "read from workdir" as it does for latex — attachment_name being None
+        # is what disambiguates the two). Nothing to archive.
+        attachment_source = None
+        real_attachment_path = None
     else:
         attachment_source = str(attachment_path.resolve())
         real_attachment_path = attachment_path.resolve()
@@ -152,10 +160,11 @@ def stage_recipient(conn, *, campaign: str, recipient: str, persona: str, cadenc
     }
     (workdir / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
-    try:
-        archive.archive_resume(real_attachment_path, archive_dir, company=company, role=role, when=when)
-    except Exception as e:
-        display.warn(f"resume archive: unexpected error archiving for {recipient}: {e}")
+    if real_attachment_path is not None:
+        try:
+            archive.archive_resume(real_attachment_path, archive_dir, company=company, role=role, when=when)
+        except Exception as e:
+            display.warn(f"resume archive: unexpected error archiving for {recipient}: {e}")
 
     append_event(conn, type="queued", recipient=recipient, campaign=campaign, stage=0,
                  meta={"persona": persona, "company": company, "role": role, "req_id": req_id,
