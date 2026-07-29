@@ -26,7 +26,7 @@ export default function App() {
     <SplashGate>
       <ThemeProvider>
         <QueryClientProvider client={queryClient}>
-          <BrowserRouter basename="/static/dist/">
+          <BrowserRouter basename="/">
             <Layout>
               <Routes>
                 <Route path="/" element={<Home />} />

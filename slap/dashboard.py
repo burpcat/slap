@@ -41,7 +41,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
-from flask import Flask, g, redirect, request, render_template, url_for
+from flask import Flask, abort, g, send_file
 
 from slap import archive, display, domains, gmass, gmass_cache, reload, tracking, ui_state
 from slap.config import discover_campaigns
@@ -54,7 +54,9 @@ from slap.queue import queue_remind as _queue_remind
 from slap.runner import cap_headroom, staleness_warning as _runner_staleness_warning
 from slap.tracking import append_event
 
-TEMPLATE_FOLDER = str(Path(__file__).parent / "dashboard_templates")
+STATIC_DIST = Path(__file__).parent / "static" / "dist"
+SPA_MISSING_MESSAGE = ("Frontend bundle not built \u2014 run "
+                       "`npm --prefix slap/frontend run build`.")
 
 
 def _all_campaign_ids(conn) -> list:
@@ -1965,8 +1967,7 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
     `slap.db` (both derived from the same "wherever this is run from"
     convention, see slap/launchd.py), so no caller needs to pass this
     explicitly; tests override it to point at their own tmp_path."""
-    app = Flask(__name__, template_folder=TEMPLATE_FOLDER)
-    app.jinja_env.filters["to_local"] = _to_local
+    app = Flask(__name__)  # serves the React SPA (STATIC_DIST) + the /api/* JSON layer
     redis_client = redis_client if redis_client is not None else gmass_cache.redis_client_from_url(
         global_config.redis_url
     )
@@ -1985,295 +1986,25 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
         if conn is not None:
             conn.close()
 
-    @app.context_processor
-    def inject_template_failures_count():
-        # Multi-page redesign (post-launch): every page's shared nav
-        # (base.html) needs this count to decide whether to show the
-        # Template Failures link at all — a context processor runs on
-        # every render_template() call automatically, so no route has to
-        # remember to pass it (the way only index() used to).
-        return {"template_failures_count": len(template_failures())}
-
-    @app.context_processor
-    def inject_runner_staleness_warning():
-        # Every page's shared header (base.html) surfaces this — a launchd-
-        # level failure (e.g. EX_CONFIG) writes ZERO events at all, unlike an
-        # in-app failure which at least logs run_failed (see todays_runs()'s
-        # own "today's runs" panel) — so without this, a launchd job that's
-        # silently stopped firing is invisible until someone notices the
-        # queue backing up (see slap.runner.staleness_warning's docstring for
-        # the real incident this was found from).
-        return {"runner_staleness_warning": _runner_staleness_warning(get_conn(), global_config.schedule)}
-
+    # --- Serve the built React SPA (the dashboard frontend) ------------------
+    # The browser gets JSON from /api/* (registered below) plus the static
+    # bundle Vite builds into slap/static/dist/ (served by Flask's default
+    # /static/ handler). This serves index.html at "/" AND for every client-side
+    # route, so a deep-link/refresh on e.g. /reachouts still returns the app
+    # shell rather than a 404 -- React Router owns routing under "/". /api/* and
+    # /static/* match their own more-specific rules first; the catch-all only
+    # guards against an unknown /api/ path. (The old Jinja pages + form-POST
+    # routes were retired in the React cutover; every read is now a /api/* GET
+    # and every write a /api/* POST -- see slap/api.py.)
     @app.route("/")
-    def index():
-        # Home (multi-page redesign, post-launch): the operational pulse +
-        # the one thing that needs a same-visit decision. Everything else
-        # that used to render here (Engagement intelligence, Warm but
-        # silent, Bounces & blocks, Pipeline, Companies contacted, Active
-        # leads, Follow-up reminders) now lives on its own page — see
-        # engagement_page()/deliverability_page()/pipeline_page() below.
-        # `replies` (actionable_replies, Redis-cached) is the one exception
-        # kept here even though it shares a cache blob with Engagement's
-        # widgets: it's the only GMass-dependent widget that demands a
-        # same-visit decision, so it stays where it's seen every open
-        # rather than buried on a page shared with lagging-indicator
-        # analytics.
-        conn = get_conn()
-        gmass_data = get_gmass_dependent_data(api_key, consumer_domains, redis_client, db_path)
-        return render_template(
-            "dashboard.html",
-            sync_result=gmass_data["sync_result"],
-            replies=gmass_data["replies"],
-            cache_status=gmass_data["cache_status"],
-            today=today_strip(conn, global_config),
-            week=this_week(conn),
-            runs=todays_runs(conn),
-            next_drain=next_drain(conn, global_config),
-        )
-
-    @app.route("/pipeline")
-    def pipeline_page():
-        # Pipeline (multi-page redesign): the live-recipient work queue —
-        # Active Leads/Follow-up reminders (own reply-tag roster) alongside
-        # mid-sequence-by-stage/followups-scheduled and companies contacted
-        # (queue/workflow facts, not engagement analytics — see the design
-        # plan for why these were split off "Engagement" onto their own
-        # page). Named `pipeline_page`, not `pipeline` — the latter is
-        # already the imported widget function `pipeline(conn,
-        # global_config)` below; reusing the name would shadow it. Zero
-        # GMass-cache dependency at all (every widget here is a plain
-        # uncached SQLite read) — no sync_result/cache_status passed, so
-        # base.html's banner block is naturally absent, and this page is
-        # always instant and never stale.
-        conn = get_conn()
-        return render_template(
-            "pipeline.html",
-            active_leads=active_leads(conn),
-            follow_up_reminders=follow_up_reminders(conn),
-            pipeline=pipeline(conn, global_config),
-            companies=companies_contacted(conn, consumer_domains),
-        )
-
-    @app.route("/engagement")
-    def engagement_page():
-        # Engagement (multi-page redesign): aggregate + per-recipient
-        # engagement signal. This is the hide/unhide-related block moved
-        # VERBATIM out of index() (see git history) — the one genuine
-        # behavior change in the whole redesign is that
-        # hide_warm_but_silent()/unhide_warm_but_silent() below now
-        # redirect here instead of to index().
-        conn = get_conn()
-        gmass_data = get_gmass_dependent_data(api_key, consumer_domains, redis_client, db_path)
-        all_warm_but_silent = gmass_data["warm_but_silent"]
-        hidden_recipients = _warm_but_silent_hidden_recipients(conn)
-        show_hidden = request.args.get("show_hidden") == "1"
-        visible_warm_but_silent_rows = (
-            all_warm_but_silent if show_hidden
-            else [r for r in all_warm_but_silent if r["recipient"] not in hidden_recipients]
-        )
-        return render_template(
-            "engagement.html",
-            sync_result=gmass_data["sync_result"],
-            cache_status=gmass_data["cache_status"],
-            engagement=gmass_data["engagement"],
-            warm_but_silent=visible_warm_but_silent_rows,
-            warm_but_silent_hidden_recipients=hidden_recipients,
-            warm_but_silent_hidden_count=len(
-                [r for r in all_warm_but_silent if r["recipient"] in hidden_recipients]
-            ),
-            show_hidden=show_hidden,
-        )
-
-    @app.route("/deliverability")
-    def deliverability_page():
-        # Deliverability (multi-page redesign): why a recipient stopped
-        # moving — Bounces & blocks alongside the new Stopped outreach
-        # roster (stopped_outreach_roster(), below), the same pairing the
-        # earlier Part-3 widget proposal recommended.
-        conn = get_conn()
-        gmass_data = get_gmass_dependent_data(api_key, consumer_domains, redis_client, db_path)
-        return render_template(
-            "deliverability.html",
-            sync_result=gmass_data["sync_result"],
-            cache_status=gmass_data["cache_status"],
-            bounces=gmass_data["bounces"],
-            stopped_outreach=stopped_outreach_roster(conn),
-        )
-
-    @app.route("/analytics")
-    def analytics_page():
-        # Analytics: trend/comparison charts, all derived from local
-        # events + config — deliberately zero GMass/Redis dependency (same
-        # as Pipeline/Reachouts/Logs), so this page is always instant and
-        # never shows the stale-cache banner.
-        conn = get_conn()
-        days = request.args.get("days", 30, type=int)
-        if days not in (7, 30, 90):
-            days = 30
-        return render_template(
-            "analytics.html",
-            trend=sent_reply_trend(conn, days=days),
-            trend_days=days,
-            bounce_data=bounce_breakdown(conn),
-            reply_rate_by_persona=_reply_rate_by_persona(conn),
-            time_to_first_reply=_time_to_first_reply_distribution(conn),
-            weekly_goal=weekly_goal_progress(conn, global_config.schedule.weekly_target),
-        )
-
-    @app.route("/warm-but-silent/<string:recipient>/hide", methods=["POST"])
-    def hide_warm_but_silent(recipient):
-        ui_state.hide(get_conn(), recipient, WARM_BUT_SILENT_WIDGET)
-        return redirect(url_for("engagement_page"))
-
-    @app.route("/warm-but-silent/<string:recipient>/unhide", methods=["POST"])
-    def unhide_warm_but_silent(recipient):
-        ui_state.unhide(get_conn(), recipient, WARM_BUT_SILENT_WIDGET)
-        return redirect(url_for("engagement_page", show_hidden=1))
-
-    @app.route("/gmass/refresh", methods=["POST"])
-    def gmass_refresh():
-        # Manual escalation of get_gmass_dependent_data's own background
-        # refresh — e.g. right after tagging a reply, since invalidate()
-        # already clears the cache for that action but the auto-refresh
-        # otherwise only fires on the NEXT page load. Redirects immediately
-        # either way rather than waiting on the sweep, same as the
-        # auto-triggered path never blocks the request that spawned it.
-        try:
-            gmass_cache.ping(redis_client)
-        except gmass_cache.RedisUnavailable:
-            return redirect(url_for("index"))
-        _spawn_background_refresh(db_path, api_key, consumer_domains, redis_client)
-        return redirect(url_for("index"))
-
-    @app.route("/reachouts")
-    def reachouts():
-        # Read-only, local-state-only page (§ Reach-outs): deliberately does
-        # NOT call sync_reports() — every other route's on-open GMass poll is
-        # optional per the feature's own spec ("if the page itself needs a
-        # fresh poll on open, that's fine — but filtering afterward is a pure
-        # local-data operation"). Skipping it entirely here is the simplest
-        # way to guarantee this page can NEVER make a GMass call, no matter
-        # how it's used. Rows are rendered in full (unfiltered) — filtering/
-        # sorting happens client-side in the page's own <script>, never a
-        # server round-trip, so no pagination or query-param handling is
-        # needed here either.
-        rows = reachouts_rows(get_conn())
-        return render_template("reachouts.html", rows=rows, total_count=len(rows),
-                                warning=request.args.get("warning"))
-
-    @app.route("/logs")
-    def logs_page():
-        # Local-only, same as Reach-outs/Pipeline — never calls GMass, so no
-        # sync_result is passed and base.html's sync banner naturally stays
-        # hidden here too. No pagination state (matches every other page in
-        # this app): just a LIMIT, bumped via a "Show more" link that
-        # re-requests with a bigger one.
-        limit = request.args.get("limit", EVENTS_DEFAULT_LIMIT, type=int)
-        events = recent_events(get_conn(), limit=limit)
-        for ev in events:
-            ev["display"] = event_display(ev)
-        logs = {name: read_log_tail(log_dir / name) for name in LOG_FILES}
-        return render_template(
-            "logs.html", events=events, total_count=len(events), limit=limit,
-            truncated=len(events) == limit, event_types=sorted(tracking.EVENT_TYPES), logs=logs,
-        )
-
-    @app.route("/template-failures")
-    def template_failures_page():
-        # Always registered regardless of whether any failures currently
-        # exist — direct navigation must show a real page (an honest "no
-        # failures" empty state), never a 404, even though the nav link to
-        # it (index() above) only appears when template_failures_count > 0.
-        failures = template_failures()
-        return render_template("template_failures.html", failures=failures, total_count=len(failures))
-
-    @app.route("/reply/<string:recipient>/tag", methods=["POST"])
-    def reply_tag(recipient):
-        # Shared by both OOO entry points (dashboard.html's reply-tag widget
-        # and reachouts.html's per-row "Mark OOO" action) — see
-        # slap.dashboard.tag_reply's own docstring for why this is one
-        # route/one function, not duplicated logic.
-        tag = request.form.get("tag", "")
-        resume_date_str = request.form.get("resume_date", "").strip()
-        resume_date = None
-        if resume_date_str:
-            try:
-                resume_date = date.fromisoformat(resume_date_str)
-            except ValueError:
-                return f"invalid resume_date {resume_date_str!r} — expected YYYY-MM-DD", 400
-        try:
-            tag_reply(get_conn(), recipient, tag, resume_date=resume_date, api_key=api_key)
-        except ValueError as e:
-            return str(e), 400
-        except Exception as e:
-            # Most likely slap.gmass.unsubscribe_recipient failing (network,
-            # invalid key, GMassError) — fail loud with a clear message
-            # rather than a bare 500, and confirm nothing was recorded
-            # locally either (see tag_reply's docstring: the GMass call runs
-            # BEFORE any local event, precisely so a failure here can never
-            # leave a false "handled" local pause with no real suppression).
-            # Both 'ooo' and 'not_interested' hit this path now (both call
-            # unsubscribe_fn first) — the message stays tag-generic.
-            return f"could not tag {recipient} ({tag!r}) — GMass suppression call failed, nothing was recorded: {e}", 502
-        # Any successful tag can change actionable_replies()'s output (any
-        # of the four tags resolves needs_triage()) — invalidate rather than
-        # let the owner's own action sit invisible in a stale cache for up
-        # to an hour. Forces the next dashboard load to take the same
-        # stale/missing-cache fallback path as any other cache miss, never
-        # a separate "partial update" mechanism.
-        gmass_cache.invalidate(redis_client)
-        redirect_to = request.form.get("redirect_to", "index")
-        return redirect(url_for("reachouts" if redirect_to == "reachouts" else "index"))
-
-    @app.route("/reachouts/<string:recipient>/stop", methods=["POST"])
-    def stop_outreach_route(recipient):
-        # Stop outreach (Part 2, post-launch): per-recipient only (confirmed
-        # with the owner — see stop_outreach()'s own docstring for why a
-        # wider, company/persona scope was explicitly ruled out). Not routed
-        # through actionable_replies()/needs_triage() at all — unlike
-        # reply_tag above, a stop can apply to a recipient who never replied
-        # (mid-cadence, role fell through) just as easily as one who did, so
-        # there's no cached widget this needs to invalidate (active_leads()/
-        # follow_up_reminders()/pipeline() are all plain, uncached SQLite
-        # reads computed fresh on every index() load, same as before this
-        # feature — see compute_gmass_dependent_data's own module docstring
-        # for exactly which four widgets DO depend on the Redis cache; this
-        # isn't one of them).
-        try:
-            stop_outreach(get_conn(), recipient, api_key=api_key)
-        except Exception as e:
-            return (f"could not stop outreach to {recipient} — GMass suppression call failed, "
-                    f"nothing was recorded: {e}", 502)
-        return redirect(url_for("reachouts"))
-
-    @app.route("/reachouts/<string:recipient>/resend", methods=["POST"])
-    def resend(recipient):
-        # Bounce remediation (post-launch): the Reach-outs row action for a
-        # status=='bounced' recipient. Shares slap.queue.resend_bounced()
-        # with the `./slap.py bounced` CLI command — see that function's own
-        # docstring for why it does NOT run the dedup check itself; this
-        # route runs it here, purely for display (informational only, never
-        # blocking — the owner has already made an explicit correction by
-        # submitting this form).
-        corrected_email = request.form.get("corrected_email", "").strip()
-        if not corrected_email:
-            return "corrected_email is required", 400
-        conn = get_conn()
-        dedup = check_recipient(conn, corrected_email, consumer_domains)
-        warning = None
-        if dedup.hard_warning:
-            w = dedup.hard_warning
-            warning = f"{corrected_email} already contacted — campaign={w.campaign} status={w.status}"
-        elif dedup.soft_warning_contacts:
-            warning = (f"{len(dedup.soft_warning_contacts)} other contact(s) already on domain "
-                       f"{dedup.soft_warning_domain}")
-        try:
-            resend_bounced(conn, original_recipient=recipient, corrected_email=corrected_email,
-                            archive_dir=archive.archive_dir_from_env())
-        except QueueError as e:
-            return str(e), 400
-        return redirect(url_for("reachouts", warning=warning) if warning else url_for("reachouts"))
+    @app.route("/<path:path>")
+    def spa(path=""):
+        if path.startswith("api/"):
+            abort(404)
+        index_html = STATIC_DIST / "index.html"
+        if not index_html.exists():
+            abort(503, description=SPA_MISSING_MESSAGE)
+        return send_file(index_html)
 
     # JSON API layer (post-launch, purely additive -- see slap/api.py's own
     # module docstring). Imported here, not at this module's own top level,

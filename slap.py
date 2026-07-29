@@ -575,6 +575,15 @@ def cmd_dashboard(args):
                      f"GMass poll (replies/clicks/bounces) needs it. See .env.example.")
         sys.exit(1)
 
+    # The dashboard is now a React SPA served from a built bundle (slap/static/
+    # dist/). Fail loud with the exact build command if it's missing, same "run
+    # this setup step first" convention as a missing .env/config.yaml — the
+    # bundle is generated, not committed (see .gitignore).
+    if not (dashboard.STATIC_DIST / "index.html").exists():
+        display.fail("slap: frontend bundle not built — run "
+                     "`npm --prefix slap/frontend run build` first (Node required; see README).")
+        sys.exit(1)
+
     tracking.connect().close()  # ensure the DB file + schema exist before serving
     app = dashboard.create_app(tracking.DB_PATH, global_config, consumer_domains, api_key)
     # Not 5000: macOS's AirPlay Receiver (Control Center) listens there by
