@@ -11,6 +11,20 @@ export default defineConfig({
   build: {
     outDir: '../static/dist',
     emptyOutDir: true,
+    rollupOptions: {
+      output: {
+        // Split vendored libs into their own long-cacheable chunks. `charts`
+        // (chart.js + react-chartjs-2) is the heavy one and is only referenced
+        // by the lazily-loaded Engagement route, so Rollup keeps it out of the
+        // initial download and fetches it only when that page is opened.
+        manualChunks: {
+          'vendor-react': ['react', 'react-dom', 'react-router-dom'],
+          'vendor-query': ['@tanstack/react-query'],
+          'vendor-charts': ['chart.js', 'react-chartjs-2'],
+          'vendor-floating': ['@floating-ui/react'],
+        },
+      },
+    },
   },
   server: {
     proxy: {
