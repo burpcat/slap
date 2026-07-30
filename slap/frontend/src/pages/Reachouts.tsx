@@ -9,8 +9,11 @@ import {
 } from '../api/hooks';
 import { useTheme } from '../theme/useTheme';
 import type { CampaignColor, ReachoutRow } from '../api/types';
-import { StatusChip } from '../components/primitives/Chip';
+import { StatusChip, CampaignDot } from '../components/primitives/Chip';
+import { Button } from '../components/primitives/Button';
+import { OooPopover } from '../components/OooPopover';
 import { RowMenu } from '../components/RowMenu';
+import { shortDate } from '../utils/format';
 import styles from './Reachouts.module.css';
 
 type SortKey = 'recipient' | 'campaign' | 'persona' | 'status' | 'date_local';
@@ -111,6 +114,35 @@ function FilterSelect({
   );
 }
 
+// The reply/engagement cell collapses email + LinkedIn into one "have they
+// responded at all" read (req 9's OR of email replies and LinkedIn): an email
+// reply and a LinkedIn reply are independent channels, either one counts as a
+// response. Falls back to click / no-activity, and shows the owner's reply tag
+// (real / OOO / not-interested) when one exists.
+function ReplyCell({ row }: { row: ReachoutRow }) {
+  const emailReplied = row.engagement === 'replied';
+  const responded = emailReplied || row.linkedin_replied;
+  return (
+    <div className={styles.engage}>
+      {responded ? (
+        <span className={styles.responded}>
+          replied
+          <span className={styles.channels}>
+            {emailReplied && 'email'}
+            {emailReplied && row.linkedin_replied && ' + '}
+            {row.linkedin_replied && 'in'}
+          </span>
+        </span>
+      ) : row.engagement === 'clicked' ? (
+        <span className={styles.clicked}>clicked</span>
+      ) : (
+        <span className={styles.noneEngage}>—</span>
+      )}
+      {row.reply_tag && <span className={styles.replyTag} data-tag={row.reply_tag}>{row.reply_tag.replace('_', ' ')}</span>}
+    </div>
+  );
+}
+
 function RowActions({ row, colors }: { row: ReachoutRow; colors: Record<string, CampaignColor> }) {
   const { effective } = useTheme();
   const tag = useTagReply(row.recipient);
@@ -119,6 +151,7 @@ function RowActions({ row, colors }: { row: ReachoutRow; colors: Record<string, 
   const linkedin = useLinkedinReplied(row.recipient);
   const color = colors[row.campaign];
   const tint = color ? (effective === 'dark' ? color.dark : color.light) : 'transparent';
+  const pending = tag.isPending || stop.isPending || resend.isPending;
 
   const rowStyle = { borderLeftColor: tint } as CSSProperties;
 
@@ -126,42 +159,69 @@ function RowActions({ row, colors }: { row: ReachoutRow; colors: Record<string, 
     <tr className={styles.row} style={rowStyle} data-status={row.status}>
       <td>
         <div className={styles.recipientCell}>
-          <span>{row.recipient}</span>
+          <span className={styles.recipientEmail}>{row.recipient}</span>
           {(row.name || row.company) && (
             <span className={styles.recipientMeta}>
               {[row.name, row.company].filter(Boolean).join(' · ')}
+              {row.req_id_present && <span className={styles.reqId}>req id</span>}
             </span>
           )}
         </div>
       </td>
-      <td>{row.campaign}</td>
+      <td>
+        <span className={styles.campaignCell}>
+          {color && <CampaignDot color={color} />}
+          {row.campaign}
+        </span>
+      </td>
       <td>{row.persona}</td>
       <td>
         <StatusChip color={row.chip.color} label={row.chip.label} />
       </td>
-      <td>{row.date_local ?? '—'}</td>
       <td>
-        <button
-          className={`${styles.linkedin} ${row.linkedin_replied ? styles.linkedinActive : ''}`}
-          title={row.linkedin_replied ? 'LinkedIn: replied (click to unmark)' : 'Mark LinkedIn replied'}
-          onClick={() => linkedin.mutate({ replied: !row.linkedin_replied })}
-          disabled={linkedin.isPending}
-        >
-          in
-        </button>
+        <ReplyCell row={row} />
       </td>
+      <td className={styles.dateCell}>{shortDate(row.date_local)}</td>
       <td>
-        <RowMenu
-          row={row}
-          actions={{
-            pending: tag.isPending || stop.isPending || resend.isPending,
-            onMarkOoo: (resume_date) => tag.mutate({ tag: 'ooo', resume_date }),
-            onStop: () => stop.mutate(),
-            onResend: (corrected_email) => resend.mutate({ corrected_email }),
-            onTagReal: () => tag.mutate({ tag: 'real' }),
-            onTagNotInterested: () => tag.mutate({ tag: 'not_interested' }),
-          }}
-        />
+        <div className={styles.actionsCell}>
+          {/* Inline triage — the common actions, no longer buried in the "…"
+              menu (req 9). Real / Not interested / OOO (date popup). */}
+          <Button small variant="primary" disabled={pending} onClick={() => tag.mutate({ tag: 'real' })}>
+            Real
+          </Button>
+          <Button small disabled={pending} onClick={() => tag.mutate({ tag: 'not_interested' })}>
+            Not
+          </Button>
+          <OooPopover
+            pending={pending}
+            onConfirm={(resume_date) => tag.mutate({ tag: 'ooo', resume_date })}
+            trigger={
+              <Button small disabled={pending}>
+                OOO
+              </Button>
+            }
+          />
+          <button
+            className={`${styles.linkedin} ${row.linkedin_replied ? styles.linkedinActive : ''}`}
+            title={row.linkedin_replied ? 'LinkedIn: replied (click to unmark)' : 'Mark replied on LinkedIn'}
+            onClick={() => linkedin.mutate({ replied: !row.linkedin_replied })}
+            disabled={linkedin.isPending}
+          >
+            in
+          </button>
+          {/* Overflow: less-common / destructive actions (Stop, Resend). */}
+          <RowMenu
+            row={row}
+            actions={{
+              pending,
+              onMarkOoo: (resume_date) => tag.mutate({ tag: 'ooo', resume_date }),
+              onStop: () => stop.mutate(),
+              onResend: (corrected_email) => resend.mutate({ corrected_email }),
+              onTagReal: () => tag.mutate({ tag: 'real' }),
+              onTagNotInterested: () => tag.mutate({ tag: 'not_interested' }),
+            }}
+          />
+        </div>
       </td>
     </tr>
   );
@@ -219,16 +279,19 @@ export default function Reachouts() {
   };
   const filtersOn = anyFilterActive(filters) || !!search.trim();
 
+  // Sortable columns that appear before the (non-sortable) Reply cell. Date is
+  // rendered as its own sortable header after Reply so it sits beside the row's
+  // date cell; Reply and Actions are not sortable.
   const columns: { key: SortKey; label: string }[] = [
     { key: 'recipient', label: 'Recipient' },
     { key: 'campaign', label: 'Campaign' },
     { key: 'persona', label: 'Persona' },
     { key: 'status', label: 'Status' },
-    { key: 'date_local', label: 'Date' },
   ];
+  const TOTAL_COLS = columns.length + 3; // + Reply + Date + Actions
 
   return (
-    <div>
+    <div className={styles.page}>
       <h1>Reach-outs</h1>
       <div className={styles.toolbar}>
         <input
@@ -292,14 +355,18 @@ export default function Reachouts() {
                   {sortKey === col.key && <span className={styles.arrow}>{sortDir === 'asc' ? '▲' : '▼'}</span>}
                 </th>
               ))}
-              <th>LinkedIn</th>
-              <th></th>
+              <th className={styles.noSort}>Reply</th>
+              <th onClick={() => setSort('date_local')}>
+                Date
+                {sortKey === 'date_local' && <span className={styles.arrow}>{sortDir === 'asc' ? '▲' : '▼'}</span>}
+              </th>
+              <th className={styles.noSort}>Actions</th>
             </tr>
           </thead>
           <tbody>
             {filteredSorted.length === 0 ? (
               <tr>
-                <td colSpan={columns.length + 2} className={styles.empty}>
+                <td colSpan={TOTAL_COLS} className={styles.empty}>
                   No reach-outs match these filters.
                 </td>
               </tr>

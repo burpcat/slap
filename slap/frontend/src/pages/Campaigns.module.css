@@ -24,11 +24,31 @@
 .leadRow {
   display: flex;
   justify-content: space-between;
-  padding: 8px 0;
+  align-items: flex-start;
+  gap: 16px;
+  padding: 10px 0;
   border-bottom: 1px solid var(--hairline);
   font-size: 0.9rem;
 }
 .leadRow:last-child { border-bottom: none; }
+
+.leadStatus {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  text-align: right;
+  white-space: nowrap;
+}
+.leadStatusMain {
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+.leadStatusSub {
+  font-size: 0.74rem;
+  color: var(--text-muted);
+}
 
 .empty {
   color: var(--text-muted);

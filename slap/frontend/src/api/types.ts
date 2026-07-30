@@ -72,6 +72,10 @@ export interface CompaniesContacted {
   all_time_count: number;
   this_week_count: number;
   top_companies: [string, number][];
+  // Full (domain, count) roster for the front-page company word cloud — same
+  // set as top_companies, just not truncated. TLD stripping is a display concern
+  // (done in the UI); the domain is the real key here.
+  all_companies: [string, number][];
 }
 
 export interface ActiveLead {
@@ -86,6 +90,10 @@ export interface ActiveLead {
 export interface FollowUpReminder extends ActiveLead {
   days_since: number;
   last_interaction_at: string | null;
+  // Computed cadence date for the next personal nudge: anchor (max of
+  // real-tagged / last interaction) + a fixed gap. Derived, not stored — it
+  // auto-recomputes when "Followed up" moves the anchor. ISO YYYY-MM-DD.
+  next_follow_up_date: string;
 }
 
 export interface ContactContext {
@@ -169,6 +177,7 @@ export interface HomeResponse {
 // --- /api/pipeline -----------------------------------------------------------
 
 export interface PipelineResponse {
+  today: TodayStrip;
   active_leads: ActiveLead[];
   follow_up_reminders: FollowUpReminder[];
   pipeline: Pipeline;

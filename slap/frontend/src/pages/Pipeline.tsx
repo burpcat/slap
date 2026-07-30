@@ -1,6 +1,7 @@
 import { usePipeline } from '../api/hooks';
 import { Card, CardGrid } from '../components/primitives/Card';
-import { StatusChip } from '../components/primitives/Chip';
+import { BounceItem } from '../components/BounceItem';
+import { shortDate } from '../utils/format';
 import styles from './Pipeline.module.css';
 
 export default function Pipeline() {
@@ -33,15 +34,21 @@ export default function Pipeline() {
           )}
         </Card>
 
-        <Card title="Follow-ups firing today / tomorrow">
+        <Card title="Follow-ups: fired vs firing">
           <div className={styles.stageList}>
+            {/* Fired today climbs and "still firing today" falls as the day's
+                follow-ups drain (req 2). */}
+            <div className={styles.stageTile}>
+              <div className={styles.stageValue}>{data.today.sent.follow_up}</div>
+              <div className={styles.stageLabel}>fired today</div>
+            </div>
             <div className={styles.stageTile}>
               <div className={styles.stageValue}>{today.length}</div>
-              <div className={styles.stageLabel}>today</div>
+              <div className={styles.stageLabel}>still firing today</div>
             </div>
             <div className={styles.stageTile}>
               <div className={styles.stageValue}>{tomorrow.length}</div>
-              <div className={styles.stageLabel}>tomorrow</div>
+              <div className={styles.stageLabel}>firing tomorrow</div>
             </div>
           </div>
         </Card>
@@ -68,7 +75,10 @@ export default function Pipeline() {
             data.follow_up_reminders.map((r) => (
               <div key={r.recipient} className={styles.row}>
                 <span>{r.recipient}</span>
-                <span>{r.days_since}d since real</span>
+                <span className={styles.reminderMeta}>
+                  {r.days_since}d since {r.last_interaction_at ? 'follow-up' : 'real'} · next{' '}
+                  {shortDate(r.next_follow_up_date)}
+                </span>
               </div>
             ))
           )}
@@ -89,17 +99,7 @@ export default function Pipeline() {
           {data.bounces.length === 0 ? (
             <p className={styles.empty}>No bounces or blocks.</p>
           ) : (
-            data.bounces.map((b) => (
-              <div key={b.recipient} className={styles.row}>
-                <span>
-                  {b.recipient} · {b.campaign}
-                </span>
-                <span>
-                  <StatusChip color="critical" label={b.category === 'block' ? 'Blocked' : 'Bounced'} />{' '}
-                  {b.reason}
-                </span>
-              </div>
-            ))
+            data.bounces.map((b) => <BounceItem key={b.recipient} bounce={b} />)
           )}
         </Card>
 
@@ -113,7 +113,7 @@ export default function Pipeline() {
                   {s.recipient} {s.company && `· ${s.company}`}
                 </span>
                 <span>
-                  {s.stopped_at ? new Date(s.stopped_at).toLocaleDateString() : '—'} ({s.scope})
+                  {s.stopped_at ? shortDate(s.stopped_at) : '—'} ({s.scope})
                 </span>
               </div>
             ))

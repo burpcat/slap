@@ -173,6 +173,10 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, api
         conn = get_conn()
         gmass_data = dashboard.get_gmass_dependent_data(api_key, consumer_domains, redis_client, db_path)
         return jsonify({
+            # today_strip rides along (cheap, GMass-independent) so the
+            # "follow-ups firing today" panel can show how many already FIRED
+            # today (today.sent.follow_up) vs are still due — req 2.
+            "today": dashboard.today_strip(conn, global_config),
             "active_leads": dashboard.active_leads(conn),
             "follow_up_reminders": dashboard.follow_up_reminders(conn),
             "pipeline": dashboard.pipeline(conn, global_config),

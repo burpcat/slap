@@ -1,0 +1,23 @@
+.cloud {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 16px;
+  margin-top: 14px;
+  line-height: 1.5;
+}
+
+.word {
+  font-family: Georgia, "Iowan Old Style", serif;
+  color: var(--text-primary);
+  transition: color 0.15s ease;
+  cursor: default;
+}
+.word:hover {
+  color: var(--series-1);
+}
+
+.empty {
+  color: var(--text-muted);
+  font-style: italic;
+}

@@ -152,7 +152,8 @@ def test_api_pipeline_returns_expected_keys(app):
         resp = app.test_client().get("/api/pipeline")
     assert resp.status_code == 200
     body = resp.get_json()
-    for key in ("active_leads", "follow_up_reminders", "pipeline", "companies", "bounces", "stopped_outreach"):
+    for key in ("today", "active_leads", "follow_up_reminders", "pipeline", "companies", "bounces",
+                "stopped_outreach"):
         assert key in body, key
 
 
@@ -610,3 +611,14 @@ def test_api_remind_missing_body_and_slug_returns_400(app, tmp_path):
     conn.close()
     resp = app.test_client().post("/api/reachouts/a@acme.com/remind", json={})
     assert resp.status_code == 400
+
+
+# --- company word-cloud roster ----------------------------------------------
+
+def test_api_home_companies_include_all_companies_roster(app):
+    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+        companies = app.test_client().get("/api/home").get_json()["companies"]
+    # Full roster is present and is a superset-shaped (domain, count) list — same
+    # shape as top_companies, just not truncated to 5.
+    assert "all_companies" in companies
+    assert isinstance(companies["all_companies"], list)

@@ -1,0 +1,11 @@
+.timer {
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.due {
+  color: var(--warning);
+  font-weight: 600;
+}
