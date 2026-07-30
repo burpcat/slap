@@ -92,6 +92,66 @@ def _strip_ansi(s: str) -> str:
     return _ANSI_RE.sub("", s or "")
 
 
+# USAGE.md is the human-authored day-to-day guide; its fenced code blocks and
+# inline `slap.py …` command spans are the canonical, curated examples. We pull
+# them straight from there so the Commands tab's examples match the docs (and
+# update whenever the docs do) rather than being a second, hand-kept copy.
+_USAGE_PATH = Path(__file__).resolve().parent.parent / "USAGE.md"
+_usage_examples_cache = None
+
+
+def _load_usage_examples() -> dict:
+    """Parse USAGE.md into {command_name: [example invocation, ...]}. Pulls
+    `slap.py <cmd> …` lines from fenced code blocks and inline `code` spans,
+    keeping only clean, runnable ones — anything carrying argparse signature
+    notation ([], {}, |) is skipped (that's what the `usage:` line is for).
+    Cached per process; a missing USAGE.md just yields {} (callers fall back to
+    synthesized examples)."""
+    global _usage_examples_cache
+    if _usage_examples_cache is not None:
+        return _usage_examples_cache
+    result: dict = {}
+    try:
+        text = _USAGE_PATH.read_text()
+    except OSError:
+        _usage_examples_cache = {}
+        return _usage_examples_cache
+
+    candidates = []
+    in_fence = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            candidates.append(stripped)
+        else:
+            candidates.extend(re.findall(r"`([^`]+)`", line))  # inline `code` spans
+
+    for cand in candidates:
+        cand = cand.strip()
+        m = re.match(r"^(?:python\s+)?slap\.py\s+([a-z][\w-]*)\b", cand)
+        if not m or any(ch in cand for ch in "{}|["):
+            continue
+        name = m.group(1)
+        ex = re.sub(r"^python\s+", "", cand)  # uniform "slap.py …"
+        result.setdefault(name, [])
+        if ex not in result[name]:
+            result[name].append(ex)
+    _usage_examples_cache = result
+    return result
+
+
+def _fill_placeholders(example: str, campaign: str, recipient: str) -> str:
+    """Swap the doc's placeholders for the owner's real data so examples read
+    like their own tool."""
+    return (example
+            .replace("<campaign>", campaign)
+            .replace("my-campaign", campaign)
+            .replace("<recipient>", recipient))
+
+
 def _command_examples(name: str, args: list, campaigns: list, recipient: str) -> list:
     """Concrete, copy-pasteable example invocations for a command — using the
     owner's REAL campaign names and a real recipient from their DB (passed in)
@@ -155,6 +215,8 @@ def commands_reference(*, campaigns=None, sample_recipient=None) -> list:
     data) are woven into each command's examples so the reference feels concrete."""
     campaigns = list(campaigns or [])
     recipient = sample_recipient or "jordan@acme.com"
+    c0 = campaigns[0] if campaigns else "my-campaign"
+    usage_examples = _load_usage_examples()
     parser = _load_cli().build_parser()
     sub_actions = [a for a in parser._actions if isinstance(a, argparse._SubParsersAction)]
     out = []
@@ -173,12 +235,16 @@ def commands_reference(*, campaigns=None, sample_recipient=None) -> list:
                     "required": bool(getattr(act, "required", False)),
                     "choices": list(act.choices) if act.choices else None,
                 })
+            # Prefer USAGE.md's curated examples (with the owner's real
+            # campaign/recipient filled in); fall back to synthesized ones only
+            # for commands the docs don't show a runnable example for.
+            doc_examples = [_fill_placeholders(e, c0, recipient) for e in usage_examples.get(name, [])]
             out.append({
                 "name": name,
                 "help": _strip_ansi(help_by_name.get(name, "")),
                 "usage": _strip_ansi(" ".join(subparser.format_usage().split())),
                 "args": args,
-                "examples": _command_examples(name, args, campaigns, recipient),
+                "examples": doc_examples or _command_examples(name, args, campaigns, recipient),
             })
     out.sort(key=lambda c: c["name"])
     return out
