@@ -585,3 +585,116 @@ def test_rebuild_removes_a_stale_recipient_row_with_no_backing_events(conn):
 def _ts(n):
     from datetime import datetime, timedelta, timezone
     return datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(minutes=n)
+
+
+# --- 'interaction' event type: cache-inertness + migration ----------------
+
+def test_interaction_requires_a_recipient(conn):
+    # interaction is not a run-level type, so (like every recipient-scoped
+    # event) it fails loud without a recipient.
+    with pytest.raises(TrackingError):
+        append_event(conn, type="interaction", meta={"channel": "followed_up"})
+
+
+def test_interaction_is_cache_inert_but_bumps_last_event_at(conn):
+    # A per-reachout interaction (LinkedIn-replied / followed-up / remind) must
+    # never move a recipient's status or stage — it is bookkeeping, not a send-
+    # pipeline transition — but it does advance last_event_at, exactly like a
+    # click. (Its actual current-state is derived live from the log elsewhere.)
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter", "cadence": [2, 4]})
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=0,
+                 gmass_campaign_id="123", timestamp=_ts(1))
+    before = recipient_row(conn, "a@x.com")
+
+    append_event(conn, type="interaction", recipient="a@x.com", campaign="c",
+                 meta={"channel": "linkedin_reply", "state": True}, timestamp=_ts(5))
+    after = recipient_row(conn, "a@x.com")
+
+    assert after["status"] == before["status"] == "active"
+    assert after["current_stage"] == before["current_stage"] == 0
+    assert after["last_gmass_campaign_id"] == before["last_gmass_campaign_id"] == "123"
+    assert after["last_event_at"] == _ts(5).isoformat()  # only this moved
+
+
+def test_rebuild_reproduces_cache_identically_with_interaction_events(conn):
+    # Rebuild-equivalence (§5) must still hold once interaction events are in
+    # the log — a cache-inert type is exactly the kind of thing a replay could
+    # subtly diverge on if it were handled differently in append vs rebuild.
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter", "cadence": [2, 4]})
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=0,
+                 gmass_campaign_id="123", timestamp=_ts(1))
+    append_event(conn, type="interaction", recipient="a@x.com", campaign="c",
+                 meta={"channel": "linkedin_reply", "state": True}, timestamp=_ts(2))
+    append_event(conn, type="interaction", recipient="a@x.com", campaign="c",
+                 meta={"channel": "followed_up"}, timestamp=_ts(3))
+    live = all_recipients(conn)
+
+    rebuild(conn)
+    assert all_recipients(conn) == live
+
+
+# --- 'interaction' migration for a db already carrying 'stopped' ----------
+
+def _pre_interaction_events_table_sql():
+    # The events table's CREATE statement exactly as it looked AFTER the
+    # 'stopped' migration but BEFORE 'interaction' was added — i.e. a real
+    # owner's slap.db that has already been through the earlier migration.
+    return """
+    CREATE TABLE events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        recipient TEXT,
+        campaign TEXT,
+        type TEXT NOT NULL CHECK (type IN (
+            'queued','draft_created','sent','click','reply','bounce','ooo_tagged','requeued',
+            'reply_reviewed','run_started','run_completed','send_failed','run_failed','stopped'
+        )),
+        stage INTEGER,
+        gmass_campaign_id TEXT,
+        gmass_draft_id TEXT,
+        meta TEXT
+    );
+    """
+
+
+def test_connect_migrates_a_db_that_has_stopped_but_not_interaction(tmp_path):
+    path = tmp_path / "post_stopped.db"
+    raw = sqlite3.connect(path)
+    raw.executescript(_pre_interaction_events_table_sql())
+    # A 'stopped' row proves this fixture is the post-stopped schema, and it
+    # must survive the interaction migration untouched.
+    raw.execute(
+        "INSERT INTO events (timestamp, recipient, campaign, type) VALUES (?, ?, ?, ?)",
+        ("2026-01-01T00:00:00+00:00", "a@x.com", "c", "stopped"),
+    )
+    # A raw insert of 'interaction' against this db is rejected — confirms the
+    # fixture really lacks the new literal.
+    with pytest.raises(sqlite3.IntegrityError):
+        raw.execute(
+            "INSERT INTO events (timestamp, recipient, campaign, type) VALUES (?, ?, ?, ?)",
+            ("2026-01-01T00:00:00+00:00", "a@x.com", "c", "interaction"),
+        )
+    raw.commit()
+    raw.close()
+
+    migrated = connect(path)
+    rows = all_events(migrated)
+    assert len(rows) == 1 and rows[0]["type"] == "stopped"
+
+    # 'interaction' now works after the migration.
+    append_event(migrated, type="interaction", recipient="a@x.com", campaign="c",
+                 meta={"channel": "followed_up"})
+    assert any(r["type"] == "interaction" for r in all_events(migrated))
+
+
+def test_interaction_migration_is_idempotent(tmp_path):
+    path = tmp_path / "post_stopped.db"
+    raw = sqlite3.connect(path)
+    raw.executescript(_pre_interaction_events_table_sql())
+    raw.commit()
+    raw.close()
+
+    connect(path).close()
+    connect(path).close()  # second connect on an already-migrated db must not raise

@@ -1,0 +1,35 @@
+.container {
+  position: relative;
+  height: 260px;
+  margin-bottom: 10px;
+}
+.container.short {
+  height: 200px;
+}
+
+.tableView {
+  margin-top: 6px;
+}
+.tableView summary {
+  cursor: pointer;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+.tableView summary:hover {
+  color: var(--text-primary);
+}
+.tableView table {
+  margin-top: 8px;
+  font-size: 0.82rem;
+}
+.tableView th,
+.tableView td {
+  text-align: left;
+  padding: 4px 10px 4px 0;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.empty {
+  color: var(--text-muted);
+  font-style: italic;
+}

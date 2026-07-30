@@ -15,12 +15,12 @@ event-sourced SQLite store with a localhost dashboard for monitoring and reply t
 ## Implementation
 
 **Stack:** Python 3, stdlib `argparse` for the CLI, SQLite for storage, Flask for the
-localhost dashboard, `requests` for the GMass HTTP client, `PyYAML` for config, `pypdf`
-for LaTeX page-counting. No ORM, no task queue, no background worker framework — the
-"runner" is a plain script fired by macOS `launchd`. The dashboard's only non-Python
-frontend dependency is a single vendored Chart.js build (`slap/static/vendor/chart.min.js`,
-Analytics page only) — no CDN reference at runtime, no npm/bundler step; every other
-dashboard page is still plain server-rendered HTML/CSS/vanilla JS.
+localhost dashboard's static file + JSON API server, `requests` for the GMass HTTP client,
+`PyYAML` for config, `pypdf` for LaTeX page-counting. No ORM, no task queue, no background
+worker framework — the "runner" is a plain script fired by macOS `launchd`. The
+dashboard's frontend is a React + TypeScript + Vite single-page app (`slap/frontend/`,
+Chart.js via `react-chartjs-2` for its charts) — see "Frontend: the dashboard as a React
+SPA," below, for what that changed and, just as importantly, what it deliberately did not.
 
 **Build approach — verify before building, then build in dependency order.** Rather than
 implementing against the GMass API's documented shape, the project started with a
@@ -144,6 +144,114 @@ migrating every existing owner's database, and a diagnostic-only report about th
 recent attempt was never going to need append-only replay anyway. Same one-recipient
 (and, here, one-campaign) blast radius as everywhere else in the app: one broken
 campaign's config, or one recipient's field mismatch, never blocks reloading anyone else.
+
+## Frontend: the dashboard as a React SPA
+
+**The dashboard was rebuilt from Flask/Jinja server-rendered HTML into a React +
+TypeScript + Vite single-page app.** This reverses this document's own former claim
+("no build step, no CDN, no npm/bundler; vanilla JS + server-rendered HTML") — own that
+explicitly rather than quietly dropping it. What actually changed, and what didn't:
+
+- **The zero-live-Node, zero-CDN invariant now applies at RUNTIME, not at BUILD time.**
+  `slap.py dashboard` still starts exactly one Flask process, on `127.0.0.1` only, and
+  that process never shells out to Node, never fetches anything from a CDN, and never
+  runs a bundler at request time — it serves an already-built, static bundle plus a JSON
+  API. What's new is that producing that bundle is now a separate, explicit build step
+  (`npm --prefix slap/frontend run build`, via Vite + `tsc`) run once, ahead of time, by
+  the owner or a CI-less dev loop — not something `slap.py` itself ever invokes. The
+  output (`slap/static/dist/`) is gitignored, exactly like `slap.db`/`workdir/` — a build
+  artifact, never source, never committed.
+- **`slap.py dashboard` fails loud if the bundle is missing**, printing the exact build
+  command, rather than silently serving a blank page — the same "run this setup step
+  first" convention as a missing `.env`/`config.yaml`.
+- **The CLI, the runner, the event store, and the GMass client are completely
+  unchanged.** Nothing about `send`/`runner`/`tracking.py`/`gmass.py` cares whether the
+  dashboard is Jinja or React — the rebuild is entirely a presentation-layer swap over the
+  same underlying reads/writes.
+- **A new JSON API layer, `slap/api.py`, is the seam between the two.** Every dashboard
+  read is now a `GET /api/*` route and every write a `POST /api/*` route; both wrap the
+  exact same widget/action functions `slap/dashboard.py` already had (`today_strip`,
+  `pipeline`, `reachouts_rows`, `tag_reply`, `stop_outreach`, `resend_bounced`, ...) —
+  never a second, independently-derived implementation of any of them. The old Jinja
+  templates/routes and `dashboard_templates/*.html` were removed outright in the cutover,
+  not kept alongside as a fallback.
+- **Flask's own static-folder convention serves the built bundle.** `create_app()`'s
+  catch-all route (`/` and `/<path:path>`) returns `slap/static/dist/index.html` for
+  anything that isn't under `/api/` or `/static/`, so a deep-link or a browser refresh on
+  a client-side route (e.g. `/reachouts`) still returns the app shell instead of a 404 —
+  React Router owns routing under `/` entirely.
+- **Frontend source lives in `slap/frontend/`** (`src/pages/`, `src/components/`,
+  `src/charts/`, `src/api/` for the typed fetch client + React Query hooks, `src/theme/`
+  for the light/dark toggle) — a standard Vite + React + TypeScript layout, with
+  `@tanstack/react-query` for data fetching/caching and `react-router-dom` for client-side
+  routing. `slap/frontend/node_modules/` is gitignored alongside the build output.
+
+**New `interaction` event type** (`slap/tracking.py`) backs three of the features below.
+Rather than mint three separate event types — or, worse, three ad-hoc parallel stores —
+for LinkedIn-replied, "mark followed up," and Remind, all three share one new
+CHECK-constraint literal, `'interaction'`, discriminated by `meta["channel"]` (`
+linkedin_reply` +`state` bool, `followed_up` bare marker, `remind_queued`/`remind_sent`).
+Reusing the existing `reply_reviewed` type was considered and rejected: its readers treat
+the latest of `reply`/`ooo_tagged`/`reply_reviewed` as *the* reply-tag resolution, so an
+unrelated LinkedIn/followed-up marker riding that type would silently corrupt triage
+state. `interaction` is cache-inert (`_apply_event_to_cache` only bumps `last_event_at`,
+the same treatment `click` already gets) — never a `recipients.status` transition, so no
+active-only query needs to change; every feature built on it derives its current-state
+live from the log via dedicated dashboard read helpers. Adding this literal required the
+same rename-recreate-copy-drop CHECK-constraint migration the `stopped` event type
+introduced (`_migrate_events_check_constraint`, generalized to be idempotent for either
+literal) — an already-existing `slap.db` still on the pre-`interaction` schema, including
+one already migrated for `stopped` alone, is rebuilt in place on `connect()`.
+
+**Per-campaign color (`slap/color.py`) — deterministic and storage-free, not a stored
+attribute.** Every campaign gets a stable identity color derived purely from
+`sha256(campaign name)` → an index into a fixed set of 12 OKLCH hue anchors, with
+separate light/dark lightness/chroma bands (following the `dataviz` skill's method) so the
+same hue stays legible on both dashboard themes. Nothing is ever written to `campaign.yaml`,
+the DB, or a sidecar file — recomputing it is the whole point (the same "derived, not
+stored" discipline this app already applies to every other cache), which also means a
+campaign's color can only change by renaming the campaign, something every other part of
+the app already treats as a different campaign entirely. Hashing the campaign's *name*
+(not its position in `discover_campaigns()`'s sorted list) means adding or removing one
+campaign never reshuffles every other campaign's color. `slap.py list` prints each
+campaign's color; the API returns both hexes (`{"light": ..., "dark": ...}`) so the React
+side never recomputes or hardcodes one — it only ever consumes the server-derived value.
+
+**Remind — one-shot saved follow-ups, not a scheduler.** A "Remind" is a one-off follow-up
+message sent to a warm-but-silent, LinkedIn-replied, or already-real lead, fired as a
+threaded reply on the next ordinary drain — the exact same OOO-resend mechanism
+(`sendAsReply` + `campaignIdToReplyTo`) the app already had, reused rather than
+duplicated, so this still needs no scheduler of its own. Saved templates
+(`slap/followups.py`) are plain files under a project-root `followups/` directory
+(`Title:` line + blank-line separator + body — mirroring `initial.txt`'s own `Subject:`
+convention exactly), discovered by presence like `campaigns/`, never rows in `events` —
+the append-only log stays the record of *what was actually sent, to whom, when*
+(`interaction` events with channel `remind_queued`/`remind_sent`); the `followups/`
+directory is the *authored material*, the same category as every other `.txt` template
+this app already keeps as files. `slap.py remind [<recipient>] [--list] [--use SLUG]
+[--new] [--title T]` is the CLI surface; the dashboard's Remind action calls the identical
+`dashboard.queue_remind_for()`.
+
+**`slap.py send custom` — the same queue/runner machinery, with authored content instead
+of a campaign folder.** For a genuine one-off (no `campaign.yaml`, no reusable template),
+`send custom` opens the owner's configured `editor` (new `editor` config knob, default
+`"code --wait"`) to author the initial email and, optionally, an explicit per-stage
+day-gap cadence with its own follow-up bodies — no persona involved, the cadence typed in
+is the cadence staged. It reuses `stage_recipient()`/`runner.drain()` unchanged, tagged
+with a reserved pseudo-campaign label, `__custom__`, that `discover_campaigns()` never
+sees (auto-discovery is folder-based; nothing under `campaigns/` is created for a custom
+send) and that `slap.color` maps to a neutral grey rather than a random identity hue,
+since it isn't a real, nameable campaign. Attachment selection supports four modes: pick
+an already-placed PDF from the send's own workdir, paste an absolute path to one, author
+and compile a LaTeX résumé right there (the same compile-loop + hard >1-page gate every
+other LaTeX send uses), or send with no attachment at all — the last of which is new to
+the send pipeline generally, since every prior path assumed a résumé was always attached.
+The `editor` command is opened with `subprocess.run(..., check=False)` and **blocks until
+it returns**, which is exactly why the config default is `"code --wait"` and not a bare
+`code` — a GUI editor that returns immediately would have the app read back stale,
+pre-edit content. `doctor` checks the configured editor's binary is on `PATH`, but as a
+standalone check outside the global preflight battery — a missing editor should never
+block an ordinary `send`/drain that never needed one.
 
 ## Future expansions / known limitations
 

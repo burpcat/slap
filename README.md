@@ -18,13 +18,19 @@ you're set up.
 - macOS (the unattended runner is scheduled via **launchd**, and the LaTeX loop shells
   out to macOS's `open -a Preview`).
 - Python 3.11+.
+- **Node.js + npm** — the dashboard is a React + TypeScript + Vite single-page app; you
+  need Node once, to build the static frontend bundle (`slap.py dashboard` itself never
+  shells out to Node at runtime — see "Dashboard" below).
 - Your **own** [GMass](https://www.gmass.co/) account with an API key, connected to
   your **own** Gmail account (the one you want to send from). Follow-up cadences (stage
   2/3 emails) need GMass Premium.
-- If you plan to use LaTeX-compiled résumés (`latex.enabled: true` in a campaign):
-  [MacTeX](https://www.tug.org/mactex/) (for `xelatex`) and the
-  [`code`](https://code.visualstudio.com/docs/editor/command-line) CLI (VS Code), both
-  on your `PATH`. `slap.py doctor` checks for both — see below.
+- If you plan to use LaTeX-compiled résumés (`latex.enabled: true` in a campaign, or the
+  LaTeX attachment mode of `send custom`): [MacTeX](https://www.tug.org/mactex/) (for
+  `xelatex`) and the [`code`](https://code.visualstudio.com/docs/editor/command-line) CLI
+  (VS Code), both on your `PATH`. `slap.py doctor` checks for both — see below.
+- If you plan to use `send custom` or `remind --new` (author content in an editor):
+  a working `editor` command on your `PATH` — defaults to `code --wait` (`config.yaml`'s
+  `editor:` key). `doctor` checks it too, but only as an informational, non-gating check.
 
 ## Setup
 
@@ -36,6 +42,14 @@ source .venv/bin/activate
 pip install -r requirements-dev.txt   # includes requirements.txt + pytest
 ```
 
+Build the dashboard's frontend once (its output, `slap/static/dist/`, is gitignored —
+generated, not committed — so this step is required before `slap.py dashboard` will run;
+re-run it any time you pull frontend changes):
+
+```bash
+npm --prefix slap/frontend install
+npm --prefix slap/frontend run build
+```
 **Clone this somewhere outside `~/Documents`, `~/Desktop`, or `~/Downloads`.** macOS's TCC
 privacy protections for those folders can silently block the unattended `runner` from ever
 being spawned by launchd — even though everything works fine when run by hand, which makes
@@ -155,8 +169,11 @@ dashboard, deliverability tips). Quick reference:
 | `python slap.py onboard-campaign` | Interactive wizard that scaffolds a brand-new `campaigns/<name>/` folder — compose the initial email, declare its variables (auto-detected from what you paste), review the whole template set with placeholders highlighted, then fill in persona/LaTeX/attachment — instead of hand-writing `campaign.yaml`/`initial.txt`/`stageN.txt`. |
 | `python slap.py list` | Lists every auto-discovered campaign (persona, LaTeX on/off). |
 | `python slap.py send <campaign> [--now]` | Interactive prep: paste a drop, optionally compile/preview a LaTeX résumé, see domain-dedup warnings (and, for a static campaign, an offer to reuse an archived résumé), choose how many of the persona's follow-ups to actually stage for this recipient (0 up to the persona's full cadence), and a preview, then stage the send to the queue. `--now` also drains the queue immediately afterward instead of waiting for the scheduled runner. |
-| `python slap.py dashboard` | Starts the localhost dashboard at `http://127.0.0.1:5050` — today/week stats, engagement metrics, replies needing triage (tag as real/OOO/not-interested), bounces & blocks, pipeline, recent run history, an **Analytics** page (sent/replies trend, bounce breakdown, reply rate by persona, time-to-first-reply, optional weekly-goal-pacing gauge), and a link to the all-campaigns **Reach-outs** page (`/reachouts`, filterable, read-only). |
+| `python slap.py send custom` | A one-off, editor-authored send outside any campaign folder: compose the initial email (and, optionally, a custom per-recipient follow-up cadence) in your `editor`, pick an attachment (an existing PDF, a pasted path, a freshly-authored LaTeX résumé, or none), then stage it via the same queue/runner path as a normal send. Reserved campaign label `__custom__`. |
+| `python slap.py dashboard` | Starts the localhost dashboard at `http://127.0.0.1:5050` — a React + TypeScript + Vite single-page app served as a static bundle by this one Flask process (see ARCHITECTURE.md's "Frontend" section). Requires `npm --prefix slap/frontend run build` to have been run at least once (see Setup above); fails loud with that exact command if the bundle is missing. Tabs: Home, Campaigns, Engagement, Pipeline, Reach-outs, Commands. |
 | `python slap.py doctor` | Preflight checks — see Setup above. Safe to run any time. |
+| `python slap.py interaction <recipient> --channel {linkedin-reply,followed-up} [--off]` | CLI backend for two dashboard per-reachout toggles: `linkedin-reply` records (or, with `--off`, clears) a "replied on LinkedIn" flag; `followed-up` resets the follow-up-reminder timer. Both append an `interaction` event — no GMass call. |
+| `python slap.py remind [<recipient>] [--list] [--use SLUG] [--new] [--title T]` | Queues a one-shot saved follow-up ("Remind") for a warm-but-silent/LinkedIn-replied/real recipient — sent as a threaded reply on the normal drain, no scheduler of its own. `--list` shows saved templates (`followups/*.txt`); `--use SLUG` sends a saved one; `--new` authors a fresh body in your editor; add `--title` to also save it for reuse. |
 | `python slap.py domains` | Regenerates and prints a read-only domain index from tracked events (who you've contacted, grouped by email domain) — for manual inspection, not itself a source of truth. |
 | `python slap.py rebuild` | Rebuilds the `recipients` cache table by replaying the full `events` log. Use this if the cache ever looks wrong — `events` is always the source of truth. |
 | `python slap.py runner` | The unattended drain — asks the DB what's queued and due, and sends it, printing one progress line per recipient as each send resolves. Meant to be triggered by **launchd**, not run by hand day-to-day. See [`LAUNCHD.md`](LAUNCHD.md) for setup and the one-time manual test. Guards itself against `config.yaml`'s `schedule.active_days` — exits without draining on a day that isn't listed. |

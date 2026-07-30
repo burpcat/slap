@@ -140,6 +140,14 @@ def stage_recipient(conn, *, campaign: str, recipient: str, persona: str, cadenc
             shutil.copyfile(attachment_path, staged_attachment)
         attachment_source = None  # None means "read from workdir/attachment_name"
         real_attachment_path = staged_attachment
+    elif attachment_path is None:
+        # No-attachment send (`slap.py send custom` mode 4): `attachment_name`
+        # is also None, and that None is the sentinel _send_one keys on to send
+        # with no attachment at all (attachment_source=None here does NOT mean
+        # "read from workdir" as it does for latex — attachment_name being None
+        # is what disambiguates the two). Nothing to archive.
+        attachment_source = None
+        real_attachment_path = None
     else:
         attachment_source = str(attachment_path.resolve())
         real_attachment_path = attachment_path.resolve()
@@ -152,10 +160,11 @@ def stage_recipient(conn, *, campaign: str, recipient: str, persona: str, cadenc
     }
     (workdir / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
-    try:
-        archive.archive_resume(real_attachment_path, archive_dir, company=company, role=role, when=when)
-    except Exception as e:
-        display.warn(f"resume archive: unexpected error archiving for {recipient}: {e}")
+    if real_attachment_path is not None:
+        try:
+            archive.archive_resume(real_attachment_path, archive_dir, company=company, role=role, when=when)
+        except Exception as e:
+            display.warn(f"resume archive: unexpected error archiving for {recipient}: {e}")
 
     append_event(conn, type="queued", recipient=recipient, campaign=campaign, stage=0,
                  meta={"persona": persona, "company": company, "role": role, "req_id": req_id,
@@ -486,3 +495,69 @@ def due_for_ooo_resend(conn, *, today: date = None) -> list:
         if resume_date is not None and resume_date <= today:
             due.append(dict(row))
     return due
+
+
+def queue_remind(conn, recipient: str, body: str, *, followup: str = None,
+                 workdir_root: Path = WORKDIR_ROOT) -> None:
+    """Queue a one-shot "Remind" reply for `recipient` (the Engagement/reach-out
+    Remind action). Appends an append-only `interaction` event, channel
+    'remind_queued', that the runner's drain later fires as a reply threaded
+    into the recipient's original conversation (see slap.runner._send_remind).
+
+    The remind body is SNAPSHOTTED verbatim into the event here, at queue time,
+    not referenced by file — so a later edit/deletion of the saved follow-up
+    template can never retroactively change what a past Remind actually said.
+    The reply-thread campaign id and original subject are snapshotted from the
+    recipient's current cache/manifest for the same reason. Follows the
+    OOO-resend model (app-initiated reply-in-thread on the normal drain), the
+    only sanctioned way this app sends after the initial: no scheduler.
+
+    Fail loud on an unknown recipient, or one with no prior GMass campaign to
+    reply into (they were never actually sent — nothing to thread onto), same
+    "must be a real, resend-able recipient" guard as resend_bounced()."""
+    row = conn.execute(
+        "SELECT campaign, last_gmass_campaign_id FROM recipients WHERE recipient = ?", (recipient,)
+    ).fetchone()
+    if row is None:
+        raise QueueError(f"unknown recipient {recipient!r} — never staged/contacted")
+    reply_to = row["last_gmass_campaign_id"]
+    if not reply_to:
+        raise QueueError(
+            f"{recipient} has no prior GMass send to reply into — a Remind is a threaded "
+            f"follow-up, so it can only go to someone already contacted"
+        )
+    # Snapshot the original subject from the staged manifest when available, so
+    # the threaded reply reads "Re: <original subject>". Best-effort: a missing/
+    # unreadable manifest just yields no subject_ref (the runner falls back).
+    subject_ref = ""
+    try:
+        subject_ref = load_manifest(recipient_workdir(row["campaign"], recipient, root=workdir_root)).get(
+            "subject", ""
+        )
+    except Exception:
+        subject_ref = ""
+    append_event(conn, type="interaction", recipient=recipient, campaign=row["campaign"],
+                 meta={"channel": "remind_queued", "followup": followup, "body": body,
+                       "campaign_id_to_reply_to": reply_to, "subject_ref": subject_ref})
+
+
+def due_for_remind(conn) -> list:
+    """Every recipient with a PENDING Remind: a 'remind_queued' interaction with
+    no later 'remind_sent' interaction closing it. Returns one dict per pending
+    remind carrying the snapshotted body/campaign_id_to_reply_to/subject_ref the
+    runner needs — no manifest re-read at send time. Last-write-wins per
+    recipient (a re-queued remind supersedes an unsent earlier one), mirroring
+    due_for_ooo_resend()'s "derive the due set from the event log, no separate
+    queue store" shape."""
+    rows = conn.execute(
+        "SELECT recipient, campaign, meta FROM events WHERE type = 'interaction' ORDER BY id ASC"
+    ).fetchall()
+    pending: dict = {}
+    for row in rows:
+        meta = json.loads(row["meta"]) if row["meta"] else {}
+        channel = meta.get("channel")
+        if channel == "remind_queued":
+            pending[row["recipient"]] = {"recipient": row["recipient"], "campaign": row["campaign"], **meta}
+        elif channel == "remind_sent":
+            pending.pop(row["recipient"], None)
+    return list(pending.values())

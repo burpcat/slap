@@ -1,0 +1,20 @@
+.reasonsTitle {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  margin: 0 0 6px;
+}
+.reasonsList {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.reasonRow {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.85rem;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--hairline);
+}
+.reasonsWrap {
+  margin-top: 12px;
+}

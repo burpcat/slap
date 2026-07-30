@@ -1,0 +1,33 @@
+/* Mirror of slap/static/dashboard.css's `:root` token block ONLY (the
+   custom-property declarations, not any page/component CSS). This file
+   must NEVER diverge from dashboard.css's own :root / dark-override rules —
+   if that file's palette changes, copy the change here too, verbatim.
+   dashboard.css itself is owned by the Python/Jinja track and is not
+   imported directly (it lives outside the frontend build root and also
+   carries page-specific selectors that don't apply to the React app). */
+
+:root {
+  color-scheme: light;
+  --surface-1: #fcfcfb; --page: #f9f9f7;
+  --text-primary: #0b0b0b; --text-secondary: #52514e; --text-muted: #898781;
+  --hairline: #e1e0d9; --border: rgba(11,11,11,0.10);
+  --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
+  --series-1: #2a78d6;
+  --ink-on-status: #0b0b0b;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --surface-1: #1a1a19; --page: #0d0d0d;
+    --text-primary: #ffffff; --text-secondary: #c3c2b7;
+    --hairline: #2c2c2a; --border: rgba(255,255,255,0.10);
+    --series-1: #3987e5;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface-1: #1a1a19; --page: #0d0d0d;
+  --text-primary: #ffffff; --text-secondary: #c3c2b7;
+  --hairline: #2c2c2a; --border: rgba(255,255,255,0.10);
+  --series-1: #3987e5;
+}

@@ -1,0 +1,28 @@
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--hairline);
+}
+.row:last-child { border-bottom: none; }
+
+.rowMain { display: flex; flex-direction: column; gap: 2px; }
+.rowTitle { font-weight: 600; font-size: 0.95rem; }
+.rowMeta { font-size: 0.8rem; color: var(--text-secondary); }
+
+.actions { display: flex; gap: 6px; flex: none; }
+
+.empty { color: var(--text-muted); font-style: italic; padding: 8px 0; }
+
+.hiddenToggle {
+  all: unset;
+  cursor: pointer;
+  font-size: 0.75rem;
+  margin-left: 8px;
+  color: var(--text-secondary);
+}
+.hiddenToggle:hover { color: var(--text-primary); }
+
+.goalWrap { margin-top: 10px; }

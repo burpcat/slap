@@ -1,8 +1,18 @@
 # USAGE.md — using slap day to day
 
-This assumes you've already run `python slap.py init` (see [`README.md`](README.md)) and
-`doctor` passes. This doc covers everything after that: creating campaigns, writing
-drops, sending, the dashboard, the scheduler, and deliverability tips.
+This assumes you've already run `python slap.py init` (see [`README.md`](README.md)),
+built the dashboard's frontend once (`npm --prefix slap/frontend install && npm --prefix
+slap/frontend run build` — see README's Setup), and `doctor` passes. This doc covers
+everything after that: creating campaigns, writing drops, sending, the dashboard, the
+scheduler, and deliverability tips.
+
+**The dashboard is a React + TypeScript + Vite single-page app**, not server-rendered
+HTML — `slap.py dashboard` still starts exactly one localhost Flask process, but that
+process now serves a pre-built static bundle plus a JSON API (`/api/*`) instead of
+rendering Jinja templates. Nothing about the CLI, the queue, or the runner changed; only
+the dashboard's own presentation layer did. See "Dashboard + replies" below for the new
+tab layout, and [`ARCHITECTURE.md`](ARCHITECTURE.md)'s "Frontend" section for the full
+design rationale.
 
 ## Mental model
 
@@ -235,6 +245,51 @@ recipient as each send resolves (`[i/N] recipient (campaign) -> sent`/`FAILED`) 
 staying silent until a single summary line at the end — useful since a big batch is throttled
 10-15s between sends and can otherwise look stuck for minutes.
 
+### `send custom` — a one-off, editor-authored send
+
+For a genuine one-off message that doesn't warrant a whole `campaigns/<name>/` folder
+(no reusable template, maybe no follow-ups at all, or a custom cadence that doesn't match
+any persona), use:
+
+```bash
+python slap.py send custom
+```
+
+`custom` is a reserved campaign token — a real `campaigns/custom/` folder would be
+shadowed by it, so don't name a real campaign `custom`. The flow:
+
+1. **Recipient email**, plain prompt.
+2. **Initial email**, authored in your configured `editor` (`config.yaml`'s `editor:` key,
+   default `"code --wait"` — must be a command that *blocks* until the editor window
+   closes, which is exactly why the default has `--wait`; a GUI editor that returns
+   immediately would have `slap` read back stale content). The file opens pre-seeded with
+   `Subject: \n\n` — same `Subject:` line + blank-line-separator shape every campaign's
+   `initial.txt` already uses.
+3. **Optional custom follow-ups** — for each one you choose to add, you're asked how many
+   days after the previous message it should fire, then your editor opens for that stage's
+   body (no subject line, threaded as a reply, like any other stage file). This becomes
+   the literal cadence staged for this recipient — there's no persona involved, so there's
+   nothing to truncate or default.
+4. **Attachment** — pick one of four modes:
+   - Pick a PDF already sitting in this send's own working folder.
+   - Paste an absolute path to a PDF elsewhere on disk.
+   - Write a LaTeX résumé right now (the same compile loop + the app's one hard gate, a
+     forced confirmation past one page).
+   - No attachment at all.
+5. **Dedup warnings** (hard/soft), a preview, and a `Stage this custom send? [y/N]`
+   confirm — same shape and same warn-don't-block behavior as a normal `send`.
+
+A custom send is staged and drained through the exact same queue/runner machinery as any
+other campaign, tagged internally with a reserved campaign label (`__custom__`) that never
+shows up in `slap.py list`/campaign auto-discovery and gets a neutral grey identity color
+on the dashboard rather than a random one (see ARCHITECTURE.md). `--now` works the same
+way it does for a normal `send`.
+
+`doctor` checks your configured `editor` command is on `PATH`, but only as an
+informational, non-gating check — a missing editor should never block an ordinary send or
+scheduled drain that never needed one. `send custom`/`remind --new` fail loud up front if
+it isn't usable.
+
 ### Editing a template after staging
 
 `send` freezes the rendered subject/body/stage text into the queue the moment you stage a
@@ -270,14 +325,17 @@ confirm it lands and looks right, then you're clear to send to real recipients.
 | `python slap.py init` | Interactive installer (config.yaml, .env, schedule, DB, launchd). Re-runnable any time. |
 | `python slap.py list` | Lists every auto-discovered campaign (persona, LaTeX on/off). |
 | `python slap.py send <campaign> [--now]` | The prep flow above. `--now` also drains immediately. |
-| `python slap.py dashboard` | Starts the localhost dashboard at `http://127.0.0.1:5050`, plus the filterable all-campaigns Reach-outs page at `/reachouts`. |
-| `python slap.py doctor` | Preflight checks — sender fields, API key, DB, consumer domains file, every campaign's attachment/LaTeX toolchain, and (separately, never blocking) `RESUME_ARCHIVE_DIR`'s validity and any dangling symlinks in it. Safe to run any time; the core checks also run automatically before every `send` and every drain. |
+| `python slap.py send custom [--now]` | The editor-authored one-off flow above (see "`send custom`"). |
+| `python slap.py dashboard` | Starts the localhost dashboard at `http://127.0.0.1:5050` — a React SPA (see "Dashboard + replies" below), including the filterable all-campaigns Reach-outs tab. Requires the frontend to be built once first (`npm --prefix slap/frontend run build`). |
+| `python slap.py doctor` | Preflight checks — sender fields, API key, DB, consumer domains file, every campaign's attachment/LaTeX toolchain, and (separately, never blocking) `RESUME_ARCHIVE_DIR`'s validity, any dangling symlinks in it, and your configured `editor` command. Safe to run any time; the core checks also run automatically before every `send` and every drain. |
 | `python slap.py domains` | Prints a read-only index of who you've contacted, grouped by email domain — for manual inspection. |
 | `python slap.py rebuild` | Rebuilds the `recipients` cache table by replaying the full `events` log from scratch. Use this if the cache ever looks wrong — `events` is always the source of truth, the cache is fully disposable. |
 | `python slap.py cleanup [--confirm] [--min-days-idle N]` | Deletes stale *compiled* résumé PDFs (LaTeX campaigns only) for recipients who are done/dead/never-replied and idle 15+ days by default — except a PDF still referenced by a live `RESUME_ARCHIVE_DIR` symlink, which is kept and reported separately. Dry run unless you pass `--confirm`. Never touches the `.tex` source. |
 | `python slap.py runner` | The unattended drain — asks the DB what's queued and due, and sends it. Meant to be fired by **launchd** (see Scheduler below), not run by hand day-to-day. |
 | `python slap.py plist` | Prints the launchd `.plist` for `runner`, generated fresh from your current `config.yaml`. |
 | `python slap.py template-reload` | Re-renders every not-yet-sent recipient across every campaign against whatever `initial.txt`/`stageN.txt` currently say — use this after editing a template you've already staged sends against. Shows a summary and sample diffs, asks to confirm before writing anything. Only ever touches recipients who haven't sent at all yet (see "Editing a template after staging" below); everyone else is untouched by definition. |
+| `python slap.py interaction <recipient> --channel {linkedin-reply,followed-up} [--off]` | Terminal counterpart to two dashboard toggles: `--channel linkedin-reply` records (or, with `--off`, clears) "this recipient replied on LinkedIn"; `--channel followed-up` resets the follow-up-reminder timer, same as clicking "Followed up" on Home. Both just append an `interaction` event — no GMass call either way. |
+| `python slap.py remind [<recipient>] [--list] [--use SLUG] [--new] [--title T]` | Queue a one-shot follow-up ("Remind") for a warm-but-silent, LinkedIn-replied, or already-real recipient — sent as a threaded reply on the next ordinary drain. `--list` shows saved templates under `followups/`; `--use SLUG` sends a saved one verbatim; `--new` opens your editor to author a fresh body; add `--title` to also save what you authored for reuse later. See "Remind" under Reach-outs below. |
 
 Typical day-to-day flow: `send` a few recipients through the interactive prep loop →
 either `--now` or let the scheduled `runner` pick them up → check `dashboard`
@@ -343,96 +401,99 @@ company, to reuse for the new recipient instead of the campaign's usual
 python slap.py dashboard
 ```
 
-Opens `http://127.0.0.1:5050`. Seven pages share one header/nav bar, a light/dark theme
-toggle (top right — cycles Auto → Light → Dark, remembers your choice), and, only when
-the most recent `template-reload` run left at least one recipient un-reloaded, a
-**"Template Failures"** nav link listing who, in which campaign, and why (see "Editing a
-template after staging" above) — it disappears again once a later `template-reload` run
-comes back clean.
+Opens `http://127.0.0.1:5050`. The dashboard is a React SPA now (see the note at the top
+of this doc) — same one Flask process, same localhost-only, same underlying SQLite reads,
+but a different page layout than a Jinja-era screenshot might show. First visit shows a
+full-screen splash (dismiss by clicking Continue or pressing any key — remembered in your
+browser via `localStorage`, so it only shows once per browser). A light/dark theme toggle
+sits top-right (cycles Auto → Light → Dark, remembers your choice). Six tabs share one
+nav bar — **Home, Campaigns, Engagement, Pipeline, Reach-outs, Commands** — plus two
+footer links, **Logs** and, only when the most recent `template-reload` run left at least
+one recipient un-reloaded, **Template failures** with a count badge (see "Editing a
+template after staging" above) — the link itself disappears again once a later
+`template-reload` run comes back clean.
 
 **Home** (`/`) — the operational pulse, and the one thing that needs a same-visit decision:
 
-- **Metrics** — today/this-week send counts (initial vs. follow-up split), plus a
-  daily-cap gauge.
+- **Today** / **This week** — send counts (new vs. follow-up split), replies, clicks, and
+  a daily-cap gauge.
 - **Replies needing triage** — every reply that hasn't been tagged yet, with prior-contact
   domain context. Tag each one:
-  - **real** — a genuine reply. Pure bookkeeping; no further action from slap.
+  - **Real** — a genuine reply. Pure bookkeeping; no further action from slap.
   - **OOO** — an out-of-office auto-reply. This is the one tag with real consequences:
     it queues slap's own resend of the recipient's *next* stage, sent as a threaded reply
     (`sendAsReply`) on the normal runner cadence — deterministic threading, not reliant on
     GMass's own conversation auto-detection. (GMass usually filters real auto-responders
     itself; this is a manual safety net for the ones that slip through.)
-  - **not interested** — pure bookkeeping; stops the row from showing as needing triage.
-  - **unreal** — Reach-outs-only (see below), for a Real-tagged reply that later went
+  - **Not real** — pure bookkeeping; stops the row from showing as needing triage.
+  - **Unreal** — Reach-outs-only (see below), for a Real-tagged reply that later went
     cold. Not offered here since a recipient only reaches this widget while their reply
     is still untagged.
-- **Next drain** — when the runner is next scheduled to fire.
-- **Today's runs** — each drain that actually did something today (fired, sent, failed
-  counts) — a drain that found nothing queued is omitted as noise.
+- **Follow-up reminders** — every recipient currently tagged Real, framed as a nag: how
+  many days since you marked each one Real. Once someone's marked Real, GMass's own
+  automated follow-ups have already stopped for them (it stops firing on any reply) — this
+  is the one place that reminds you to personally follow up. Click **Followed up** to
+  reset the timer (same as `slap.py interaction <recipient> --channel followed-up`) —
+  it records a fresh `interaction` event; the reminder starts counting again from zero.
+- **Pipeline summary** and **Companies contacted** — the same live-queue numbers the
+  Pipeline tab shows in full, kept on Home too so they're never buried behind
+  lagging-indicator analytics.
 
-**Pipeline** (`/pipeline`) — the live-recipient work queue, always instant (nothing here
-depends on GMass's own report data):
+**Campaigns** (`/campaigns`) — per-campaign analytics, one filter pill per
+auto-discovered campaign (plus "All campaigns"). Each pill is tinted with that campaign's
+deterministic identity color (see ARCHITECTURE.md's "Per-campaign color" — a stable hash
+of the campaign name, never stored, never changes unless you rename the campaign). Shows
+recipient/reply/click/active-lead counts for the selected campaign (or the combined
+total), plus that slice's **Active leads marked real** roster.
 
-- **Active leads** — a roster of every recipient currently tagged Real: company,
-  campaign, persona, and when you marked them real. This is a live "who's actually a
-  real opportunity right now" list, separate from the triage widget above (which is
-  about *tagging* a reply, not tracking it afterward).
-- **Follow-up reminders** — the same Active Leads recipients, but framed as a nag: how
-  many days since you marked each one Real, worst-first. Once someone's marked Real,
-  GMass's own automated follow-ups have already stopped for them (it stops firing on any
-  reply) — this is the one place that reminds you to personally follow up, since nothing
-  else on the dashboard tracks that.
-- **Pipeline** — who's mid-sequence at which stage, and what's scheduled to fire today/tomorrow.
-- **Companies contacted** — a rollup by company domain.
+**Engagement** (`/engagement`) — reply-rate/engagement intelligence and the dashboard's
+charts, together on one tab:
 
-**Engagement** (`/engagement`):
-
-- **Engagement intelligence** — reply rate by persona, replies/clicks by stage, and a
-  time-to-first-reply distribution.
+- **Reply rate by persona** — as a stat row and, further down, the same data as a bar
+  chart.
 - **Warm but silent — clicked, no reply** — the highest-value signal on the whole
   dashboard: someone opened a tracked link but hasn't replied yet. The message landed and
-  was read; it's just unanswered. Worth a manual nudge.
-
-**Analytics** (`/analytics`) — the dashboard's charts, always instant (nothing here
-depends on GMass's own report data):
-
-- **Sent & replies trend** — a line chart of daily new-sends, follow-up-sends, and
-  replies, with a 7/30/90-day toggle.
-- **Bounce & block volume** and **top bounce/block reasons** — the same category/reason
-  data as Deliverability's Bounces & Blocks widget, charted as a weekly trend and a
-  most-common-reasons bar chart.
-- **Reply rate by persona** and **time to first reply** — chart versions of Engagement
-  intelligence's tables.
+  was read; it's just unanswered. Each row has a **Remind** button — see "Remind" under
+  Reach-outs below — plus **Hide**/**Unhide** if you don't want a particular recipient
+  nagging you here (a "show hidden (N)" toggle reveals what you've hidden).
+- **Send / reply trend** (30 days) — a line chart of daily new-sends, follow-up-sends, and
+  replies.
+- **Bounce & block breakdown**, **Reply rate by persona (chart)**, **Time to first
+  reply** — chart versions of the same underlying data shown elsewhere as plain numbers.
 - **Weekly goal pacing** — only shown if you've set `schedule.weekly_target` in
   `config.yaml`: a progress gauge for new-recipient sends against your own weekly target.
   Omit the config key to hide this widget entirely.
 
-Every chart has a "View as table" link underneath showing the same numbers as plain rows —
-nothing here is chart-only.
+**Pipeline** (`/pipeline`) — the live-recipient work queue, with deliverability folded in:
 
-**Deliverability** (`/deliverability`) — why a recipient stopped moving:
+- **Mid-sequence, by current stage** and **Follow-ups firing today / tomorrow** — who's
+  where in a cadence, and what's about to fire.
+- **Active leads** and **Follow-up reminders** — the same rosters Home surfaces, shown in
+  full here.
+- **Companies contacted** — a rollup by company domain.
+- **Bounces & blocks (deliverability)** — every delivery failure GMass reports back,
+  tagged **Bounced** or **Blocked** (GMass tracks these as two separate report
+  categories with their own reason text — both are shown here rather than blended
+  together). The reason text is also visible next to a recipient's status on Reach-outs.
+- **Stopped outreach roster** — every recipient you've permanently halted follow-ups to
+  (see **Stop outreach** under Reach-outs below), with company/campaign/when. A roster,
+  not a reply-tag view — a stopped recipient can independently still be tagged Real
+  elsewhere; this just tracks the stop itself.
 
-- **Bounces & blocks** — every delivery failure GMass reports back, tagged **Bounced** or
-  **Blocked**. GMass tracks these as two separate categories (different report endpoints,
-  different reasons) — both are shown here rather than one blended into the other, so a
-  recipient whose mail got blocked by a spam filter doesn't look identical to one whose
-  address just doesn't exist. A **Reason** column shows GMass's actual reason text for
-  each one (truncated in the table; hover for the full text) — no more guessing why
-  something bounced from the Bounced/Blocked label alone. The same reason text shows up
-  next to a recipient's status on the Reach-outs page too.
-- **Stopped outreach** — every recipient you've permanently halted follow-ups to (see
-  **Stop outreach** under Reach-outs below), with company/campaign/when. A roster, not a
-  reply-tag view — a stopped recipient can independently still be tagged Real elsewhere;
-  this just tracks the stop itself.
+**Commands** (`/commands`) — a live reference of every `slap.py` subcommand (name, usage,
+flags, help text), generated directly from the CLI's own `argparse` definition
+(`/api/commands`) rather than hand-maintained — a new subcommand shows up here
+automatically the next time you load the page, and this tab can never drift from the real
+CLI surface.
 
-**Logs** (`/logs`) — every event slap has ever recorded, in one place:
+**Logs** (footer link, `/logs`) — every event slap has ever recorded, in one place:
 
 - **Events** — every `queued`/`draft_created`/`sent`/`send_failed`/`run_started`/
-  `run_completed`/`run_failed`/`click`/`reply`/`bounce`/etc. event, newest first, filterable
-  by type/recipient/campaign and free-text search, sortable by clicking any column header.
-  Expand a row to see its raw event data (GMass draft/campaign IDs, full meta). This is a
-  direct, unfiltered view over the exact same append-only event log every other page's
-  widgets are derived from — nothing here is a separate log store.
+  `run_completed`/`run_failed`/`click`/`reply`/`bounce`/`interaction`/etc. event, newest
+  first, filterable by type/recipient/campaign and free-text search, sortable by clicking
+  any column header. Expand a row to see its raw event data (GMass draft/campaign IDs,
+  full meta). This is a direct, unfiltered view over the exact same append-only event log
+  every other tab's widgets are derived from — nothing here is a separate log store.
 - **Raw job output** — the last 200 lines of `runner.log`/`runner.err.log`/`sync.log`/
   `sync.err.log` (the scheduled jobs' actual stdout/stderr, launchd writes these — see
   Scheduler below), newest first. This is the one place a *launchd-level* failure would show
@@ -445,52 +506,50 @@ nothing here is chart-only.
 http://127.0.0.1:5050/reachouts
 ```
 
-One row per recipient across every campaign, filterable and sortable, for when you want
-to slice "everyone I've contacted" by whatever you care about that day instead of hunting
-through per-campaign panels. Never makes a GMass call on its own — everything here is
-already-synced local data.
+One row per recipient across every campaign, sortable and free-text searchable, for when
+you want to slice "everyone I've contacted" instead of hunting through per-campaign
+panels. Never makes a GMass call on its own — everything here is already-synced local
+data. Each row's left edge is tinted with that recipient's campaign's identity color (see
+ARCHITECTURE.md's "Per-campaign color") — a quick visual grouping cue without a filter
+dropdown.
 
-Each row has a single **⋯** button on the right — click it to open that row's action
-menu, rather than a wall of always-visible buttons. Inside, as applicable: **Mark OOO**
-(always available), **Real / Not interested** (only once that recipient has actually
-replied), **Resend to corrected address** (only on a bounced row), and two more:
+Click any column header (Recipient/Campaign/Persona/Status/Date) to sort by it, and again
+to flip direction. The search box matches recipient email, company, name, domain,
+campaign, and persona in one field. A count line ("N of M") tracks the current search.
+Both happen instantly in the browser — no page reload, no extra GMass calls.
 
-- **Unreal** — shown only once a recipient is already tagged Real (sits right next to
-  the Real/Not interested items). Use it when a Real lead goes cold later — the deal
-  fell through, they stopped responding, whatever. It's local-only: no GMass call, no
-  suppression, nothing sent. The recipient drops out of the Active Leads / Follow-up
-  reminders widgets on the Pipeline page, but their reply-tag history isn't erased —
-  it's recorded as its own event, same as every tag change here.
+A dedicated **LinkedIn** column shows a toggle button — click it to mark (or, clicking
+again, unmark) that this recipient replied to you on LinkedIn (records an `interaction`
+event; no GMass call, since GMass has no visibility into LinkedIn). Same action as
+`slap.py interaction <recipient> --channel linkedin-reply`.
+
+Each row also has a single **⋯** button on the right — click it to open that row's
+floating action menu (it repositions itself to stay on-screen regardless of where the row
+lands in the viewport), rather than a wall of always-visible buttons. Inside, as
+applicable: **Mark OOO…** (always available, opens a small date picker for when the
+recipient is expected back), **Resend to corrected address…** (only on a bounced row),
+**Tag real**, **Tag not interested**, and:
+
 - **Stop outreach** — offered until the row is already stopped. Permanently halts further
   follow-ups to *this one recipient* (e.g. you got rejected for the specific role they
   were contacted about). This is a real, irreversible suppression — same account-wide
-  GMass unsubscribe Mark OOO/Not interested use — so it asks for confirmation first, the
-  same way those do. Once stopped, the row shows a **Stopped** chip and the menu item
+  GMass unsubscribe Mark OOO/Not interested use — so it's a distinct, visually separated
+  ("danger") menu item. Once stopped, the row shows a **Stopped** chip and the menu item
   disappears (nothing left to stop); the recipient also drops out of the follow-up-
-  reminder/Active-Leads widgets and shows up instead on the Deliverability page's Stopped
-  outreach roster. This only ever affects the one recipient you clicked it on — it does
-  NOT stop the whole campaign or every contact at that company.
+  reminder/Active-Leads widgets and shows up instead on Pipeline's Stopped outreach
+  roster. This only ever affects the one recipient you clicked it on — it does NOT stop
+  the whole campaign or every contact at that company.
 
-Filter controls (all combine with AND — narrowing by campaign AND status AND date range,
-for instance, not any of them):
+**Remind** — a one-off follow-up to a warm-but-silent, LinkedIn-replied, or already-real
+recipient, sent as a threaded reply on the next ordinary drain (the same OOO-resend
+mechanism the app already had, reused rather than duplicated — no scheduler of its own).
+The **Remind** button currently lives on Engagement's "Warm but silent" rows; the CLI
+equivalent, usable for any eligible recipient, is `slap.py remind <recipient> [--use SLUG
+| --new [--title T]]` (see "Commands" above). Saved templates live under a project-root
+`followups/` directory and are listed with `slap.py remind --list`.
 
-- **Campaign, persona, domain** — exact-match dropdowns, built from your actual data.
-- **Status** — `queued` (staged, nothing sent yet), `active` (sent at least once, still
-  mid-sequence), `done`, `replied`, `bounced`, `ooo_requeued`.
-- **Engagement** — replied / clicked-no-reply / no engagement yet.
-- **Reply tag** — real / OOO / not-interested / untagged (untagged means "replied,
-  pending triage" — someone who's never replied at all just won't match any of these).
-- **Req ID** — present vs. blank.
-- **Date range** — two date pickers; matches whichever of "first sent" or "last event"
-  a recipient actually has (a queued-but-never-sent recipient still gets a date).
-- **Search** — free text across recipient email and company name.
-
-A count line ("N of M reach-outs shown") tracks the current filter. Filtering and sorting
-happen instantly in the browser — no page reload, no extra GMass calls; the page only
-reads local data already synced.
-
-**Company and Req ID columns can show blank** for recipients staged before this page's
-underlying data capture existed — never guessed, just genuinely unknown for older sends.
+**Company columns can show blank** for recipients staged before this page's underlying
+data capture existed — never guessed, just genuinely unknown for older sends.
 
 ## Scheduler (launchd)
 

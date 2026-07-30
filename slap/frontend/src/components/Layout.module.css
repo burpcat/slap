@@ -1,0 +1,92 @@
+.shell {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 32px;
+  border-bottom: 1px solid var(--hairline);
+  background: var(--surface-1);
+}
+
+.brand {
+  font-family: Georgia, "Iowan Old Style", serif;
+  font-size: 1.25rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin: 0;
+}
+
+.nav {
+  display: flex;
+  gap: 22px;
+  font-size: 0.9rem;
+}
+
+.navLink {
+  color: var(--text-secondary);
+  text-decoration: none;
+  padding: 4px 0;
+  position: relative;
+}
+.navLink:hover { color: var(--text-primary); }
+.navLinkActive {
+  color: var(--text-primary);
+  font-weight: 600;
+  border-bottom: 2px solid var(--series-1);
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  margin-left: 6px;
+  border-radius: 8px;
+  background: var(--critical);
+  color: #ffffff;
+  font-size: 0.65rem;
+  font-weight: 700;
+}
+
+.headerRight {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.themeToggle {
+  font-size: 0.8rem;
+  padding: 5px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface-1);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.themeToggle:hover { color: var(--text-primary); border-color: var(--text-secondary); }
+
+.main {
+  flex: 1;
+  width: 100%;
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 32px;
+}
+
+.footer {
+  border-top: 1px solid var(--hairline);
+  padding: 16px 32px;
+  display: flex;
+  gap: 18px;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+.footer a { color: var(--text-secondary); text-decoration: none; }
+.footer a:hover { color: var(--text-primary); }

@@ -900,6 +900,101 @@ committed).
 
 ---
 
+## 8a. Update since the 2026-07-09 snapshot above — the dashboard is now a React SPA
+
+**This is the latest state as of this revision; everything in §8 above is otherwise still
+accurate (build state, per-campaign field mapping, distribution tooling) — only the
+dashboard's own implementation and a handful of new features changed.** Read this section
+before trusting §5/§8's Jinja-era dashboard prose (five/seven-page split, `dashboard_
+templates/*.html`, per-page routes like `/pipeline`/`/analytics`/`/deliverability`) — those
+routes and templates were **removed outright** in this cutover, not kept alongside a new
+frontend. Confirm anything load-bearing against `slap/frontend/src/` and `slap/api.py`
+directly, the same "don't trust this doc's paraphrase, check the code" discipline §9/§10
+already establish.
+
+- **The dashboard was rebuilt from Flask/Jinja server-rendered HTML into a React +
+  TypeScript + Vite single-page app** (`slap/frontend/`). This reverses §4/§8's prior
+  framing of a zero-build-step, vanilla-JS dashboard — own that reversal explicitly rather
+  than silently dropping it. What's actually true now: the zero-live-Node/zero-CDN
+  invariant holds at **runtime** (`slap.py dashboard` still starts exactly one Flask
+  process on `127.0.0.1`, serving an already-built static bundle + a JSON API — no Node
+  process, no CDN fetch, ever, at request time), not at **build** time — there is now a
+  real `npm --prefix slap/frontend run build` step (Vite + `tsc`), run once ahead of time,
+  producing `slap/static/dist/` (gitignored, like `slap.db`/`workdir/` — a build artifact,
+  never committed). `slap.py dashboard` fails loud with the exact build command if that
+  bundle is missing.
+- **New JSON API layer, `slap/api.py`** (purely additive over the same widget/action
+  functions `slap/dashboard.py` already had — `today_strip`, `pipeline`, `reachouts_rows`,
+  `tag_reply`, `stop_outreach`, `resend_bounced`, ... — never a second, independently-
+  derived implementation of any of them). Every dashboard read is now a `GET /api/*` route,
+  every write a `POST /api/*` route. The old Jinja templates/routes were deleted in the
+  same change, not kept as a fallback.
+- **New dashboard IA** (React Router tabs in `slap/frontend/src/App.tsx`): **Home** (`/`
+  — today/week stats, replies needing triage with real/not-real/OOO tagging + a resume-date
+  picker, follow-up reminders with "mark followed up," a pipeline summary, companies
+  contacted), **Campaigns** (`/campaigns` — per-campaign analytics behind a color-coded
+  pill selector, plus that campaign's active leads), **Engagement** (`/engagement` —
+  reply-rate/warm-but-silent + Remind, folded together with the former Analytics page's
+  charts: send/reply trend, bounce/block breakdown, reply-rate-by-persona, time-to-first-
+  reply, an optional weekly-goal-pacing gauge), **Pipeline** (`/pipeline` — mid-sequence/
+  follow-ups-firing, active leads, companies, with the former Deliverability page's
+  Bounces & blocks + Stopped outreach folded in), **Reach-outs** (`/reachouts` — campaign-
+  color row tint, a LinkedIn-replied toggle column, a floating "⋯" action menu built with
+  `@floating-ui/react` so it can never clip/render offscreen), **Commands** (`/commands` —
+  a live reference of every CLI subcommand, derived from `slap.py`'s own `argparse`
+  definition via `/api/commands`, never hand-maintained), plus a full-screen ASCII splash
+  screen shown once per browser (`localStorage`-gated) and footer links to **Logs**
+  (unchanged in substance) and **Template failures** (unchanged, still nav-linked only
+  when non-empty). Note: the current Reach-outs table's *filtering* is free-text search +
+  column sort only — the richer dropdown filter set (campaign/persona/domain/status/
+  engagement/reply-tag/req-id/date-range) §5/§8 describe for the Jinja-era page was not
+  carried over to this rewrite; the underlying `/api/reachouts` payload still returns every
+  one of those fields per row, so re-adding that UI is a frontend-only lift, not a backend
+  gap.
+- **New `interaction` event type** (`slap/tracking.py`, one new CHECK-constraint literal,
+  the same rename-recreate-copy-drop migration `stopped` introduced, now generalized to be
+  idempotent for either literal) backs three new features, discriminated by
+  `meta["channel"]`: **LinkedIn-replied** (`linkedin_reply` + `state` bool — a per-reachout
+  toggle, no GMass call), **follow-up "mark followed up"** (`followed_up` — resets the
+  follow-up-reminder timer computed by `_latest_interaction_at()`), and **Remind**
+  (`remind_queued`/`remind_sent`). Cache-inert (bumps only `last_event_at`, like `click`) —
+  never a `recipients.status` transition.
+- **Remind** — one-shot saved follow-ups (`slap/followups.py`; plain `followups/*.txt`
+  files, `Title:` line + blank-line separator, mirroring `initial.txt`'s own `Subject:`
+  convention; discovered by presence, never rows in `events`), sent as a threaded reply on
+  the next ordinary drain — reusing the existing OOO-resend mechanism
+  (`sendAsReply`/`campaignIdToReplyTo`), no new scheduler. `slap.py remind [<recipient>]
+  [--list] [--use SLUG] [--new] [--title T]` is the CLI surface; `dashboard.
+  queue_remind_for()`/`remind_eligible()` back both the CLI and the dashboard's Remind
+  button (warm-but-silent ∪ LinkedIn-replied ∪ active-real leads).
+- **`slap.py send custom`** — a one-off, editor-authored send outside any
+  `campaigns/<name>/` folder: author the initial email (and, optionally, an explicit
+  per-recipient day-gap cadence with its own follow-up bodies — no persona involved) in
+  the newly-added `editor` config knob (default `"code --wait"`; must block until the
+  window closes, which is why the default carries `--wait`), pick one of four attachment
+  modes (an existing PDF in the send's workdir, a pasted absolute path, a freshly-authored
+  LaTeX résumé, or none — the no-attachment path is new to the send pipeline generally),
+  then stage through the identical `stage_recipient()`/`runner.drain()` path every other
+  send uses. Tagged with a reserved pseudo-campaign label, `__custom__`, invisible to
+  `discover_campaigns()`/`slap.py list` and mapped to a neutral grey by `slap.color`
+  (below) rather than a random identity hue. `doctor.check_editor()` is a standalone,
+  non-gating check (a missing editor should never block an ordinary send/drain that never
+  needed one); `send custom`/`remind --new` call it directly to fail loud up front.
+- **Per-campaign color** (`slap/color.py`) — deterministic and storage-free: `sha256(
+  campaign name)` → one of 12 fixed OKLCH hue anchors, with separate light/dark
+  lightness/chroma bands (per the `dataviz` skill's method) so the same hue stays legible
+  on both dashboard themes. Nothing is ever persisted — recomputing it live is the whole
+  point (this app's "derived, not stored" discipline applied to a display value), and it
+  means a campaign's color can only change by renaming the campaign, which every other
+  part of the app already treats as a different campaign entirely. `slap.py list` prints
+  each campaign's color; `/api/campaigns`/`/api/reachouts` return both hexes so the React
+  side never recomputes or hardcodes one.
+- **The CLI, the runner, the event store's pre-existing types, and the GMass client are
+  unchanged** — this whole cutover is additive schema (`interaction`) plus a
+  presentation-layer swap over the same reads/writes every prior feature already used.
+
+---
+
 ## 9. Working rhythm & the Claude Code setup
 
 Implementation happens in **Claude Code**, in the repo. The pattern is **Route A**: the

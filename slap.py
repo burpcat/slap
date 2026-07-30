@@ -7,6 +7,7 @@ current build state / package layout.
 import argparse
 import difflib
 import os
+import subprocess
 import sys
 from datetime import date
 from pathlib import Path
@@ -15,14 +16,17 @@ from dotenv import load_dotenv
 
 from slap import display
 from slap.cleanup import DEFAULT_MIN_DAYS_IDLE, delete_eligible, find_cleanup_candidates
-from slap.config import ConfigError, discover_campaigns, load_campaign, load_global_config
+from slap.config import (
+    ConfigError, discover_campaigns, load_campaign, load_global_config, parse_initial_txt_text,
+)
 from slap.latex import recipient_workdir, run_latex_loop
 from slap.prompts import PASTE_TERMINATOR, read_paste
 from slap.queue import AmbiguousArchiveChoice, QueueError, resend_bounced, stage_recipient
 from slap.templates import fill_template, merge_config_values, parse_drop
-from slap import archive, dashboard, doctor, domains, gmass, gmass_cache, init, launchd, onboard, reload, runner, tracking
-
-load_dotenv()
+from slap import (
+    archive, dashboard, doctor, domains, followups, gmass, gmass_cache, init, launchd, onboard,
+    reload, runner, tracking,
+)
 
 
 def cmd_list(args):
@@ -64,6 +68,11 @@ def _run_doctor_or_exit(global_config, campaign=None):
 
 
 def cmd_send(args):
+    # `slap.py send custom` is a distinct one-off mode, not a real campaign
+    # folder — "custom" is a reserved campaign token (a campaigns/custom/ folder
+    # would be shadowed by this branch; documented in USAGE).
+    if args.campaign == "custom":
+        return cmd_send_custom(args)
     try:
         global_config = load_global_config()
         campaign = load_campaign(args.campaign, global_config)
@@ -98,6 +107,181 @@ def cmd_send(args):
 
         if input("\nAdd another? [Y/n]: ").strip().lower() == "n":
             break
+
+    if args.now:
+        print("\n--now: draining the queue immediately...")
+        result = runner.drain(conn, global_config, os.environ.get(global_config.api_key_env, ""))
+        _print_drain_result(result)
+
+
+CUSTOM_CAMPAIGN = "__custom__"  # reserved pseudo-campaign label for `send custom`
+
+
+def _open_in_editor(editor_cmd: str, path: Path) -> None:
+    """Open `path` in the configured editor and BLOCK until it returns. The
+    editor command is a full string (`code --wait`, `vim`, ...) so GUI editors
+    can carry their own wait-flag — see config.editor's own docstring for why a
+    bare `code` would return immediately and read back stale content."""
+    parts = editor_cmd.split()
+    try:
+        subprocess.run([*parts, str(path)], check=False)
+    except FileNotFoundError:
+        raise ConfigError(
+            f"editor command {parts[0]!r} not found on PATH — set a valid `editor:` in config.yaml"
+        )
+
+
+def _ask_positive_int(prompt: str, *, read_line=input) -> int:
+    while True:
+        raw = read_line(prompt).strip()
+        try:
+            n = int(raw)
+        except ValueError:
+            display.warn("  Enter a whole number >= 1.")
+            continue
+        if n >= 1:
+            return n
+        display.warn("  Enter a whole number >= 1.")
+
+
+def _choose_custom_attachment(workdir: Path, recipient: str, *, read_line=input):
+    """Resolve the attachment for a custom send. Returns
+    (attachment_path|None, attachment_name|None, latex_enabled). Four modes
+    (per the owner's spec): pick a PDF already in this send's folder, paste an
+    absolute path, author LaTeX now (compile + the >1-page hard gate), or none."""
+    while True:
+        display.plain("\nAttachment:")
+        display.plain(f"  1. Pick a PDF already placed in this send's folder ({workdir})")
+        display.plain("  2. Paste an absolute path to a PDF")
+        display.plain("  3. Write a LaTeX résumé now (compile + >1-page gate)")
+        display.plain("  4. No attachment")
+        choice = read_line("Choose [1-4]: ").strip()
+        if choice == "1":
+            pdfs = sorted(workdir.glob("*.pdf"))
+            if not pdfs:
+                display.warn(f"  No PDFs found in {workdir} — place one there first, or pick another option.")
+                continue
+            for i, p in enumerate(pdfs, start=1):
+                display.plain(f"  {i}. {p.name}")
+            sel = read_line(f"Pick [1-{len(pdfs)}]: ").strip()
+            try:
+                picked = pdfs[int(sel) - 1]
+            except (ValueError, IndexError):
+                display.warn("  Not understood.")
+                continue
+            return picked, picked.name, False
+        if choice == "2":
+            p = Path(read_line("Absolute path to a PDF: ").strip()).expanduser()
+            if not p.is_file():
+                display.warn(f"  {p} is not a file.")
+                continue
+            if p.suffix.lower() != ".pdf":
+                display.warn(f"  {p} is not a .pdf.")
+                continue
+            return p, p.name, False
+        if choice == "3":
+            name = read_line("Attachment filename the recipient sees [Resume.pdf]: ").strip() or "Resume.pdf"
+            tex_source = read_paste(f"\nPaste the LaTeX résumé source for {recipient}")
+            staged = run_latex_loop(workdir, tex_source, name)
+            if staged is None:
+                display.warn("  LaTeX aborted — choose an attachment option again.")
+                continue
+            return staged.path, name, True
+        if choice == "4":
+            return None, None, False
+        display.warn("  Enter 1, 2, 3, or 4.")
+
+
+def cmd_send_custom(args):
+    """`slap.py send custom` — author a one-off message (+ optional custom-cadence
+    follow-ups) in the configured editor, choose an attachment, and stage it via
+    the SAME queue/runner machinery as a normal send (campaign='__custom__',
+    persona='custom', an explicit per-recipient cadence). No campaign.yaml is
+    ever created; auto-discovery never sees this."""
+    try:
+        global_config = load_global_config()
+    except ConfigError as e:
+        display.fail(f"slap: {e}")
+        sys.exit(1)
+
+    # Fail loud NOW if the editor isn't usable (this command's one hard prereq).
+    editor_check = doctor.check_editor(global_config)
+    if not editor_check.ok:
+        display.fail(f"slap: {editor_check.detail} — set a valid `editor:` in config.yaml")
+        sys.exit(1)
+
+    try:
+        consumer_domains = domains.load_consumer_domains(Path(global_config.consumer_domains_file))
+    except domains.DomainsError as e:
+        display.fail(f"slap: {e}")
+        sys.exit(1)
+
+    conn = tracking.connect()
+    recipient = input("\nRecipient email: ").strip()
+    if not recipient:
+        display.error("No recipient email — aborting.")
+        return 1
+
+    workdir = recipient_workdir(CUSTOM_CAMPAIGN, recipient)
+
+    # Initial email: Subject: line + blank line + body, authored in the editor
+    # (same shape every initial.txt uses, validated by the same parser).
+    initial_path = workdir / "initial.txt"
+    if not initial_path.exists():
+        initial_path.write_text("Subject: \n\n", encoding="utf-8")
+    print("\nOpening your editor for the initial email (first line 'Subject: ...', blank line, then body)...")
+    _open_in_editor(global_config.editor, initial_path)
+    try:
+        subject, body = parse_initial_txt_text(initial_path.read_text(encoding="utf-8"), ctx=str(initial_path))
+    except ConfigError as e:
+        display.fail(f"slap: {e}")
+        return 1
+
+    # Custom cadence: each follow-up asks its own day-gap, then opens the editor
+    # for that stage's body. This per-stage day-gap list IS the cadence staged
+    # for this recipient (recipients.cadence), no persona involved.
+    cadence, stage_bodies = [], []
+    while True:
+        if input(f"\nAdd a follow-up (stage {len(cadence) + 1})? [y/N]: ").strip().lower() != "y":
+            break
+        gap = _ask_positive_int(f"Days after the previous message before stage {len(cadence) + 1} fires: ")
+        stage_path = workdir / f"stage{len(cadence) + 1}.txt"
+        if not stage_path.exists():
+            stage_path.write_text("", encoding="utf-8")
+        print(f"Opening your editor for stage {len(cadence) + 1}'s body...")
+        _open_in_editor(global_config.editor, stage_path)
+        cadence.append(gap)
+        stage_bodies.append(stage_path.read_text(encoding="utf-8"))
+
+    attachment_path, attachment_name, latex_enabled = _choose_custom_attachment(workdir, recipient)
+
+    # Dedup awareness — warn, never block (same as a normal send).
+    dedup = domains.check_recipient(conn, recipient, consumer_domains)
+    if dedup.hard_warning:
+        w = dedup.hard_warning
+        display.error(f"\n⚠ HARD WARN: {recipient} already contacted — campaign={w.campaign} status={w.status}")
+    if dedup.soft_warning_contacts:
+        display.warn(f"\n⚠ SOFT WARN: {len(dedup.soft_warning_contacts)} other contact(s) on domain "
+                     f"{dedup.soft_warning_domain}")
+    if (dedup.hard_warning or dedup.soft_warning_contacts) and \
+            input(display.styled_prompt("Proceed anyway? [y/N]: ", style=display.YELLOW)).strip().lower() != "y":
+        print("Skipped.")
+        return
+
+    display.preview_panel(recipient, subject, body)
+    print(f"Attachment: {attachment_name if attachment_name else '(none)'}")
+    print(f"Cadence (custom): {cadence}" if cadence else "Cadence: initial send only (no follow-ups)")
+    if input("\nStage this custom send? [y/N]: ").strip().lower() != "y":
+        print("Skipped.")
+        return
+
+    stage_recipient(
+        conn, campaign=CUSTOM_CAMPAIGN, recipient=recipient, persona="custom",
+        cadence=cadence, subject=subject, body=body, stage_bodies=stage_bodies,
+        attachment_path=attachment_path, attachment_name=attachment_name, latex_enabled=latex_enabled,
+        archive_dir=archive.archive_dir_from_env(),
+    )
+    display.success(f"Staged {recipient} (custom send).")
 
     if args.now:
         print("\n--now: draining the queue immediately...")
@@ -391,6 +575,15 @@ def cmd_dashboard(args):
                      f"GMass poll (replies/clicks/bounces) needs it. See .env.example.")
         sys.exit(1)
 
+    # The dashboard is now a React SPA served from a built bundle (slap/static/
+    # dist/). Fail loud with the exact build command if it's missing, same "run
+    # this setup step first" convention as a missing .env/config.yaml — the
+    # bundle is generated, not committed (see .gitignore).
+    if not (dashboard.STATIC_DIST / "index.html").exists():
+        display.fail("slap: frontend bundle not built — run "
+                     "`npm --prefix slap/frontend run build` first (Node required; see README).")
+        sys.exit(1)
+
     tracking.connect().close()  # ensure the DB file + schema exist before serving
     app = dashboard.create_app(tracking.DB_PATH, global_config, consumer_domains, api_key)
     # Not 5000: macOS's AirPlay Receiver (Control Center) listens there by
@@ -459,6 +652,96 @@ def cmd_rebuild(args):
     tracking.rebuild(conn)
     recipient_count = conn.execute("SELECT COUNT(*) FROM recipients").fetchone()[0]
     display.success(f"Rebuilt recipients cache ({recipient_count} recipients) from {event_count} events.")
+
+
+def cmd_interaction(args):
+    # The CLI backend for the dashboard's LinkedIn-replied toggle and follow-up
+    # "mark followed up" action (every dashboard write has a terminal command —
+    # slap stays GUI-agnostic/TUI-friendly). Both append an `interaction` event.
+    conn = tracking.connect()
+    try:
+        if args.channel == "linkedin-reply":
+            replied = not args.off
+            dashboard.mark_linkedin_replied(conn, args.recipient, replied)
+            display.success(
+                f"Marked {args.recipient} "
+                f"{'LinkedIn-replied' if replied else 'not LinkedIn-replied'}."
+            )
+        else:  # followed-up
+            dashboard.mark_followed_up(conn, args.recipient)
+            display.success(f"Recorded follow-up with {args.recipient} — reminder timer reset.")
+    except ValueError as e:
+        display.error(str(e))
+        return 1
+
+
+def cmd_remind(args):
+    # CLI backend for the dashboard's Remind action (req 9): queue a one-shot
+    # follow-up that fires as a threaded reply on the next drain. Templates are
+    # authored content on disk (followups/*.txt).
+    conn = tracking.connect()
+
+    if args.list:
+        saved = followups.discover_followups()
+        if not saved:
+            display.plain("No saved follow-ups yet — author one with `remind <recipient> --new --title \"...\"`.")
+            return
+        display.plain("Saved follow-ups:")
+        for f in saved:
+            display.plain(f"  {f['slug']}: {f['title']}")
+        return
+
+    if not args.recipient:
+        display.error("A recipient is required (or use --list).")
+        return 1
+
+    used_slug = None
+    if args.use:
+        try:
+            body = followups.load_followup(args.use)["body"]
+            used_slug = args.use
+        except followups.FollowupError as e:
+            display.fail(f"slap: {e}")
+            return 1
+    elif args.new:
+        try:
+            global_config = load_global_config()
+        except ConfigError as e:
+            display.fail(f"slap: {e}")
+            sys.exit(1)
+        editor_check = doctor.check_editor(global_config)
+        if not editor_check.ok:
+            display.fail(f"slap: {editor_check.detail} — set a valid `editor:` in config.yaml")
+            sys.exit(1)
+        scratch = recipient_workdir(CUSTOM_CAMPAIGN, args.recipient) / "remind-draft.txt"
+        if not scratch.exists():
+            scratch.write_text("", encoding="utf-8")
+        print("\nOpening your editor to write the reminder body...")
+        _open_in_editor(global_config.editor, scratch)
+        body = scratch.read_text(encoding="utf-8")
+        if not body.strip():
+            display.error("Empty reminder body — nothing queued.")
+            return 1
+        if args.title:
+            # "Save and send": warn that a saved template is generic and should
+            # be edited before reuse (matches the dashboard's save-and-send copy).
+            try:
+                saved = followups.save_followup(args.title, body)
+                used_slug = saved["slug"]
+                display.success(f"Saved follow-up '{saved['slug']}' (edit before reusing — it's generic).")
+            except followups.FollowupError as e:
+                display.fail(f"slap: {e}")
+                return 1
+    else:
+        display.error("Choose --use <slug> or --new (see `remind --list`).")
+        return 1
+
+    try:
+        dashboard.queue_remind_for(conn, args.recipient, body, followup=used_slug)
+    except (ValueError, QueueError) as e:
+        display.error(str(e))
+        return 1
+    display.success(f"Queued a reminder for {args.recipient} — it fires on the next drain.")
 
 
 RELOAD_SAMPLE_DIFF_COUNT = 3
@@ -671,8 +954,10 @@ def build_parser():
 
     sub.add_parser("list", help="List auto-discovered campaigns").set_defaults(func=cmd_list)
 
-    p_send = sub.add_parser("send", help="Prep flow: stage a recipient to the queue")
-    p_send.add_argument("campaign")
+    p_send = sub.add_parser(
+        "send", help="Prep flow: stage a recipient to the queue (use `send custom` for a one-off editor-authored send)"
+    )
+    p_send.add_argument("campaign", help="Campaign name, or the literal 'custom' for an editor-authored one-off send")
     p_send.add_argument("--now", action="store_true", help="Also drain immediately after staging")
     p_send.set_defaults(func=cmd_send)
 
@@ -686,6 +971,26 @@ def build_parser():
     ).set_defaults(func=cmd_onboard_campaign)
     sub.add_parser("domains", help="Regenerate/print the domain index").set_defaults(func=cmd_domains)
     sub.add_parser("rebuild", help="Rebuild the recipients cache from events").set_defaults(func=cmd_rebuild)
+
+    p_interaction = sub.add_parser(
+        "interaction", help="Record a per-reachout interaction (LinkedIn-replied / followed-up)"
+    )
+    p_interaction.add_argument("recipient")
+    p_interaction.add_argument("--channel", choices=["linkedin-reply", "followed-up"], required=True,
+                                help="linkedin-reply: toggle the LinkedIn-replied flag; followed-up: reset the reminder timer")
+    p_interaction.add_argument("--off", action="store_true",
+                                help="With --channel linkedin-reply: CLEAR the flag instead of setting it")
+    p_interaction.set_defaults(func=cmd_interaction)
+
+    p_remind = sub.add_parser(
+        "remind", help="Queue a one-shot follow-up reminder (fires as a threaded reply on the next drain)"
+    )
+    p_remind.add_argument("recipient", nargs="?", help="Recipient to remind (omit when using --list)")
+    p_remind.add_argument("--list", action="store_true", help="List saved follow-up templates")
+    p_remind.add_argument("--use", metavar="SLUG", help="Send using a saved follow-up template")
+    p_remind.add_argument("--new", action="store_true", help="Author a new reminder body in your editor")
+    p_remind.add_argument("--title", help="With --new: also save the authored body as a reusable template")
+    p_remind.set_defaults(func=cmd_remind)
     sub.add_parser(
         "template-reload",
         help="Re-render every not-yet-sent recipient's staged content against current templates",
@@ -719,6 +1024,13 @@ def build_parser():
 
 
 def main(argv=None):
+    # Loaded here (the CLI entry point), NOT at module import time: importing
+    # slap.py for introspection only (slap.api._load_cli() walks build_parser()
+    # to derive the dashboard's Commands reference) must never mutate the
+    # calling process's os.environ by loading a real .env — that side effect
+    # once leaked RESUME_ARCHIVE_DIR into the test/dashboard process. Every real
+    # CLI invocation still goes through main(), so behavior is unchanged.
+    load_dotenv()
     args = build_parser().parse_args(argv)
     return args.func(args)
 

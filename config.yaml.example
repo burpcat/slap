@@ -51,6 +51,14 @@ schedule:
 tracking:
   consumer_domains_file: consumer_domains.txt
 
+# Optional — the command `slap.py send custom` (and `remind --new`) uses to open
+# a scratch file for authoring. Defaults to "code --wait" if omitted. Use a FULL
+# command: GUI editors need a blocking flag (VS Code: `code --wait`, Sublime:
+# `subl --wait`) so slap waits for you to close the file before reading it back;
+# terminal editors block natively (`vim`, `nvim`, `nano`). `doctor` verifies the
+# binary is on PATH but never blocks a send/drain over it.
+editor: "code --wait"
+
 # Optional — entirely omittable. Caches GMass reply/click/bounce data for
 # the dashboard, refreshed hourly by `slap.py sync` (see LAUNCHD.md) instead
 # of on every page load. If this block (or Redis itself) isn't there, the

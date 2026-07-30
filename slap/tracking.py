@@ -111,6 +111,20 @@ CONTROL_SHEET.md, revisit when steps 6/9/10 wire in real callers):
   default only for `queued` events written before this feature shipped
   (missing key = unknown, never fabricated, the same convention every other
   additive `meta` field in this module follows).
+- `interaction` (post-launch: the per-reachout interaction log backing the
+  React dashboard's LinkedIn-replied toggle, follow-up "mark followed up"
+  timer reset, and one-shot "Remind" sends). One new CHECK-constraint literal
+  deliberately shared across all three features rather than minting three
+  types (or, worse, three ad-hoc stores): `meta = {"channel": <str>, ...}`
+  where channel ∈ {`linkedin_reply` (+`state`: bool toggle), `followed_up`
+  (bare marker), `remind_queued` (+`followup`/`body` snapshot), `remind_sent`}.
+  Reusing `reply_reviewed` was rejected: its readers (`reply_tags()`,
+  `_latest_reply_lifecycle_events()`) treat the latest of reply/ooo_tagged/
+  reply_reviewed as *the* reply-tag resolution, so an unrelated LinkedIn/
+  followed-up marker riding that type would silently corrupt triage state.
+  Cache-inert (`_apply_event_to_cache` bumps only last_event_at, like `click`)
+  — never a status transition, so it needs no changes to any active-only query;
+  its current-state is derived live from the log by dashboard read helpers.
 """
 from __future__ import annotations
 
@@ -124,7 +138,7 @@ DB_PATH = Path("slap.db")
 EVENT_TYPES = {
     "queued", "draft_created", "sent", "click", "reply", "bounce", "ooo_tagged",
     "requeued", "reply_reviewed", "run_started", "run_completed", "send_failed", "run_failed",
-    "stopped",
+    "stopped", "interaction",
 }
 # Event types describing a runner/drain's own lifecycle, not a specific
 # recipient — appended to the log but never applied to the recipients cache.
@@ -143,7 +157,8 @@ CREATE TABLE IF NOT EXISTS events (
     campaign TEXT,
     type TEXT NOT NULL CHECK (type IN (
         'queued','draft_created','sent','click','reply','bounce','ooo_tagged','requeued',
-        'reply_reviewed','run_started','run_completed','send_failed','run_failed','stopped'
+        'reply_reviewed','run_started','run_completed','send_failed','run_failed','stopped',
+        'interaction'
     )),
     stage INTEGER,
     gmass_campaign_id TEXT,
@@ -183,10 +198,16 @@ class TrackingError(Exception):
 
 
 def _migrate_events_check_constraint(conn: sqlite3.Connection) -> None:
-    """One-time additive migration for the `stopped` event type (Stop
-    outreach, post-launch — see this module's own docstring for why it
-    genuinely needed a new CHECK-constraint literal instead of reusing an
-    existing type). A brand-new `slap.db` never hits this at all — its
+    """One-time additive migration for the CHECK-constraint literals `events.type`
+    accepts. Originally added for the `stopped` event type (Stop outreach); the
+    guard literal is now `'interaction'` (the newest CHECK value — the per-reachout
+    interaction log: LinkedIn-replied, followed-up, remind markers), so a db still
+    on the pre-`interaction` constraint — INCLUDING one already migrated for
+    `stopped` — is rebuilt to the current shape. The rebuild is generic (every row
+    copied verbatim against `_EVENTS_TABLE_SQL`), so bumping the literal is all a
+    new additive type needs here. See this module's own docstring for why these
+    types genuinely need a new CHECK-constraint literal instead of reusing an
+    existing type. A brand-new `slap.db` never hits this at all — its
     `events` table doesn't exist yet, so `_SCHEMA`'s own `CREATE TABLE IF
     NOT EXISTS` below creates it correctly, already including `'stopped'`,
     with zero migration involved. An already-existing, already-populated db
@@ -245,7 +266,7 @@ def _migrate_events_check_constraint(conn: sqlite3.Connection) -> None:
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'"
     ).fetchone()
-    if row is None or row[0] is None or "'stopped'" in row[0]:
+    if row is None or row[0] is None or "'interaction'" in row[0]:
         return  # fresh db (nothing to migrate yet) or already migrated
     conn.execute("BEGIN")
     try:
@@ -356,12 +377,23 @@ def latest_open_draft_id(conn: sqlite3.Connection, recipient: str):
     it can never be the reverse (a real open draft going undetected)."""
     rows = conn.execute(
         "SELECT type, gmass_draft_id FROM events WHERE recipient = ? "
-        "AND type IN ('draft_created', 'sent', 'requeued') ORDER BY id DESC",
+        "AND type IN ('draft_created', 'sent', 'requeued', 'interaction') ORDER BY id DESC",
         (recipient,),
     ).fetchall()
     for row in rows:
         if row["type"] in ("sent", "requeued"):
             return None  # already resolved since the last draft_created — nothing open
+        if row["type"] == "interaction":
+            # A Remind send (runner._send_remind) records a `remind_sent`
+            # interaction carrying the draft it sent in gmass_draft_id — that
+            # closes the Remind's own draft exactly like a `sent`/`requeued`
+            # does, so a subsequent send never reuses a stale Remind draft.
+            # Every other interaction channel (linkedin_reply/followed_up) has
+            # no draft and is skipped, leaving any genuinely-open earlier draft
+            # visible.
+            if row["gmass_draft_id"]:
+                return None
+            continue
         if row["type"] == "draft_created":
             return row["gmass_draft_id"]
     return None
@@ -438,7 +470,16 @@ def _apply_event_to_cache(conn: sqlite3.Connection, event: dict) -> None:
                            current_stage=event["stage"],
                            last_gmass_campaign_id=event["gmass_campaign_id"],
                            first_sent_at=ts, last_event_at=ts)
-    elif etype in ("send_failed", "click"):
+    elif etype in ("send_failed", "click", "interaction"):
+        # `interaction` (per-reachout owner-recorded signals — LinkedIn-replied
+        # toggles, "followed up" markers, remind_queued/remind_sent) is
+        # cache-inert exactly like `click`/`draft_created`/`reply_reviewed`: it
+        # bumps last_event_at but never touches status/current_stage, because
+        # it is not a send-pipeline state transition GMass cares about. Its
+        # current-state (e.g. "is LinkedIn-replied on?", "when was the latest
+        # interaction?") is derived live from the event log by the dashboard's
+        # read helpers, never stored in a mutable column — the same derived-
+        # not-stored discipline as reply_tags()/_stopped_recipients().
         _upsert_recipient(conn, recipient, campaign=campaign, last_event_at=ts)
     elif etype == "reply":
         _upsert_recipient(conn, recipient, campaign=campaign, status="replied",
