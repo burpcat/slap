@@ -367,6 +367,9 @@ export interface CommandSpec {
   help: string;
   usage: string;
   args: CommandArg[];
+  // Concrete example invocations, using the owner's real campaign names /
+  // recipient where relevant (see _command_examples in slap/api.py).
+  examples: string[];
 }
 
 export interface CommandsResponse {

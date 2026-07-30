@@ -248,6 +248,13 @@ def test_api_commands_derived_from_argparse(app):
     send = next(c for c in commands if c["name"] == "send")
     assert send["help"]  # help text carried through
     assert any(a["name"] == "campaign" for a in send["args"])  # positional arg surfaced
+    # Usage must be plain text — no leaked ANSI color escapes (argparse 3.13+
+    # colorizes format_usage()).
+    assert "\x1b" not in send["usage"]
+    assert "[1;3" not in send["usage"]
+    # Every command carries at least one concrete example invocation.
+    assert all(c["examples"] for c in commands)
+    assert any("slap.py send" in ex for ex in send["examples"])
 
 
 def test_api_reachouts_returns_rows_and_total_count(app, tmp_path):

@@ -30,6 +30,16 @@ export default function Commands() {
             <p className={styles.name}>{cmd.name}</p>
             {cmd.help && <p className={styles.help}>{cmd.help}</p>}
             <pre className={styles.usage}>{cmd.usage}</pre>
+            {cmd.examples.length > 0 && (
+              <div className={styles.examples}>
+                <span className={styles.examplesLabel}>Examples</span>
+                {cmd.examples.map((ex) => (
+                  <code key={ex} className={styles.example}>
+                    {ex}
+                  </code>
+                ))}
+              </div>
+            )}
             {cmd.args.length > 0 && (
               <table className={styles.argsTable}>
                 <thead>

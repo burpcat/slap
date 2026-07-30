@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import re
 from datetime import date, datetime
 from pathlib import Path
 
@@ -80,14 +81,80 @@ def _load_cli():
     return _cli_module
 
 
-def commands_reference() -> list:
+# argparse (Python 3.13+) colorizes format_usage()/help with ANSI SGR escapes
+# when it thinks output is a terminal. Those escapes are meaningless in the
+# JSON payload and leaked as literal "[1;34m…" noise into the Commands tab —
+# strip them so the usage line renders as plain text.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _strip_ansi(s: str) -> str:
+    return _ANSI_RE.sub("", s or "")
+
+
+def _command_examples(name: str, args: list, campaigns: list, recipient: str) -> list:
+    """Concrete, copy-pasteable example invocations for a command — using the
+    owner's REAL campaign names and a real recipient from their DB (passed in)
+    so the reference reads like their own tool, not abstract placeholders.
+    Curated per command for the ones with interesting flags/arguments; a
+    generic `slap.py <name> <required positionals>` is synthesized for the
+    rest, with campaign/recipient positionals filled from real data too."""
+    c0 = campaigns[0] if campaigns else "my-campaign"
+    c1 = campaigns[1] if len(campaigns) > 1 else c0
+    curated = {
+        "list": ["slap.py list"],
+        "send": [f"slap.py send {c0}", f"slap.py send {c1} --now", "slap.py send custom"],
+        "runner": ["slap.py runner"],
+        "sync": ["slap.py sync"],
+        "dashboard": ["slap.py dashboard"],
+        "doctor": ["slap.py doctor"],
+        "domains": ["slap.py domains"],
+        "rebuild": ["slap.py rebuild"],
+        "bounced": ["slap.py bounced"],
+        "cleanup": ["slap.py cleanup", "slap.py cleanup --confirm", "slap.py cleanup --min-days-idle 30"],
+        "interaction": [
+            f"slap.py interaction {recipient} --channel linkedin-reply",
+            f"slap.py interaction {recipient} --channel followed-up",
+            f"slap.py interaction {recipient} --channel linkedin-reply --off",
+        ],
+        "remind": [
+            "slap.py remind --list",
+            f"slap.py remind {recipient} --use quick-nudge",
+            f'slap.py remind {recipient} --new --title "Quick nudge"',
+        ],
+    }
+    if name in curated:
+        return curated[name]
+    # Generic fallback: fill required positionals with real values where the arg
+    # name tells us how (campaign/recipient), else the first choice, else a
+    # readable placeholder. Optional flags are left off the default example.
+    parts = ["slap.py", name]
+    for a in args:
+        if a["flags"] or not a["required"]:
+            continue
+        dest = a["name"]
+        if "campaign" in dest:
+            parts.append(c0)
+        elif "recipient" in dest:
+            parts.append(recipient)
+        elif a["choices"]:
+            parts.append(str(a["choices"][0]))
+        else:
+            parts.append(f"<{dest}>")
+    return [" ".join(parts)]
+
+
+def commands_reference(*, campaigns=None, sample_recipient=None) -> list:
     """The terminal-command reference, derived live from the CLI's own argparse
     definition (`build_parser()` in slap.py) so it can never drift from the real
     commands — a new subcommand shows up here automatically. Reaches into
     argparse's `_SubParsersAction`/`_actions` internals (argparse exposes no
     public introspection API); a test asserts the expected command list so a
     Python-version change to those internals surfaces as a failure, not a
-    silently empty Commands tab."""
+    silently empty Commands tab. `campaigns`/`sample_recipient` (the owner's own
+    data) are woven into each command's examples so the reference feels concrete."""
+    campaigns = list(campaigns or [])
+    recipient = sample_recipient or "jordan@acme.com"
     parser = _load_cli().build_parser()
     sub_actions = [a for a in parser._actions if isinstance(a, argparse._SubParsersAction)]
     out = []
@@ -102,15 +169,16 @@ def commands_reference() -> list:
                 args.append({
                     "name": act.dest,
                     "flags": list(act.option_strings),  # [] for positionals
-                    "help": act.help or "",
+                    "help": _strip_ansi(act.help or ""),
                     "required": bool(getattr(act, "required", False)),
                     "choices": list(act.choices) if act.choices else None,
                 })
             out.append({
                 "name": name,
-                "help": help_by_name.get(name, ""),
-                "usage": " ".join(subparser.format_usage().split()),
+                "help": _strip_ansi(help_by_name.get(name, "")),
+                "usage": _strip_ansi(" ".join(subparser.format_usage().split())),
                 "args": args,
+                "examples": _command_examples(name, args, campaigns, recipient),
             })
     out.sort(key=lambda c: c["name"])
     return out
@@ -332,8 +400,16 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, api
     @app.route("/api/commands")
     def api_commands():
         # Backs the dashboard's Commands reference tab (req 0) — derived from
-        # the live argparse definition, never a hand-maintained list.
-        return jsonify({"commands": commands_reference()})
+        # the live argparse definition, never a hand-maintained list. Real
+        # campaign names + a real recipient are threaded in so the per-command
+        # examples read like the owner's own tool.
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT recipient FROM recipients ORDER BY last_event_at DESC LIMIT 1"
+        ).fetchone()
+        sample_recipient = row["recipient"] if row else None
+        return jsonify({"commands": commands_reference(
+            campaigns=list(discover_campaigns()), sample_recipient=sample_recipient)})
 
     @app.route("/api/nav")
     def api_nav():
