@@ -71,6 +71,41 @@
   color: var(--text-secondary);
   white-space: nowrap;
 }
+.agingRight {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  white-space: nowrap;
+}
+.followedUpBtn {
+  all: unset;
+  cursor: pointer;
+  font-size: 0.75rem;
+  font-weight: 600;
+  line-height: 1;
+  padding: 5px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+}
+.followedUpBtn:hover {
+  border-color: var(--series-1);
+  color: var(--series-1);
+}
+.followedUpBtn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.inTag {
+  margin-left: 8px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--series-1);
+  border: 1px solid var(--series-1);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
 
 .empty {
   color: var(--text-muted);

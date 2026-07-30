@@ -655,23 +655,36 @@ def cmd_rebuild(args):
 
 
 def cmd_interaction(args):
-    # The CLI backend for the dashboard's LinkedIn-replied toggle and follow-up
+    # The CLI backend for the dashboard's LinkedIn reply-gate and follow-up
     # "mark followed up" action (every dashboard write has a terminal command —
-    # slap stays GUI-agnostic/TUI-friendly). Both append an `interaction` event.
+    # slap stays GUI-agnostic/TUI-friendly).
     conn = tracking.connect()
     try:
         if args.channel == "linkedin-reply":
-            replied = not args.off
-            dashboard.mark_linkedin_replied(conn, args.recipient, replied)
+            # Marking LinkedIn-replied now HALTS GMass outreach (status
+            # 'linkedin-gate'), so it fires a real GMass unsubscribe and needs
+            # the api key. One-way, like Stop — --off can't clear it.
+            if args.off:
+                display.error("linkedin-reply is a one-way gate (like Stop) — --off can't clear it.")
+                return 1
+            global_config = load_global_config()
+            api_key = os.environ.get(global_config.api_key_env, "").strip()
+            if not api_key:
+                display.error(f"{global_config.api_key_env} is not set — the LinkedIn gate halts "
+                              f"GMass outreach and needs it. See .env.example.")
+                return 1
+            dashboard.gate_linkedin(conn, args.recipient, api_key=api_key)
             display.success(
-                f"Marked {args.recipient} "
-                f"{'LinkedIn-replied' if replied else 'not LinkedIn-replied'}."
+                f"Marked {args.recipient} LinkedIn-replied — GMass outreach halted (status linkedin-gate)."
             )
         else:  # followed-up
             dashboard.mark_followed_up(conn, args.recipient)
             display.success(f"Recorded follow-up with {args.recipient} — reminder timer reset.")
     except ValueError as e:
         display.error(str(e))
+        return 1
+    except Exception as e:  # GMass suppression failed → nothing recorded, fail loud
+        display.error(f"GMass suppression call failed, nothing was recorded: {e}")
         return 1
 
 
@@ -977,9 +990,10 @@ def build_parser():
     )
     p_interaction.add_argument("recipient")
     p_interaction.add_argument("--channel", choices=["linkedin-reply", "followed-up"], required=True,
-                                help="linkedin-reply: toggle the LinkedIn-replied flag; followed-up: reset the reminder timer")
+                                help="linkedin-reply: mark replied-on-LinkedIn and HALT GMass outreach "
+                                     "(status linkedin-gate; one-way, like Stop); followed-up: reset the reminder timer")
     p_interaction.add_argument("--off", action="store_true",
-                                help="With --channel linkedin-reply: CLEAR the flag instead of setting it")
+                                help="(deprecated) linkedin-reply is a one-way gate and can't be cleared")
     p_interaction.set_defaults(func=cmd_interaction)
 
     p_remind = sub.add_parser(

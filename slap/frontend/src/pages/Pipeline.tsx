@@ -19,6 +19,19 @@ export default function Pipeline() {
     <div>
       <h1>Pipeline</h1>
       <CardGrid>
+        {/* Companies contacted leads the grid so it lands in the first row
+            (Image #19). */}
+        <Card title="Companies contacted">
+          <div className={styles.row}>
+            <span>All time</span>
+            <span>{data.companies.all_time_count}</span>
+          </div>
+          <div className={styles.row}>
+            <span>This week</span>
+            <span>{data.companies.this_week_count}</span>
+          </div>
+        </Card>
+
         <Card title="Mid-sequence, by current stage">
           {stageEntries.length === 0 ? (
             <p className={styles.empty}>Nobody currently mid-sequence.</p>
@@ -82,17 +95,6 @@ export default function Pipeline() {
               </div>
             ))
           )}
-        </Card>
-
-        <Card title="Companies contacted">
-          <div className={styles.row}>
-            <span>All time</span>
-            <span>{data.companies.all_time_count}</span>
-          </div>
-          <div className={styles.row}>
-            <span>This week</span>
-            <span>{data.companies.this_week_count}</span>
-          </div>
         </Card>
 
         <Card title="Bounces &amp; blocks (deliverability)" full>

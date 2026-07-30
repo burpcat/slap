@@ -99,7 +99,7 @@ function useInvalidateAfter(keys: string[][]) {
 }
 
 export function useTagReply(recipient: string) {
-  const invalidate = useInvalidateAfter([['home'], ['pipeline'], ['reachouts'], ['engagement']]);
+  const invalidate = useInvalidateAfter([['home'], ['pipeline'], ['reachouts'], ['engagement'], ['campaigns']]);
   return useMutation({
     mutationFn: (body: TagReplyBody) => apiPost<OkResponse>(`/api/reply/${encodeURIComponent(recipient)}/tag`, body),
     onSuccess: invalidate,
@@ -107,7 +107,7 @@ export function useTagReply(recipient: string) {
 }
 
 export function useStopOutreach(recipient: string) {
-  const invalidate = useInvalidateAfter([['pipeline'], ['reachouts'], ['home']]);
+  const invalidate = useInvalidateAfter([['pipeline'], ['reachouts'], ['home'], ['engagement'], ['campaigns']]);
   return useMutation({
     mutationFn: () => apiPost<OkResponse>(`/api/reachouts/${encodeURIComponent(recipient)}/stop`, {}),
     onSuccess: invalidate,
@@ -133,7 +133,10 @@ export function useHideWarmButSilent(recipient: string, hide: boolean) {
 }
 
 export function useLinkedinReplied(recipient: string) {
-  const invalidate = useInvalidateAfter([['reachouts'], ['home'], ['pipeline']]);
+  // Gating halts outreach and moves the recipient to 'linkedin-gate' — affects
+  // the reach-outs table, home/pipeline rosters, engagement analytics, and a
+  // campaign's LinkedIn/active-lead counts, so refresh all of them.
+  const invalidate = useInvalidateAfter([['reachouts'], ['home'], ['pipeline'], ['engagement'], ['campaigns']]);
   return useMutation({
     mutationFn: (body: LinkedinRepliedBody) =>
       apiPost<OkResponse>(`/api/reachouts/${encodeURIComponent(recipient)}/linkedin-replied`, body),
@@ -142,7 +145,7 @@ export function useLinkedinReplied(recipient: string) {
 }
 
 export function useFollowedUp(recipient: string) {
-  const invalidate = useInvalidateAfter([['home'], ['pipeline'], ['reachouts']]);
+  const invalidate = useInvalidateAfter([['home'], ['pipeline'], ['reachouts'], ['campaigns']]);
   return useMutation({
     mutationFn: () => apiPost<OkResponse>(`/api/reachouts/${encodeURIComponent(recipient)}/followed-up`, {}),
     onSuccess: invalidate,

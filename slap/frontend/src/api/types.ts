@@ -289,6 +289,9 @@ export interface ReachoutRow {
   already_corrected_to: { recipient: string; status: string }[];
   clicks: ClickDetail[];
   linkedin_replied: boolean;
+  // Outreach halted because they replied on LinkedIn (status 'linkedin-gate') —
+  // one-way, like `stopped`. Durable, append-only read (see dashboard.py).
+  linkedin_gated: boolean;
   stopped: boolean;
   chip: StatusChip;
   date_local: string | null;

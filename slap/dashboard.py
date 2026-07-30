@@ -1045,6 +1045,18 @@ def _stopped_recipients(conn) -> set:
     return {r["recipient"] for r in conn.execute("SELECT DISTINCT recipient FROM events WHERE type = 'stopped'")}
 
 
+def _linkedin_gated_recipients(conn) -> set:
+    """Every recipient with at least one 'linkedin_gate' event, ever — the
+    append-only EVENT LOG as the source of truth for "was this recipient's
+    outreach halted because they replied on LinkedIn," exactly the same
+    durable pattern (and for the same reason) as _stopped_recipients() above:
+    `sync_reports()` can overwrite `recipients.status` away from 'linkedin-gate'
+    to 'bounced'/'replied' via a later GMass-polled event, so the chip and any
+    "is this row gated" gate must read the event's own existence, not the
+    mutable status column, to keep answering correctly afterward."""
+    return {r["recipient"] for r in conn.execute("SELECT DISTINCT recipient FROM events WHERE type = 'linkedin_gate'")}
+
+
 def _latest_reply_lifecycle_events(conn) -> dict:
     """Per recipient, the single most recent event among reply/ooo_tagged/
     reply_reviewed (raw `events` row, not yet reduced to a tag label) —
@@ -1168,6 +1180,47 @@ def mark_linkedin_replied(conn, recipient: str, replied: bool) -> None:
     ).fetchone()["campaign"]
     tracking.append_event(conn, type="interaction", recipient=recipient, campaign=campaign,
                           meta={"channel": "linkedin_reply", "state": bool(replied)})
+
+
+def gate_linkedin(conn, recipient: str, *, api_key: str = None, unsubscribe_fn=None) -> None:
+    """LinkedIn reply-gate: the owner marks this recipient as replied-on-LinkedIn,
+    which HALTS their GMass outreach and moves them to status 'linkedin-gate'.
+
+    Treated exactly like stop_outreach() — same real GMass suppression, same
+    ordering: call `unsubscribe_fn` (slap.gmass.unsubscribe_recipient) FIRST,
+    before any local write, and if it raises, raise too and record NOTHING
+    locally (a locally-gated recipient with GMass's native timer still live is
+    the exact "looks handled but isn't" failure stop_outreach() rejects). Unlike
+    plain mark_linkedin_replied() (which is pure bookkeeping and fires no GMass
+    call), gating IS delivery suppression — the owner has moved the conversation
+    to LinkedIn and doesn't want GMass's remaining cadence firing.
+
+    On success, appends TWO append-only events (same connection, atomic):
+      * `interaction` {channel: linkedin_reply, state: True} — so
+        linkedin_replied_state() reports them as LinkedIn-replied, keeping the
+        Campaigns "Replied on LinkedIn" card and the Reach-outs reply cell lit;
+      * `linkedin_gate` — whose _apply_event_to_cache branch flips
+        `recipients.status` to 'linkedin-gate', the same single-status-column
+        mechanism 'stopped'/'bounced' use to drop the recipient from every
+        active-only query (due_recipients/due_for_ooo_resend/followups_scheduled)
+        with zero query changes.
+
+    One-way, like Stop: GMass unsubscribe is account-wide with no clean
+    re-subscribe, so there is no un-gate. Idempotent — a no-op (no second GMass
+    call, no duplicate events) if the recipient is already gated. Fail loud on an
+    unknown recipient, same guard as mark_linkedin_replied()/stop_outreach()."""
+    if not _recipient_exists(conn, recipient):
+        raise ValueError(f"unknown recipient {recipient!r} — never staged/contacted")
+    if recipient in _linkedin_gated_recipients(conn):
+        return  # already gated — idempotent, don't re-hit GMass or double-log
+    (unsubscribe_fn or gmass.unsubscribe_recipient)(api_key, recipient)
+    campaign = conn.execute(
+        "SELECT campaign FROM recipients WHERE recipient = ?", (recipient,)
+    ).fetchone()["campaign"]
+    tracking.append_event(conn, type="interaction", recipient=recipient, campaign=campaign,
+                          meta={"channel": "linkedin_reply", "state": True})
+    tracking.append_event(conn, type="linkedin_gate", recipient=recipient, campaign=campaign,
+                          meta={"channel": "linkedin_reply"})
 
 
 def mark_followed_up(conn, recipient: str) -> None:
@@ -1406,7 +1459,7 @@ def _already_corrected_to(conn) -> dict:
 
 
 def _status_chip(*, status: str, engagement: str, reply_tag, bounce_category, bounce_reason,
-                  ooo_resume_date, num_clicks: int, stopped: bool = False) -> dict:
+                  ooo_resume_date, num_clicks: int, stopped: bool = False, gated: bool = False) -> dict:
     """One computed `{color, label}` per Reach-outs row — folds status,
     engagement, reply_tag, and bounce category/reason into a single display
     value (see the Reach-outs layout redesign) instead of several columns
@@ -1443,6 +1496,16 @@ def _status_chip(*, status: str, engagement: str, reply_tag, bounce_category, bo
     "Stopped" regardless."""
     if stopped:
         return {"color": "critical", "label": "Stopped"}
+
+    # LinkedIn reply-gate (see gate_linkedin): checked right after `stopped`
+    # and before bounced — like Stop, "this recipient's outreach was
+    # deliberately halted (pivoted to LinkedIn)" is the lead fact regardless
+    # of any prior/later engagement. A positive, handled state, so `good`
+    # (green), not `critical`. Same durable-boolean discipline as `stopped`:
+    # the caller passes _linkedin_gated_recipients()'s append-only answer,
+    # NOT `status == 'linkedin-gate'`, so a later bounce/reply can't un-mark it.
+    if gated:
+        return {"color": "good", "label": "LinkedIn"}
 
     if status == "bounced":
         label = "Blocked" if bounce_category == "block" else "Bounced"
@@ -1565,6 +1628,7 @@ def reachouts_rows(conn) -> list:
     """
     clicked = _clicked_recipients(conn)
     stopped_recipients = _stopped_recipients(conn)
+    gated_recipients = _linkedin_gated_recipients(conn)
     tags = reply_tags(conn)
     drop_meta = _recipient_drop_meta(conn)
     click_details = _click_details(conn)
@@ -1604,6 +1668,7 @@ def reachouts_rows(conn) -> list:
         row_date = row["first_sent_at"] or row["last_event_at"]
         clicks = click_details.get(recipient, [])
         is_stopped = recipient in stopped_recipients
+        is_gated = recipient in gated_recipients
 
         result.append({
             "recipient": recipient,
@@ -1634,11 +1699,17 @@ def reachouts_rows(conn) -> list:
             # chip precedence below and reachouts.html's "hide the Stop
             # outreach button once already stopped" gate.
             "stopped": is_stopped,
+            # linkedin_gated (LinkedIn reply-gate, see gate_linkedin): from
+            # _linkedin_gated_recipients()'s durable, append-only read — NOT
+            # `status == 'linkedin-gate'` — so a later bounce/reply can't
+            # silently un-mark this row. Drives the chip precedence below and
+            # the React table's "gate the 'in' button once gated" state.
+            "linkedin_gated": is_gated,
             "chip": _status_chip(status=status, engagement=engagement, reply_tag=tags.get(recipient),
                                   bounce_category=bounce_category, bounce_reason=bounce_reason,
                                   ooo_resume_date=ooo_resume_date,
                                   num_clicks=len(clicks) or (1 if engagement == "clicked" else 0),
-                                  stopped=is_stopped),
+                                  stopped=is_stopped, gated=is_gated),
             # Precomputed LOCAL calendar date (YYYY-MM-DD), reusing the same
             # _local_date() conversion todays_runs()/companies_contacted()
             # already use — so the client-side date-range filter (reachouts.

@@ -22,7 +22,8 @@ from slap.dashboard import (
     _click_details, _clicked_recipients, _recipient_drop_meta, active_leads, actionable_replies,
     bounce_breakdown, bounces, companies_contacted, compute_gmass_dependent_data, create_app,
     engagement_intelligence, event_display, filter_reachouts, follow_up_reminders,
-    get_gmass_dependent_data, needs_triage, next_drain, pipeline, reachouts_rows, read_log_tail,
+    gate_linkedin, get_gmass_dependent_data, needs_triage, next_drain, pipeline, reachouts_rows,
+    read_log_tail,
     recent_events, reply_tags, sent_reply_trend, stop_outreach, stopped_outreach_roster,
     sync_reports, tag_reply, template_failures, this_week, today_strip, todays_runs,
     visible_warm_but_silent, warm_but_silent, weekly_goal_progress,
@@ -1800,6 +1801,85 @@ def test_reachouts_rows_chip_stays_stopped_after_a_later_bounce_overwrites_statu
     reachout = next(r for r in rows if r["recipient"] == "a@x.com")
     assert reachout["stopped"] is True
     assert reachout["chip"] == {"color": "critical", "label": "Stopped"}
+
+
+# --- gate_linkedin: LinkedIn reply-gate (halts GMass, status linkedin-gate) ----
+
+def test_gate_linkedin_writes_events_and_sets_status(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    gate_linkedin(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    row = conn.execute("SELECT status FROM recipients WHERE recipient = ?", ("a@x.com",)).fetchone()
+    assert row["status"] == "linkedin-gate"
+    # Both events written: the interaction (keeps linkedin_replied True) and the gate.
+    assert conn.execute("SELECT COUNT(*) FROM events WHERE type = 'linkedin_gate'").fetchone()[0] == 1
+    inter = conn.execute(
+        "SELECT meta FROM events WHERE type = 'interaction' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert json.loads(inter["meta"]) == {"channel": "linkedin_reply", "state": True}
+
+
+def test_gate_linkedin_calls_unsubscribe_before_recording_anything(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+
+    def failing(api_key, email):
+        raise RuntimeError("simulated GMass failure")
+
+    with pytest.raises(RuntimeError, match="simulated GMass failure"):
+        gate_linkedin(conn, "a@x.com", api_key="k", unsubscribe_fn=failing)
+    assert conn.execute("SELECT * FROM events WHERE type = 'linkedin_gate'").fetchone() is None
+    row = conn.execute("SELECT status FROM recipients WHERE recipient = ?", ("a@x.com",)).fetchone()
+    assert row["status"] == "active"  # unchanged — nothing recorded
+
+
+def test_gate_linkedin_is_idempotent(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    calls = []
+
+    def counting(api_key, email):
+        calls.append(email)
+        return _fake_unsubscribe(api_key, email)
+
+    gate_linkedin(conn, "a@x.com", api_key="k", unsubscribe_fn=counting)
+    gate_linkedin(conn, "a@x.com", api_key="k", unsubscribe_fn=counting)  # already gated → no-op
+    assert calls == ["a@x.com"]  # GMass hit exactly once
+    assert conn.execute("SELECT COUNT(*) FROM events WHERE type = 'linkedin_gate'").fetchone()[0] == 1
+
+
+def test_gate_linkedin_unknown_recipient_fails_loud(conn):
+    with pytest.raises(ValueError, match="unknown recipient"):
+        gate_linkedin(conn, "ghost@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+
+
+def test_gate_linkedin_removes_recipient_from_due_recipients(conn):
+    from slap.queue import due_recipients
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter", send=False)
+    assert len(due_recipients(conn)) == 1
+    gate_linkedin(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    assert due_recipients(conn) == []
+
+
+def test_reachouts_rows_chip_linkedin_gate(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    gate_linkedin(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    row = next(r for r in reachouts_rows(conn) if r["recipient"] == "a@x.com")
+    assert row["chip"] == {"color": "good", "label": "LinkedIn"}
+    assert row["linkedin_gated"] is True
+    assert row["linkedin_replied"] is True
+    assert row["status"] == "linkedin-gate"
+
+
+def test_reachouts_rows_chip_stays_linkedin_gate_after_a_later_bounce(conn):
+    # Same durability as stopped: a later bounce flips recipients.status, but the
+    # gate chip reads the append-only linkedin_gate event, so it holds.
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    gate_linkedin(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    append_event(conn, type="bounce", recipient="a@x.com", campaign="c",
+                 meta={"bounce_reason": "mailbox full", "bounce_time": "t1", "category": "bounce"})
+    assert conn.execute("SELECT status FROM recipients WHERE recipient = ?",
+                        ("a@x.com",)).fetchone()["status"] == "bounced"
+    row = next(r for r in reachouts_rows(conn) if r["recipient"] == "a@x.com")
+    assert row["chip"]["label"] == "LinkedIn"
+    assert row["linkedin_gated"] is True
 
 
 # --- _recipient_drop_meta -----------------------------------------------------

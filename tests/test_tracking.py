@@ -698,3 +698,98 @@ def test_interaction_migration_is_idempotent(tmp_path):
 
     connect(path).close()
     connect(path).close()  # second connect on an already-migrated db must not raise
+
+
+# --- 'linkedin_gate' event type (LinkedIn reply-gate that halts GMass) --------
+
+def test_linkedin_gate_sets_status(conn):
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter"})
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=0, gmass_campaign_id="1")
+    assert recipient_row(conn, "a@x.com")["status"] == "active"
+    append_event(conn, type="linkedin_gate", recipient="a@x.com", campaign="c",
+                 meta={"channel": "linkedin_reply"})
+    # Flipping status to a non-active value is what drops the recipient from
+    # every active-only query (due_recipients/due_for_ooo_resend/followups).
+    assert recipient_row(conn, "a@x.com")["status"] == "linkedin-gate"
+
+
+def test_rebuild_reproduces_cache_identically_with_linkedin_gate(conn):
+    # Rebuild-equivalence (§5) must hold for the new event type too.
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter", "cadence": [2, 4]})
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=0,
+                 gmass_campaign_id="123", timestamp=_ts(1))
+    append_event(conn, type="interaction", recipient="a@x.com", campaign="c",
+                 meta={"channel": "linkedin_reply", "state": True}, timestamp=_ts(2))
+    append_event(conn, type="linkedin_gate", recipient="a@x.com", campaign="c",
+                 meta={"channel": "linkedin_reply"}, timestamp=_ts(3))
+    live = all_recipients(conn)
+
+    rebuild(conn)
+    assert all_recipients(conn) == live
+
+
+# --- 'linkedin_gate' migration for a db already carrying 'interaction' --------
+
+def _pre_linkedin_gate_events_table_sql():
+    # The events table's CREATE statement as it looked AFTER the 'interaction'
+    # migration but BEFORE 'linkedin_gate' — a real owner's slap.db already
+    # through every earlier migration.
+    return """
+    CREATE TABLE events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        recipient TEXT,
+        campaign TEXT,
+        type TEXT NOT NULL CHECK (type IN (
+            'queued','draft_created','sent','click','reply','bounce','ooo_tagged','requeued',
+            'reply_reviewed','run_started','run_completed','send_failed','run_failed','stopped',
+            'interaction'
+        )),
+        stage INTEGER,
+        gmass_campaign_id TEXT,
+        gmass_draft_id TEXT,
+        meta TEXT
+    );
+    """
+
+
+def test_connect_migrates_a_db_that_has_interaction_but_not_linkedin_gate(tmp_path):
+    path = tmp_path / "post_interaction.db"
+    raw = sqlite3.connect(path)
+    raw.executescript(_pre_linkedin_gate_events_table_sql())
+    # An 'interaction' row proves this is the post-interaction schema and must
+    # survive the linkedin_gate migration untouched.
+    raw.execute(
+        "INSERT INTO events (timestamp, recipient, campaign, type) VALUES (?, ?, ?, ?)",
+        ("2026-01-01T00:00:00+00:00", "a@x.com", "c", "interaction"),
+    )
+    # A raw insert of 'linkedin_gate' is rejected — confirms the fixture lacks it.
+    with pytest.raises(sqlite3.IntegrityError):
+        raw.execute(
+            "INSERT INTO events (timestamp, recipient, campaign, type) VALUES (?, ?, ?, ?)",
+            ("2026-01-01T00:00:00+00:00", "a@x.com", "c", "linkedin_gate"),
+        )
+    raw.commit()
+    raw.close()
+
+    migrated = connect(path)
+    rows = all_events(migrated)
+    assert len(rows) == 1 and rows[0]["type"] == "interaction"
+
+    # 'linkedin_gate' now works after the migration.
+    append_event(migrated, type="linkedin_gate", recipient="a@x.com", campaign="c",
+                 meta={"channel": "linkedin_reply"})
+    assert any(r["type"] == "linkedin_gate" for r in all_events(migrated))
+
+
+def test_linkedin_gate_migration_is_idempotent(tmp_path):
+    path = tmp_path / "post_interaction.db"
+    raw = sqlite3.connect(path)
+    raw.executescript(_pre_linkedin_gate_events_table_sql())
+    raw.commit()
+    raw.close()
+
+    connect(path).close()
+    connect(path).close()  # second connect on an already-migrated db must not raise

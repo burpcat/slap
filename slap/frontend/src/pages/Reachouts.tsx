@@ -191,6 +191,26 @@ function RowActions({ row, colors }: { row: ReachoutRow; colors: Record<string, 
       <td className={styles.dateCell}>{shortDate(row.date_local)}</td>
       <td>
         <div className={styles.actionsCell}>
+          {/* Conditional recovery/halt actions come FIRST in the stack so the
+              always-present triage buttons below stay pinned to the right edge:
+              the cell is right-aligned, so a row that loses its Stop button no
+              longer shifts Real/Not/OOO/in out of column alignment (Image #20). */}
+          {!row.stopped && row.status === 'active' && (
+            <ConfirmPopover
+              message={`Stop all further outreach to ${row.recipient}?`}
+              confirmLabel="Stop"
+              pending={stop.isPending}
+              onConfirm={() => stop.mutate()}
+              trigger={<button className={styles.actBtn}>Stop</button>}
+            />
+          )}
+          {row.status === 'bounced' && (
+            <ResendPopover
+              pending={resend.isPending}
+              onConfirm={(corrected_email) => resend.mutate({ corrected_email })}
+              trigger={<button className={styles.actBtn}>Resend</button>}
+            />
+          )}
           {/* Inline triage. Each button is neutral until it's the current tag,
               then it lights up in its own color (Image #13): Real=green,
               Not=red, OOO=orange. */}
@@ -217,30 +237,32 @@ function RowActions({ row, colors }: { row: ReachoutRow; colors: Record<string, 
               </button>
             }
           />
-          <button
-            className={`${styles.linkedin} ${row.linkedin_replied ? styles.linkedinActive : ''}`}
-            title={row.linkedin_replied ? 'LinkedIn: replied (click to unmark)' : 'Mark replied on LinkedIn'}
-            onClick={() => linkedin.mutate({ replied: !row.linkedin_replied })}
-            disabled={linkedin.isPending}
-          >
-            in
-          </button>
-          {/* Conditional recovery/halt actions — only where they apply, no
-              overflow menu (Image #12). */}
-          {row.status === 'bounced' && (
-            <ResendPopover
-              pending={resend.isPending}
-              onConfirm={(corrected_email) => resend.mutate({ corrected_email })}
-              trigger={<button className={styles.actBtn}>Resend</button>}
-            />
-          )}
-          {!row.stopped && row.status === 'active' && (
+          {/* LinkedIn "in" is now a ONE-WAY gate (like Stop): marking replied-on-
+              LinkedIn halts GMass outreach (status linkedin-gate), so it confirms
+              first. Once gated it's a lit, disabled marker — no un-gate. */}
+          {row.linkedin_gated ? (
+            <button
+              className={`${styles.linkedin} ${styles.linkedinActive}`}
+              title="LinkedIn-gated — GMass outreach halted"
+              disabled
+            >
+              in
+            </button>
+          ) : (
             <ConfirmPopover
-              message={`Stop all further outreach to ${row.recipient}?`}
-              confirmLabel="Stop"
-              pending={stop.isPending}
-              onConfirm={() => stop.mutate()}
-              trigger={<button className={styles.actBtn}>Stop</button>}
+              message={`Mark ${row.recipient} replied on LinkedIn and stop GMass outreach?`}
+              confirmLabel="Mark & stop"
+              pending={linkedin.isPending}
+              onConfirm={() => linkedin.mutate({ replied: true })}
+              trigger={
+                <button
+                  className={`${styles.linkedin} ${row.linkedin_replied ? styles.linkedinActive : ''}`}
+                  title="Mark replied on LinkedIn (halts GMass outreach)"
+                  disabled={linkedin.isPending}
+                >
+                  in
+                </button>
+              }
             />
           )}
         </div>

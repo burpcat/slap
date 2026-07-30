@@ -138,7 +138,7 @@ DB_PATH = Path("slap.db")
 EVENT_TYPES = {
     "queued", "draft_created", "sent", "click", "reply", "bounce", "ooo_tagged",
     "requeued", "reply_reviewed", "run_started", "run_completed", "send_failed", "run_failed",
-    "stopped", "interaction",
+    "stopped", "interaction", "linkedin_gate",
 }
 # Event types describing a runner/drain's own lifecycle, not a specific
 # recipient — appended to the log but never applied to the recipients cache.
@@ -158,7 +158,7 @@ CREATE TABLE IF NOT EXISTS events (
     type TEXT NOT NULL CHECK (type IN (
         'queued','draft_created','sent','click','reply','bounce','ooo_tagged','requeued',
         'reply_reviewed','run_started','run_completed','send_failed','run_failed','stopped',
-        'interaction'
+        'interaction','linkedin_gate'
     )),
     stage INTEGER,
     gmass_campaign_id TEXT,
@@ -200,10 +200,10 @@ class TrackingError(Exception):
 def _migrate_events_check_constraint(conn: sqlite3.Connection) -> None:
     """One-time additive migration for the CHECK-constraint literals `events.type`
     accepts. Originally added for the `stopped` event type (Stop outreach); the
-    guard literal is now `'interaction'` (the newest CHECK value — the per-reachout
-    interaction log: LinkedIn-replied, followed-up, remind markers), so a db still
-    on the pre-`interaction` constraint — INCLUDING one already migrated for
-    `stopped` — is rebuilt to the current shape. The rebuild is generic (every row
+    guard literal is now `'linkedin_gate'` (the newest CHECK value — the LinkedIn
+    reply-gate that halts GMass outreach), so a db still on any older constraint —
+    INCLUDING one already migrated for `stopped` or `interaction` — is rebuilt to
+    the current shape. The rebuild is generic (every row
     copied verbatim against `_EVENTS_TABLE_SQL`), so bumping the literal is all a
     new additive type needs here. See this module's own docstring for why these
     types genuinely need a new CHECK-constraint literal instead of reusing an
@@ -266,7 +266,7 @@ def _migrate_events_check_constraint(conn: sqlite3.Connection) -> None:
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'"
     ).fetchone()
-    if row is None or row[0] is None or "'interaction'" in row[0]:
+    if row is None or row[0] is None or "'linkedin_gate'" in row[0]:
         return  # fresh db (nothing to migrate yet) or already migrated
     conn.execute("BEGIN")
     try:
@@ -509,3 +509,13 @@ def _apply_event_to_cache(conn: sqlite3.Connection, event: dict) -> None:
         # followups_scheduled) with no changes needed to any of them, the
         # same single-status-column mechanism 'bounced'/'done' already use.
         _upsert_recipient(conn, recipient, campaign=campaign, status="stopped", last_event_at=ts)
+    elif etype == "linkedin_gate":
+        # The owner marked this recipient as replied-on-LinkedIn, which HALTS
+        # their GMass outreach (a GMass unsubscribe fired before this event was
+        # ever appended — see dashboard.gate_linkedin). Like `stopped`, flipping
+        # status here to a non-active value is the whole mechanism that removes
+        # them from every active-only query (due_recipients/due_for_ooo_resend/
+        # pipeline followups_scheduled) — no query changes needed. Distinct
+        # status value ('linkedin-gate') so the dashboard can show WHY outreach
+        # stopped (pivoted to LinkedIn) versus a plain manual Stop.
+        _upsert_recipient(conn, recipient, campaign=campaign, status="linkedin-gate", last_event_at=ts)

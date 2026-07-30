@@ -537,21 +537,52 @@ def test_api_survives_real_concurrent_request_threads(tmp_path, monkeypatch):
 
 # --- interaction endpoints: LinkedIn-replied + followed-up ------------------
 
-def test_api_linkedin_replied_marks_and_reflects_in_reachouts(app, tmp_path):
+def test_api_linkedin_replied_gates_outreach_and_reflects_in_reachouts(app, tmp_path):
     conn = connect(tmp_path / "test.db")
     seed_sent_recipient(conn, recipient="a@x.com", campaign="c")
     conn.close()
     client = app.test_client()
 
-    resp = client.post("/api/reachouts/a@x.com/linkedin-replied", json={"replied": True})
+    # Marking LinkedIn-replied now HALTS GMass outreach (a real unsubscribe),
+    # so the endpoint fires gmass.unsubscribe_recipient and returns the new
+    # gated status.
+    with patch("slap.dashboard.gmass.unsubscribe_recipient", return_value={}) as unsub:
+        resp = client.post("/api/reachouts/a@x.com/linkedin-replied", json={"replied": True})
     assert resp.status_code == 200
-    assert resp.get_json() == {"ok": True, "linkedin_replied": True}
+    assert resp.get_json() == {"ok": True, "status": "linkedin-gate"}
+    assert unsub.call_count == 1
 
-    rows = client.get("/api/reachouts").get_json()["rows"]
-    assert next(r for r in rows if r["recipient"] == "a@x.com")["linkedin_replied"] is True
+    row = next(r for r in client.get("/api/reachouts").get_json()["rows"] if r["recipient"] == "a@x.com")
+    assert row["linkedin_replied"] is True   # still lights the reply cell / Campaigns card
+    assert row["linkedin_gated"] is True
+    assert row["status"] == "linkedin-gate"
+    assert row["chip"]["label"] == "LinkedIn"
+
+
+def test_api_linkedin_replied_failure_returns_502(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    seed_sent_recipient(conn, recipient="a@x.com", campaign="c")
+    conn.close()
+
+    with patch("slap.dashboard.gmass.unsubscribe_recipient", side_effect=RuntimeError("boom")):
+        resp = app.test_client().post("/api/reachouts/a@x.com/linkedin-replied", json={"replied": True})
+    assert resp.status_code == 502
+    assert "nothing was recorded" in resp.get_json()["error"]
+
+
+def test_api_linkedin_replied_ungate_not_supported_400(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    seed_sent_recipient(conn, recipient="a@x.com", campaign="c")
+    conn.close()
+    # One-way, like Stop: an explicit un-gate fails loud and never hits GMass.
+    with patch("slap.dashboard.gmass.unsubscribe_recipient") as unsub:
+        resp = app.test_client().post("/api/reachouts/a@x.com/linkedin-replied", json={"replied": False})
+    assert resp.status_code == 400
+    assert unsub.call_count == 0
 
 
 def test_api_linkedin_replied_unknown_recipient_404(app):
+    # Unknown recipient fails loud before any GMass call (guard is first).
     resp = app.test_client().post("/api/reachouts/ghost@x.com/linkedin-replied", json={"replied": True})
     assert resp.status_code == 404
 

@@ -567,17 +567,29 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, api
 
     @app.route("/api/reachouts/<string:recipient>/linkedin-replied", methods=["POST"])
     def api_linkedin_replied(recipient):
-        # Toggle the LinkedIn-replied flag (req 8.3). Body {replied: bool},
-        # defaulting to True (the common "mark it" action). Append-only via an
-        # interaction event; no GMass call (pipeline bookkeeping, not
-        # suppression). Unknown recipient -> 404, same as any missing resource.
+        # LinkedIn reply-gate (see dashboard.gate_linkedin): marking a recipient
+        # replied-on-LinkedIn now HALTS their GMass outreach (status
+        # 'linkedin-gate'), so this fires a real GMass unsubscribe first and
+        # carries the same 502-on-failure, nothing-recorded contract as /stop.
+        # One-way, like Stop: un-gating isn't supported (GMass unsubscribe is
+        # account-wide, with no clean re-subscribe), so an explicit
+        # {replied: false} fails loud rather than silently doing nothing.
+        # Unknown recipient -> 404, same as any missing resource.
         body = request.get_json(silent=True) or {}
-        replied = bool(body.get("replied", True))
+        if body.get("replied") is False:
+            return jsonify({
+                "error": "un-gating a LinkedIn-gated recipient is not supported (one-way, like Stop)"
+            }), 400
         try:
-            dashboard.mark_linkedin_replied(get_conn(), recipient, replied)
+            dashboard.gate_linkedin(get_conn(), recipient, api_key=api_key)
         except ValueError as e:
             return jsonify({"error": str(e)}), 404
-        return jsonify({"ok": True, "linkedin_replied": replied})
+        except Exception as e:
+            return jsonify({
+                "error": f"could not gate {recipient} via LinkedIn — GMass suppression call failed, "
+                         f"nothing was recorded: {e}"
+            }), 502
+        return jsonify({"ok": True, "status": "linkedin-gate"})
 
     @app.route("/api/reachouts/<string:recipient>/followed-up", methods=["POST"])
     def api_followed_up(recipient):
