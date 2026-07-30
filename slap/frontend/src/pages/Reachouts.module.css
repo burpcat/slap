@@ -20,6 +20,49 @@
   color: var(--text-muted);
 }
 
+.clear {
+  all: unset;
+  cursor: pointer;
+  font-size: 0.8rem;
+  color: var(--series-1);
+  padding: 4px 8px;
+  border-radius: 6px;
+}
+.clear:hover { text-decoration: underline; }
+
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  align-items: flex-end;
+  margin-bottom: 16px;
+}
+
+.filterGroup {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.filterLabel {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.select,
+.date {
+  font-size: 0.85rem;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-1);
+  color: var(--text-primary);
+  min-width: 130px;
+}
+.date { min-width: 140px; }
+
 .tableWrap {
   background: var(--surface-1);
   border: 1px solid var(--border);
