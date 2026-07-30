@@ -16,12 +16,99 @@ import styles from './Reachouts.module.css';
 type SortKey = 'recipient' | 'campaign' | 'persona' | 'status' | 'date_local';
 type SortDir = 'asc' | 'desc';
 
+// Client-side filter state, mirroring the backend's filter_reachouts()
+// dimensions (slap/dashboard.py). Empty string / 'all' means "no constraint on
+// this dimension", never "match nothing" — same semantics as filter_reachouts.
+// Filtering is deliberately zero-network (all rows are already loaded), the
+// same hard requirement the old Jinja page had.
+interface Filters {
+  campaign: string;
+  persona: string;
+  status: string;
+  engagement: string;
+  reply_tag: string;
+  domain: string;
+  reqId: 'all' | 'yes' | 'no';
+  dateStart: string;
+  dateEnd: string;
+}
+
+const EMPTY_FILTERS: Filters = {
+  campaign: '',
+  persona: '',
+  status: '',
+  engagement: '',
+  reply_tag: '',
+  domain: '',
+  reqId: 'all',
+  dateStart: '',
+  dateEnd: '',
+};
+
+function distinct(rows: ReachoutRow[], key: keyof ReachoutRow): string[] {
+  const seen = new Set<string>();
+  for (const r of rows) {
+    const v = r[key];
+    if (typeof v === 'string' && v) seen.add(v);
+  }
+  return [...seen].sort();
+}
+
 function matchesSearch(row: ReachoutRow, needle: string): boolean {
   if (!needle) return true;
   const haystack = [row.recipient, row.company, row.name, row.domain, row.campaign, row.persona]
     .join(' ')
     .toLowerCase();
   return haystack.includes(needle);
+}
+
+function matchesFilters(row: ReachoutRow, f: Filters): boolean {
+  if (f.campaign && row.campaign !== f.campaign) return false;
+  if (f.persona && row.persona !== f.persona) return false;
+  if (f.status && row.status !== f.status) return false;
+  if (f.engagement && row.engagement !== f.engagement) return false;
+  if (f.reply_tag && row.reply_tag !== f.reply_tag) return false;
+  if (f.domain && row.domain !== f.domain) return false;
+  if (f.reqId === 'yes' && !row.req_id_present) return false;
+  if (f.reqId === 'no' && row.req_id_present) return false;
+  // ISO YYYY-MM-DD compares correctly lexicographically (same format
+  // date_local uses and <input type=date> produces) — no date parsing needed.
+  if (f.dateStart && !(row.date_local && row.date_local >= f.dateStart)) return false;
+  if (f.dateEnd && !(row.date_local && row.date_local <= f.dateEnd)) return false;
+  return true;
+}
+
+function anyFilterActive(f: Filters): boolean {
+  return (
+    !!f.campaign || !!f.persona || !!f.status || !!f.engagement || !!f.reply_tag ||
+    !!f.domain || f.reqId !== 'all' || !!f.dateStart || !!f.dateEnd
+  );
+}
+
+function FilterSelect({
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  options: string[];
+  onChange: (v: string) => void;
+}) {
+  return (
+    <label className={styles.filterGroup}>
+      <span className={styles.filterLabel}>{label}</span>
+      <select className={styles.select} value={value} onChange={(e) => onChange(e.target.value)}>
+        <option value="">All</option>
+        {options.map((o) => (
+          <option key={o} value={o}>
+            {o}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
 }
 
 function RowActions({ row, colors }: { row: ReachoutRow; colors: Record<string, CampaignColor> }) {
@@ -83,13 +170,26 @@ function RowActions({ row, colors }: { row: ReachoutRow; colors: Record<string, 
 export default function Reachouts() {
   const { data, isLoading, error } = useReachouts();
   const [search, setSearch] = useState('');
+  const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
   const [sortKey, setSortKey] = useState<SortKey>('date_local');
   const [sortDir, setSortDir] = useState<SortDir>('desc');
+
+  const options = useMemo(() => {
+    const rows = data?.rows ?? [];
+    return {
+      campaign: distinct(rows, 'campaign'),
+      persona: distinct(rows, 'persona'),
+      status: distinct(rows, 'status'),
+      engagement: distinct(rows, 'engagement'),
+      reply_tag: distinct(rows, 'reply_tag'),
+      domain: distinct(rows, 'domain'),
+    };
+  }, [data]);
 
   const filteredSorted = useMemo(() => {
     if (!data) return [];
     const needle = search.trim().toLowerCase();
-    const filtered = data.rows.filter((r) => matchesSearch(r, needle));
+    const filtered = data.rows.filter((r) => matchesSearch(r, needle) && matchesFilters(r, filters));
     const dir = sortDir === 'asc' ? 1 : -1;
     return [...filtered].sort((a, b) => {
       const av = (a[sortKey] ?? '') as string;
@@ -98,7 +198,7 @@ export default function Reachouts() {
       if (av > bv) return 1 * dir;
       return 0;
     });
-  }, [data, search, sortKey, sortDir]);
+  }, [data, search, filters, sortKey, sortDir]);
 
   if (isLoading) return <p>Loading…</p>;
   if (error || !data) return <p>Could not load reach-outs.</p>;
@@ -111,6 +211,13 @@ export default function Reachouts() {
       setSortDir('asc');
     }
   };
+
+  const set = (patch: Partial<Filters>) => setFilters((f) => ({ ...f, ...patch }));
+  const clearAll = () => {
+    setFilters(EMPTY_FILTERS);
+    setSearch('');
+  };
+  const filtersOn = anyFilterActive(filters) || !!search.trim();
 
   const columns: { key: SortKey; label: string }[] = [
     { key: 'recipient', label: 'Recipient' },
@@ -134,7 +241,47 @@ export default function Reachouts() {
         <span className={styles.count}>
           {filteredSorted.length} of {data.total_count}
         </span>
+        {filtersOn && (
+          <button className={styles.clear} onClick={clearAll}>
+            Clear filters
+          </button>
+        )}
       </div>
+
+      <div className={styles.filters}>
+        <FilterSelect label="Campaign" value={filters.campaign} options={options.campaign}
+          onChange={(v) => set({ campaign: v })} />
+        <FilterSelect label="Persona" value={filters.persona} options={options.persona}
+          onChange={(v) => set({ persona: v })} />
+        <FilterSelect label="Status" value={filters.status} options={options.status}
+          onChange={(v) => set({ status: v })} />
+        <FilterSelect label="Engagement" value={filters.engagement} options={options.engagement}
+          onChange={(v) => set({ engagement: v })} />
+        <FilterSelect label="Reply tag" value={filters.reply_tag} options={options.reply_tag}
+          onChange={(v) => set({ reply_tag: v })} />
+        <FilterSelect label="Domain" value={filters.domain} options={options.domain}
+          onChange={(v) => set({ domain: v })} />
+        <label className={styles.filterGroup}>
+          <span className={styles.filterLabel}>Req ID</span>
+          <select className={styles.select} value={filters.reqId}
+            onChange={(e) => set({ reqId: e.target.value as Filters['reqId'] })}>
+            <option value="all">All</option>
+            <option value="yes">Has req ID</option>
+            <option value="no">No req ID</option>
+          </select>
+        </label>
+        <label className={styles.filterGroup}>
+          <span className={styles.filterLabel}>From</span>
+          <input type="date" className={styles.date} value={filters.dateStart}
+            onChange={(e) => set({ dateStart: e.target.value })} />
+        </label>
+        <label className={styles.filterGroup}>
+          <span className={styles.filterLabel}>To</span>
+          <input type="date" className={styles.date} value={filters.dateEnd}
+            onChange={(e) => set({ dateEnd: e.target.value })} />
+        </label>
+      </div>
+
       <div className={styles.tableWrap}>
         <table className={styles.table}>
           <thead>
@@ -153,7 +300,7 @@ export default function Reachouts() {
             {filteredSorted.length === 0 ? (
               <tr>
                 <td colSpan={columns.length + 2} className={styles.empty}>
-                  No reach-outs match this search.
+                  No reach-outs match these filters.
                 </td>
               </tr>
             ) : (
