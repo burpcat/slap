@@ -40,11 +40,6 @@
   text-align: right;
   white-space: nowrap;
 }
-.leadStatusMain {
-  font-size: 0.82rem;
-  color: var(--text-secondary);
-  font-variant-numeric: tabular-nums;
-}
 .leadStatusSub {
   font-size: 0.74rem;
   color: var(--text-muted);
