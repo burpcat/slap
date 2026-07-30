@@ -30,10 +30,12 @@ export default function Commands() {
             <p className={styles.name}>{cmd.name}</p>
             {cmd.help && <p className={styles.help}>{cmd.help}</p>}
             <pre className={styles.usage}>{cmd.usage}</pre>
-            {cmd.examples.length > 0 && (
+            {/* Defensive: tolerate an older API payload that predates `examples`
+                (e.g. a not-yet-restarted server) rather than throwing. */}
+            {(cmd.examples ?? []).length > 0 && (
               <div className={styles.examples}>
                 <span className={styles.examplesLabel}>Examples</span>
-                {cmd.examples.map((ex) => (
+                {(cmd.examples ?? []).map((ex) => (
                   <code key={ex} className={styles.example}>
                     {ex}
                   </code>
