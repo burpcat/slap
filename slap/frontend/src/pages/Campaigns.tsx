@@ -1,10 +1,37 @@
 import { useState } from 'react';
-import { useCampaigns, useCampaignSlice, usePipeline, useReachouts } from '../api/hooks';
+import { useCampaigns, useCampaignSlice, useFollowedUp, usePipeline, useReachouts } from '../api/hooks';
+import type { FollowUpReminder } from '../api/types';
 import { Card, CardGrid } from '../components/primitives/Card';
 import { StatRow, StatTile } from '../components/primitives/StatTile';
 import { CampaignDot } from '../components/primitives/Chip';
 import { shortDate } from '../utils/format';
 import styles from './Campaigns.module.css';
+
+// One "aging" row in the Days-since-last-follow-up card. Carries its own
+// "Followed up" action (same useFollowedUp mutation as Home's reminder rows —
+// so a follow-up logged here resets days_since everywhere, atomically) and a
+// LinkedIn marker when this lead has replied on LinkedIn.
+function AgingRow({ lead, linkedin }: { lead: FollowUpReminder; linkedin: boolean }) {
+  const followedUp = useFollowedUp(lead.recipient);
+  return (
+    <div className={styles.agingRow}>
+      <span className={styles.agingWho}>
+        {lead.recipient} {lead.company && `· ${lead.company}`}
+        {linkedin && <span className={styles.inTag} title="Replied on LinkedIn">in</span>}
+      </span>
+      <span className={styles.agingRight}>
+        <span className={styles.agingDays}>{lead.days_since}d</span>
+        <button
+          className={styles.followedUpBtn}
+          disabled={followedUp.isPending}
+          onClick={() => followedUp.mutate()}
+        >
+          Followed up
+        </button>
+      </span>
+    </div>
+  );
+}
 
 export default function Campaigns() {
   const { data, isLoading, error } = useCampaigns();
@@ -30,6 +57,8 @@ export default function Campaigns() {
   // Reach-outs in this campaign who have replied on LinkedIn (the OR-with-email
   // channel — surfaced here so a campaign's LinkedIn traction is visible).
   const linkedinReplied = (reachouts?.rows ?? []).filter((r) => r.linkedin_replied && inCampaign(r));
+  // Fast membership test to flag LinkedIn replies inside the aging card.
+  const linkedinSet = new Set(linkedinReplied.map((r) => r.recipient));
 
   // The same follow-up roster, re-ordered MOST OVERDUE first — a focused
   // "who's aging without a personal follow-up" view (days_since is derived from
@@ -129,17 +158,12 @@ export default function Campaigns() {
           )}
         </Card>
 
-        <Card title="Days since last follow-up">
+        <Card title="Days since last follow-up" full>
           {followUpAging.length === 0 ? (
             <p className={styles.empty}>No active leads to follow up{selected ? ` in ${selected}` : ''}.</p>
           ) : (
             followUpAging.map((l) => (
-              <div key={l.recipient} className={styles.agingRow}>
-                <span className={styles.agingWho}>
-                  {l.recipient} {l.company && `· ${l.company}`}
-                </span>
-                <span className={styles.agingDays}>{l.days_since}d</span>
-              </div>
+              <AgingRow key={l.recipient} lead={l} linkedin={linkedinSet.has(l.recipient)} />
             ))
           )}
         </Card>
