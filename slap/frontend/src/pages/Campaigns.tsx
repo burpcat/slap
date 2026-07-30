@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useCampaigns, useCampaignSlice, usePipeline } from '../api/hooks';
+import { useCampaigns, useCampaignSlice, usePipeline, useReachouts } from '../api/hooks';
 import { Card, CardGrid } from '../components/primitives/Card';
 import { StatRow, StatTile } from '../components/primitives/StatTile';
 import { CampaignDot } from '../components/primitives/Chip';
@@ -9,20 +9,35 @@ import styles from './Campaigns.module.css';
 export default function Campaigns() {
   const { data, isLoading, error } = useCampaigns();
   const { data: pipeline } = usePipeline();
+  const { data: reachouts } = useReachouts();
   const [selected, setSelected] = useState<string | null>(null);
   const { data: slice } = useCampaignSlice(selected);
 
   if (isLoading) return <p>Loading…</p>;
   if (error || !data) return <p>Could not load campaigns.</p>;
 
+  const inCampaign = <T extends { campaign: string }>(x: T) => !selected || x.campaign === selected;
+
   // Driven by follow_up_reminders (same real-tagged roster as active_leads,
   // but carrying the derived follow-up status: days_since + next_follow_up_date)
   // so each lead can show "how long since the last follow-up" and the next-nudge
   // date (req 4). Sorted most-recently-marked-real first — a "who's live" roster.
   const activeLeads = (pipeline?.follow_up_reminders ?? [])
-    .filter((l) => !selected || l.campaign === selected)
+    .filter(inCampaign)
     .slice()
     .sort((a, b) => (a.real_tagged_at < b.real_tagged_at ? 1 : -1));
+
+  // Reach-outs in this campaign who have replied on LinkedIn (the OR-with-email
+  // channel — surfaced here so a campaign's LinkedIn traction is visible).
+  const linkedinReplied = (reachouts?.rows ?? []).filter((r) => r.linkedin_replied && inCampaign(r));
+
+  // The same follow-up roster, re-ordered MOST OVERDUE first — a focused
+  // "who's aging without a personal follow-up" view (days_since is derived from
+  // the last touch, so it resets when "Followed up" is clicked).
+  const followUpAging = (pipeline?.follow_up_reminders ?? [])
+    .filter(inCampaign)
+    .slice()
+    .sort((a, b) => b.days_since - a.days_since);
 
   const totals = data.campaigns.reduce(
     (acc, c) => ({
@@ -66,6 +81,7 @@ export default function Campaigns() {
               <StatTile value={display.reply_count} label="replies" />
               <StatTile value={display.click_count} label="clicks" />
               <StatTile value={display.active_lead_count} label="active leads" />
+              <StatTile value={linkedinReplied.length} label="linkedin replies" />
             </StatRow>
           ) : (
             <p className={styles.empty}>Loading slice…</p>
@@ -90,6 +106,39 @@ export default function Campaigns() {
                     {lead.campaign} · marked real {shortDate(lead.real_tagged_at)}
                   </span>
                 </span>
+              </div>
+            ))
+          )}
+        </Card>
+
+        <Card title="Replied on LinkedIn" full>
+          {linkedinReplied.length === 0 ? (
+            <p className={styles.empty}>No LinkedIn replies yet{selected ? ` in ${selected}` : ''}.</p>
+          ) : (
+            linkedinReplied.map((r) => (
+              <div key={r.recipient} className={styles.leadRow}>
+                <span>
+                  {r.recipient} {r.company && `· ${r.company}`} {r.name && `(${r.name})`}
+                </span>
+                <span className={styles.leadStatusSub}>
+                  {r.campaign}
+                  {r.reply_tag && ` · ${r.reply_tag.replace('_', ' ')}`}
+                </span>
+              </div>
+            ))
+          )}
+        </Card>
+
+        <Card title="Days since last follow-up">
+          {followUpAging.length === 0 ? (
+            <p className={styles.empty}>No active leads to follow up{selected ? ` in ${selected}` : ''}.</p>
+          ) : (
+            followUpAging.map((l) => (
+              <div key={l.recipient} className={styles.agingRow}>
+                <span className={styles.agingWho}>
+                  {l.recipient} {l.company && `· ${l.company}`}
+                </span>
+                <span className={styles.agingDays}>{l.days_since}d</span>
               </div>
             ))
           )}
