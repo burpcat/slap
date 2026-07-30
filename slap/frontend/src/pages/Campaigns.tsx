@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useCampaigns, useCampaignSlice, useFollowedUp, usePipeline, useReachouts } from '../api/hooks';
-import type { FollowUpReminder } from '../api/types';
+import type { FollowUpAgingRow } from '../api/types';
 import { Card, CardGrid } from '../components/primitives/Card';
 import { StatRow, StatTile } from '../components/primitives/StatTile';
 import { CampaignDot } from '../components/primitives/Chip';
@@ -9,18 +9,20 @@ import styles from './Campaigns.module.css';
 
 // One "aging" row in the Days-since-last-follow-up card. Carries its own
 // "Followed up" action (same useFollowedUp mutation as Home's reminder rows —
-// so a follow-up logged here resets days_since everywhere, atomically) and a
-// LinkedIn marker when this lead has replied on LinkedIn.
-function AgingRow({ lead, linkedin }: { lead: FollowUpReminder; linkedin: boolean }) {
+// so a follow-up logged here resets days_since and pushes next_follow_up_date
+// forward everywhere, atomically) and a LinkedIn marker for LinkedIn leads.
+function AgingRow({ lead }: { lead: FollowUpAgingRow }) {
   const followedUp = useFollowedUp(lead.recipient);
   return (
     <div className={styles.agingRow}>
       <span className={styles.agingWho}>
         {lead.recipient} {lead.company && `· ${lead.company}`}
-        {linkedin && <span className={styles.inTag} title="Replied on LinkedIn">in</span>}
+        {lead.linkedin && <span className={styles.inTag} title="Replied on LinkedIn">in</span>}
       </span>
       <span className={styles.agingRight}>
-        <span className={styles.agingDays}>{lead.days_since}d</span>
+        <span className={styles.agingDays}>
+          {lead.days_since}d · next nudge {shortDate(lead.next_follow_up_date)}
+        </span>
         <button
           className={styles.followedUpBtn}
           disabled={followedUp.isPending}
@@ -45,11 +47,10 @@ export default function Campaigns() {
 
   const inCampaign = <T extends { campaign: string }>(x: T) => !selected || x.campaign === selected;
 
-  // Driven by follow_up_reminders (same real-tagged roster as active_leads,
-  // but carrying the derived follow-up status: days_since + next_follow_up_date)
-  // so each lead can show "how long since the last follow-up" and the next-nudge
-  // date (req 4). Sorted most-recently-marked-real first — a "who's live" roster.
-  const activeLeads = (pipeline?.follow_up_reminders ?? [])
+  // The plain "who's a live real lead" roster — just campaign + marked-real
+  // date (the follow-up timing lives in the aging card below, not here).
+  // Sorted most-recently-marked-real first.
+  const activeLeads = (pipeline?.active_leads ?? [])
     .filter(inCampaign)
     .slice()
     .sort((a, b) => (a.real_tagged_at < b.real_tagged_at ? 1 : -1));
@@ -57,13 +58,13 @@ export default function Campaigns() {
   // Reach-outs in this campaign who have replied on LinkedIn (the OR-with-email
   // channel — surfaced here so a campaign's LinkedIn traction is visible).
   const linkedinReplied = (reachouts?.rows ?? []).filter((r) => r.linkedin_replied && inCampaign(r));
-  // Fast membership test to flag LinkedIn replies inside the aging card.
-  const linkedinSet = new Set(linkedinReplied.map((r) => r.recipient));
 
-  // The same follow-up roster, re-ordered MOST OVERDUE first — a focused
-  // "who's aging without a personal follow-up" view (days_since is derived from
-  // the last touch, so it resets when "Followed up" is clicked).
-  const followUpAging = (pipeline?.follow_up_reminders ?? [])
+  // The aging roster: a SUPERSET of the real leads that ALSO includes
+  // LinkedIn-only leads (backend follow_up_aging), so everything needing a
+  // personal nudge is in one place. Re-ordered MOST OVERDUE first; days_since
+  // and the next-nudge date are derived from the last touch, so they reset when
+  // "Followed up" is clicked.
+  const followUpAging = (pipeline?.follow_up_aging ?? [])
     .filter(inCampaign)
     .slice()
     .sort((a, b) => b.days_since - a.days_since);
@@ -127,10 +128,6 @@ export default function Campaigns() {
                   {lead.recipient} {lead.company && `· ${lead.company}`} {lead.role && `(${lead.role})`}
                 </span>
                 <span className={styles.leadStatus}>
-                  <span className={styles.leadStatusMain}>
-                    {lead.days_since}d since {lead.last_interaction_at ? 'last follow-up' : 'marked real'} · next
-                    nudge {shortDate(lead.next_follow_up_date)}
-                  </span>
                   <span className={styles.leadStatusSub}>
                     {lead.campaign} · marked real {shortDate(lead.real_tagged_at)}
                   </span>
@@ -151,6 +148,7 @@ export default function Campaigns() {
                 </span>
                 <span className={styles.leadStatusSub}>
                   {r.campaign}
+                  {r.linkedin_replied_at && ` · marked ${shortDate(r.linkedin_replied_at)}`}
                   {r.reply_tag && ` · ${r.reply_tag.replace('_', ' ')}`}
                 </span>
               </div>
@@ -162,9 +160,7 @@ export default function Campaigns() {
           {followUpAging.length === 0 ? (
             <p className={styles.empty}>No active leads to follow up{selected ? ` in ${selected}` : ''}.</p>
           ) : (
-            followUpAging.map((l) => (
-              <AgingRow key={l.recipient} lead={l} linkedin={linkedinSet.has(l.recipient)} />
-            ))
+            followUpAging.map((l) => <AgingRow key={l.recipient} lead={l} />)
           )}
         </Card>
       </CardGrid>

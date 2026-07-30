@@ -96,6 +96,17 @@ export interface FollowUpReminder extends ActiveLead {
   next_follow_up_date: string;
 }
 
+// One row of the Campaigns "Days since last follow-up" card — a superset of
+// FollowUpReminder that also includes LinkedIn-only leads (no real_tagged_at).
+export interface FollowUpAgingRow {
+  recipient: string;
+  campaign: string;
+  company: string;
+  days_since: number;
+  next_follow_up_date: string; // ISO YYYY-MM-DD, 3 working days after last touch
+  linkedin: boolean; // currently marked replied-on-LinkedIn
+}
+
 export interface ContactContext {
   recipient: string;
   campaign: string;
@@ -180,6 +191,7 @@ export interface PipelineResponse {
   today: TodayStrip;
   active_leads: ActiveLead[];
   follow_up_reminders: FollowUpReminder[];
+  follow_up_aging: FollowUpAgingRow[];
   pipeline: Pipeline;
   companies: CompaniesContacted;
   bounces: BounceRow[];
@@ -289,6 +301,9 @@ export interface ReachoutRow {
   already_corrected_to: { recipient: string; status: string }[];
   clicks: ClickDetail[];
   linkedin_replied: boolean;
+  // ISO timestamp of when they were marked LinkedIn-replied (latest
+  // linkedin_reply interaction), or null. Mirrors ActiveLead.real_tagged_at.
+  linkedin_replied_at: string | null;
   // Outreach halted because they replied on LinkedIn (status 'linkedin-gate') —
   // one-way, like `stopped`. Durable, append-only read (see dashboard.py).
   linkedin_gated: boolean;

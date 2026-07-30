@@ -152,8 +152,8 @@ def test_api_pipeline_returns_expected_keys(app):
         resp = app.test_client().get("/api/pipeline")
     assert resp.status_code == 200
     body = resp.get_json()
-    for key in ("today", "active_leads", "follow_up_reminders", "pipeline", "companies", "bounces",
-                "stopped_outreach"):
+    for key in ("today", "active_leads", "follow_up_reminders", "follow_up_aging", "pipeline",
+                "companies", "bounces", "stopped_outreach"):
         assert key in body, key
 
 

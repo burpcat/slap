@@ -1149,6 +1149,24 @@ def linkedin_replied_state(conn) -> dict:
     return out
 
 
+def linkedin_replied_at(conn) -> dict:
+    """Per recipient CURRENTLY LinkedIn-replied, the ISO timestamp of the latest
+    `linkedin_reply` interaction event that put them there — the "when did they
+    reply on LinkedIn" companion to linkedin_replied_state()'s boolean, reusing
+    the exact same _latest_interaction_events() resolution so the two can never
+    disagree about which recipients are LinkedIn-replied. Absent for anyone
+    not currently LinkedIn-replied (never toggled, or toggled back off) — same
+    "never fabricated" convention _real_tagged_at()/every other per-recipient
+    timestamp lookup in this module already follows."""
+    latest = _latest_interaction_events(conn)
+    out = {}
+    for recipient, channels in latest.items():
+        ev = channels.get("linkedin_reply")
+        if ev is not None and bool(ev["meta"].get("state")):
+            out[recipient] = ev["timestamp"]
+    return out
+
+
 def _latest_interaction_at(conn) -> dict:
     """Per recipient, the ISO timestamp of their most recent interaction on ANY
     channel (LinkedIn-replied toggle, "followed up" marker, Remind). Feeds
@@ -1339,11 +1357,29 @@ def active_leads(conn) -> list:
     return sorted(result, key=lambda e: e["real_tagged_at"], reverse=True)
 
 
-# Days after the last touch (real-tag or a "followed up"/LinkedIn interaction)
-# at which the dashboard suggests the next personal nudge. A plain display
-# cadence for manual follow-ups — not a send schedule (GMass's automated
-# cadence already stopped once someone replied/was marked Real, §3).
-FOLLOW_UP_NUDGE_DAYS = 7
+# Working days (Mon–Fri) after the last touch (real-tag or a "followed
+# up"/LinkedIn interaction) at which the dashboard suggests the next personal
+# nudge. A plain display cadence for manual follow-ups — not a send schedule
+# (GMass's automated cadence already stopped once someone replied/was marked
+# Real, §3). Counted in WORKING days so a Friday touch nudges the next
+# Wednesday, not over the weekend.
+FOLLOW_UP_NUDGE_DAYS = 3
+
+
+def _add_working_days(start: date, n: int) -> date:
+    """`start` plus `n` working days (Mon–Fri), skipping weekends. Deliberately
+    plain Mon–Fri: the GMass-send holiday/active-days calendar in
+    slap.config/slap.runner is a SEPARATE axis (when the unattended runner is
+    allowed to fire), not this manual, human-facing display nudge — reusing it
+    here would couple a "when should I personally poke this lead" hint to send
+    scheduling knobs that have nothing to do with it."""
+    d = start
+    remaining = n
+    while remaining > 0:
+        d += timedelta(days=1)
+        if d.weekday() < 5:  # Mon–Fri
+            remaining -= 1
+    return d
 
 
 def follow_up_reminders(conn, *, today: date = None) -> list:
@@ -1387,7 +1423,68 @@ def follow_up_reminders(conn, *, today: date = None) -> list:
             # max(real_tagged, latest interaction), clicking "Followed up"
             # (which appends an interaction event) moves the anchor forward and
             # this date recomputes on its own — no sticky note to go stale.
-            "next_follow_up_date": (anchor_date + timedelta(days=FOLLOW_UP_NUDGE_DAYS)).isoformat(),
+            "next_follow_up_date": _add_working_days(anchor_date, FOLLOW_UP_NUDGE_DAYS).isoformat(),
+        })
+    return sorted(result, key=lambda e: e["days_since"], reverse=True)
+
+
+def follow_up_aging(conn, *, today: date = None) -> list:
+    """The "days since last follow-up" roster — a SUPERSET of
+    follow_up_reminders()/active_leads(): every real-tagged lead PLUS every
+    LinkedIn-replied lead (so a lead the owner is nudging on LinkedIn but never
+    tagged Real is still surfaced here, "everything to follow up in one
+    place"), minus stopped. Deliberately its own roster rather than folded into
+    active_leads()/follow_up_reminders() — those two stay strictly the
+    real-tag + not-stopped set backing the "Active leads marked real" card,
+    which must NOT show a LinkedIn-only lead; this wider one only backs the
+    aging nudge card.
+
+    Anchor is the most recent touch — max of when they were marked Real (if
+    ever) and their latest interaction on any channel (the LinkedIn-reply
+    toggle, a "followed up" click, or a Remind). A LinkedIn-only lead always
+    has at least the linkedin_reply interaction, so it always has an anchor;
+    clicking "Followed up" appends a `followed_up` interaction that moves the
+    anchor forward and resets `days_since`/`next_follow_up_date` live — the
+    exact same mechanism follow_up_reminders() relies on. Sorted MOST OVERDUE
+    first (same framing as follow_up_reminders() — this card is time pressure).
+
+    Reuses _real_tagged_at()/linkedin_replied_state()/_stopped_recipients()/
+    _latest_interaction_at()/_recipient_drop_meta()/_local_date() rather than
+    re-deriving any of them, so it can never disagree with the other cards
+    about who is real / LinkedIn-replied / stopped."""
+    today = today or date.today()
+    real = _real_tagged_at(conn)  # {recipient: iso_ts}
+    linkedin = {r for r, on in linkedin_replied_state(conn).items() if on}
+    stopped = _stopped_recipients(conn)
+    roster = (set(real) | linkedin) - stopped
+    if not roster:
+        return []
+    latest_interaction_at = _latest_interaction_at(conn)
+    drop_meta = _recipient_drop_meta(conn)
+    placeholders = ",".join("?" * len(roster))
+    rows = conn.execute(
+        f"SELECT recipient, campaign FROM recipients WHERE recipient IN ({placeholders})",
+        list(roster),
+    ).fetchall()
+    result = []
+    for row in rows:
+        recip = row["recipient"]
+        # max() over ISO-8601 UTC strings is a correct 'most recent'; both
+        # candidates are None-guarded, and roster membership guarantees at
+        # least one exists (real-tagged -> real[recip]; LinkedIn-replied ->
+        # a linkedin_reply interaction feeds latest_interaction_at).
+        candidates = [t for t in (real.get(recip), latest_interaction_at.get(recip)) if t]
+        if not candidates:
+            continue
+        anchor_date = _local_date(max(candidates))
+        meta = drop_meta.get(recip, {"company": ""})
+        result.append({
+            "recipient": recip,
+            "campaign": row["campaign"],
+            "company": meta["company"],
+            "days_since": (today - anchor_date).days,
+            "next_follow_up_date": _add_working_days(anchor_date, FOLLOW_UP_NUDGE_DAYS).isoformat(),
+            "linkedin": recip in linkedin,
         })
     return sorted(result, key=lambda e: e["days_since"], reverse=True)
 
@@ -1635,6 +1732,7 @@ def reachouts_rows(conn) -> list:
     corrected_from_map = _corrected_from_by_recipient(conn)
     already_corrected_map = _already_corrected_to(conn)
     linkedin_replied_map = linkedin_replied_state(conn)
+    linkedin_replied_at_map = linkedin_replied_at(conn)
     rows = conn.execute("SELECT * FROM recipients").fetchall()
 
     result = []
@@ -1692,6 +1790,12 @@ def reachouts_rows(conn) -> list:
             # derived live from the interaction log. Drives the highlighted
             # LinkedIn icon in the React table and feeds the follow-up timer.
             "linkedin_replied": linkedin_replied_map.get(recipient, False),
+            # When they were marked LinkedIn-replied (the latest linkedin_reply
+            # interaction's own timestamp) — mirrors active_leads()'s
+            # real_tagged_at so the "Replied on LinkedIn" card can show a
+            # "marked <date>" the same way the "marked real" card does. None
+            # for anyone not currently LinkedIn-replied — never fabricated.
+            "linkedin_replied_at": linkedin_replied_at_map.get(recipient),
             # stopped (Stop outreach, Part 2): from _stopped_recipients()'s
             # durable, append-only read — NOT `status == 'stopped'` — so a
             # later bounce/reply event can never silently un-mark this row

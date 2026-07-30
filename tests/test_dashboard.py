@@ -19,10 +19,12 @@ from slap.config import GlobalConfig, ScheduleConfig
 from slap import gmass_cache, ui_state
 from slap.queue import stage_recipient
 from slap.dashboard import (
-    _click_details, _clicked_recipients, _recipient_drop_meta, active_leads, actionable_replies,
+    _add_working_days, _click_details, _clicked_recipients, _recipient_drop_meta, active_leads,
+    actionable_replies,
     bounce_breakdown, bounces, companies_contacted, compute_gmass_dependent_data, create_app,
-    engagement_intelligence, event_display, filter_reachouts, follow_up_reminders,
-    gate_linkedin, get_gmass_dependent_data, needs_triage, next_drain, pipeline, reachouts_rows,
+    engagement_intelligence, event_display, filter_reachouts, follow_up_aging, follow_up_reminders,
+    gate_linkedin, get_gmass_dependent_data, linkedin_replied_at, needs_triage, next_drain,
+    pipeline, reachouts_rows,
     read_log_tail,
     recent_events, reply_tags, sent_reply_trend, stop_outreach, stopped_outreach_roster,
     sync_reports, tag_reply, template_failures, this_week, today_strip, todays_runs,
@@ -1674,9 +1676,9 @@ def test_follow_up_reminders_reuses_active_leads_and_adds_days_since(conn):
     assert reminders[0]["company"] == "Acme"
     assert reminders[0]["days_since"] == 4
     # Next-nudge date is the real-tag anchor (no interaction yet) + the fixed
-    # nudge gap — computed live, not stored.
+    # nudge gap in WORKING days — computed live, not stored.
     from slap.dashboard import FOLLOW_UP_NUDGE_DAYS
-    expected = (_ts(0).date() + timedelta(days=FOLLOW_UP_NUDGE_DAYS)).isoformat()
+    expected = _add_working_days(_ts(0).date(), FOLLOW_UP_NUDGE_DAYS).isoformat()
     assert reminders[0]["next_follow_up_date"] == expected
 
 
@@ -1705,6 +1707,99 @@ def test_follow_up_reminders_excludes_stopped(conn):
 
 def test_follow_up_reminders_empty_when_no_active_leads(conn):
     assert follow_up_reminders(conn) == []
+
+
+# --- _add_working_days -------------------------------------------------------
+
+def test_add_working_days_skips_weekends():
+    # 2026-01-15 is a Thursday. +3 working days -> Fri 16, (skip Sat/Sun), Mon 19, Tue 20.
+    assert _add_working_days(date(2026, 1, 15), 3) == date(2026, 1, 20)
+    # A Friday start: +1 working day lands on the following Monday, not Saturday.
+    assert _add_working_days(date(2026, 1, 16), 1) == date(2026, 1, 19)
+    # Zero is a no-op.
+    assert _add_working_days(date(2026, 1, 15), 0) == date(2026, 1, 15)
+
+
+# --- follow_up_aging ---------------------------------------------------------
+
+def test_follow_up_aging_includes_real_lead(conn):
+    _stage_and_send(conn, recipient="real@x.com", campaign="c", persona="recruiter", company="Acme")
+    append_event(conn, type="reply", recipient="real@x.com", campaign="c", timestamp=_ts(0))
+    append_event(conn, type="reply_reviewed", recipient="real@x.com", campaign="c",
+                 meta={"tag": "real"}, timestamp=_ts(0))
+
+    aging = follow_up_aging(conn, today=_ts(0).date() + timedelta(days=4))
+    assert len(aging) == 1
+    assert aging[0]["recipient"] == "real@x.com"
+    assert aging[0]["company"] == "Acme"
+    assert aging[0]["days_since"] == 4
+    assert aging[0]["linkedin"] is False
+    assert aging[0]["next_follow_up_date"] == _add_working_days(_ts(0).date(), 3).isoformat()
+
+
+def test_follow_up_aging_includes_linkedin_only_lead(conn):
+    # A LinkedIn-replied lead who was NEVER tagged Real still shows up here
+    # (the whole point of this widget vs. the real-only follow_up_reminders).
+    _stage_and_send(conn, recipient="li@x.com", campaign="c", persona="recruiter", company="LinkedCo")
+    append_event(conn, type="interaction", recipient="li@x.com", campaign="c",
+                 meta={"channel": "linkedin_reply", "state": True}, timestamp=_ts(0))
+
+    assert active_leads(conn) == []  # not real-tagged
+    aging = follow_up_aging(conn, today=_ts(0).date() + timedelta(days=2))
+    assert [a["recipient"] for a in aging] == ["li@x.com"]
+    assert aging[0]["linkedin"] is True
+    assert aging[0]["days_since"] == 2
+
+
+def test_follow_up_aging_excludes_stopped(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
+    tag_reply(conn, "a@x.com", "real")
+    stop_outreach(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    assert follow_up_aging(conn) == []
+
+
+def test_follow_up_aging_followed_up_resets_days_since(conn):
+    _stage_and_send(conn, recipient="li@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="interaction", recipient="li@x.com", campaign="c",
+                 meta={"channel": "linkedin_reply", "state": True}, timestamp=_ts(0))
+    today = _ts(10).date()
+    assert follow_up_aging(conn, today=today)[0]["days_since"] == 10
+
+    # A "followed up" interaction moves the anchor forward -> days_since resets.
+    append_event(conn, type="interaction", recipient="li@x.com", campaign="c",
+                 meta={"channel": "followed_up"}, timestamp=_ts(10))
+    assert follow_up_aging(conn, today=today)[0]["days_since"] == 0
+
+
+def test_follow_up_aging_empty_when_nothing(conn):
+    assert follow_up_aging(conn) == []
+
+
+# --- linkedin_replied_at -----------------------------------------------------
+
+def test_linkedin_replied_at_surfaces_marked_timestamp(conn):
+    _stage_and_send(conn, recipient="li@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="interaction", recipient="li@x.com", campaign="c",
+                 meta={"channel": "linkedin_reply", "state": True}, timestamp=_ts(3))
+
+    at = linkedin_replied_at(conn)
+    assert at["li@x.com"] == _ts(3).isoformat()
+
+    rows = {r["recipient"]: r for r in reachouts_rows(conn)}
+    assert rows["li@x.com"]["linkedin_replied_at"] == _ts(3).isoformat()
+
+
+def test_linkedin_replied_at_absent_when_toggled_off(conn):
+    _stage_and_send(conn, recipient="li@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="interaction", recipient="li@x.com", campaign="c",
+                 meta={"channel": "linkedin_reply", "state": True}, timestamp=_ts(0))
+    append_event(conn, type="interaction", recipient="li@x.com", campaign="c",
+                 meta={"channel": "linkedin_reply", "state": False}, timestamp=_ts(1))
+
+    assert "li@x.com" not in linkedin_replied_at(conn)
+    rows = {r["recipient"]: r for r in reachouts_rows(conn)}
+    assert rows["li@x.com"]["linkedin_replied_at"] is None
 
 
 # --- stop_outreach -------------------------------------------------------------

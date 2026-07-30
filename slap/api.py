@@ -313,6 +313,10 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, api
             "today": dashboard.today_strip(conn, global_config),
             "active_leads": dashboard.active_leads(conn),
             "follow_up_reminders": dashboard.follow_up_reminders(conn),
+            # Superset of follow_up_reminders (real leads + LinkedIn-replied
+            # leads, minus stopped) backing the Campaigns "Days since last
+            # follow-up" card, so a LinkedIn-only lead is nudged there too.
+            "follow_up_aging": dashboard.follow_up_aging(conn),
             "pipeline": dashboard.pipeline(conn, global_config),
             "companies": dashboard.companies_contacted(conn, consumer_domains),
             "bounces": gmass_data["bounces"],
