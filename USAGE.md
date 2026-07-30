@@ -588,6 +588,15 @@ can't run anything if the machine is powered off or the user isn't logged in.
 (`/logs`) — it shows every `run_started`/`run_completed`/`run_failed` event alongside the raw
 `runner.log`/`runner.err.log` tails, so you don't have to go find and open those files by hand.
 
+**If the runner stops firing altogether** (not just late — genuinely silent, no
+`run_started` events at all), check `launchctl print gui/<uid>/com.slap.runner`'s `last
+exit code`. `78: EX_CONFIG` alongside a `posix_spawn ... error 0x1` line in the unified log
+(`log show --predicate 'process == "launchd"'`) means macOS's TCC privacy protections are
+blocking launchd from spawning the interpreter — a common cause if this repo lives inside
+`~/Documents`/`~/Desktop`/`~/Downloads`. See
+[`LAUNCHD.md`'s Troubleshooting section](LAUNCHD.md#troubleshooting-runner-silently-stops-firing)
+for full diagnosis and the fix (move the repo elsewhere, regenerate the plist).
+
 ## Tips
 
 - **Keep daily volume low.** Cold outreach from a personal Gmail account has real

@@ -739,6 +739,21 @@ behaviorally *unproven*, and that remains the case).
 - **launchd runs with a bare environment.** No shell, no `cd`, no aliases, no auto-loaded
   `.env`. The generated plist (via `slap.py plist`) uses absolute paths; the runner loads
   `.env` itself. **This is the #1 unattended-failure risk** — verify on any real wake test.
+- **A `posix_spawn ... error 0x1 - Operation not permitted` / exit 78 (`EX_CONFIG`) from
+  `launchctl print` means TCC blocked the spawn, not a scheduling bug.** Confirmed root
+  cause of a real incident (2026-07-25–27): the repo lived under `~/Documents`, which is a
+  TCC-protected folder. Interactive shells (Terminal, iTerm2) have their own blanket grant
+  for it — why a manual `slap.py runner` run always worked even while this was broken —
+  but `launchd`/`xpcproxy` has no such inherited trust and relies on a much narrower grant
+  tied to the *exact code-signing identity* of the venv's Python. Homebrew's Python is only
+  ad-hoc signed (no stable Team ID), so that identity changes on every
+  `brew reinstall`/upgrade, silently invalidating the grant with no way for a headless job
+  to ever re-trigger a consent prompt. Re-signing/reinstalling Python does **not** fix
+  this — confirmed directly, since doing exactly that produced a new binary identity and
+  the identical failure on the next `launchctl kickstart` test. The only durable fix: move
+  the whole repo outside `~/Documents`/`~/Desktop`/`~/Downloads` (e.g. `~/dev/slap`) and
+  regenerate+reload the plist — see `LAUNCHD.md`'s Troubleshooting section for the full
+  step-by-step; fixed and verified end-to-end this way.
 - **Two different "times":** the plist `StartCalendarInterval` (launch anchor, fires on
   wake if asleep) vs. `config.yaml`'s `fire_window_start/end` (the jitter window the
   runner sleeps inside, in LOCAL time — deliberately not UTC, since it mirrors a human
@@ -1059,6 +1074,16 @@ file/function to be checked rather than trusting a paraphrase, including this on
 - **Before trusting a claim about "what status/column/flag does," check `slap/tracking.py`
   and the relevant module directly** — several sections of this very doc were wrong
   (stale) until this revision cross-checked them against the real code.
+- **If the runner goes silent, check `launchctl print gui/<uid>/com.slap.runner`'s `last
+  exit code` before assuming a scheduling/`active_days` bug.** `78: EX_CONFIG` plus a
+  `posix_spawn ... error 0x1` line in `log show --predicate 'process == "launchd"'` is a
+  TCC/Documents-folder permission failure, not a `slap.py` bug at all — see §7 and
+  `LAUNCHD.md`. A fix attempt that only reinstalls/re-signs the Python interpreter without
+  moving the repo out of the protected folder will not hold — verify with a real
+  `launchctl kickstart` test (checking the unified log for a clean spawn), not just a
+  manual `slap.py runner` invocation, since manual runs go through a different, already-
+  trusted execution path and will falsely appear to confirm a fix that hasn't actually
+  worked.
 
 ---
 
