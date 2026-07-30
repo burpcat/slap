@@ -3,6 +3,7 @@ import { useCampaigns, useCampaignSlice, usePipeline } from '../api/hooks';
 import { Card, CardGrid } from '../components/primitives/Card';
 import { StatRow, StatTile } from '../components/primitives/StatTile';
 import { CampaignDot } from '../components/primitives/Chip';
+import { shortDate } from '../utils/format';
 import styles from './Campaigns.module.css';
 
 export default function Campaigns() {
@@ -14,7 +15,14 @@ export default function Campaigns() {
   if (isLoading) return <p>Loading…</p>;
   if (error || !data) return <p>Could not load campaigns.</p>;
 
-  const activeLeads = (pipeline?.active_leads ?? []).filter((l) => !selected || l.campaign === selected);
+  // Driven by follow_up_reminders (same real-tagged roster as active_leads,
+  // but carrying the derived follow-up status: days_since + next_follow_up_date)
+  // so each lead can show "how long since the last follow-up" and the next-nudge
+  // date (req 4). Sorted most-recently-marked-real first — a "who's live" roster.
+  const activeLeads = (pipeline?.follow_up_reminders ?? [])
+    .filter((l) => !selected || l.campaign === selected)
+    .slice()
+    .sort((a, b) => (a.real_tagged_at < b.real_tagged_at ? 1 : -1));
 
   const totals = data.campaigns.reduce(
     (acc, c) => ({
@@ -73,8 +81,14 @@ export default function Campaigns() {
                 <span>
                   {lead.recipient} {lead.company && `· ${lead.company}`} {lead.role && `(${lead.role})`}
                 </span>
-                <span>
-                  {lead.campaign} · marked real {new Date(lead.real_tagged_at).toLocaleDateString()}
+                <span className={styles.leadStatus}>
+                  <span className={styles.leadStatusMain}>
+                    {lead.days_since}d since {lead.last_interaction_at ? 'last follow-up' : 'marked real'} · next
+                    nudge {shortDate(lead.next_follow_up_date)}
+                  </span>
+                  <span className={styles.leadStatusSub}>
+                    {lead.campaign} · marked real {shortDate(lead.real_tagged_at)}
+                  </span>
                 </span>
               </div>
             ))

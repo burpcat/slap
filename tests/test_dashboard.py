@@ -1342,7 +1342,7 @@ def test_companies_contacted_this_week_vs_all_time(conn):
 
 def test_companies_contacted_empty_when_nothing_sent(conn):
     result = companies_contacted(conn, consumer_domains=set(), today=date(2026, 1, 15))
-    assert result == {"all_time_count": 0, "this_week_count": 0, "top_companies": []}
+    assert result == {"all_time_count": 0, "this_week_count": 0, "top_companies": [], "all_companies": []}
 
 
 def test_next_drain_reports_window_and_queue_depth(conn):
@@ -1672,6 +1672,11 @@ def test_follow_up_reminders_reuses_active_leads_and_adds_days_since(conn):
     assert reminders[0]["recipient"] == "a@x.com"
     assert reminders[0]["company"] == "Acme"
     assert reminders[0]["days_since"] == 4
+    # Next-nudge date is the real-tag anchor (no interaction yet) + the fixed
+    # nudge gap — computed live, not stored.
+    from slap.dashboard import FOLLOW_UP_NUDGE_DAYS
+    expected = (_ts(0).date() + timedelta(days=FOLLOW_UP_NUDGE_DAYS)).isoformat()
+    assert reminders[0]["next_follow_up_date"] == expected
 
 
 def test_follow_up_reminders_sorted_most_overdue_first(conn):

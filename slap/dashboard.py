@@ -968,14 +968,22 @@ def companies_contacted(conn, consumer_domains: set, *, today: date = None) -> d
         d for d, contacts in non_consumer.items()
         if any(week_start <= _local_date(c.first_sent_at) <= today for c in contacts)
     }
-    top_companies = sorted(
+    ranked = sorted(
         ((d, len(contacts)) for d, contacts in non_consumer.items()), key=lambda t: (-t[1], t[0])
-    )[:5]
+    )
+    top_companies = ranked[:5]
 
     return {
         "all_time_count": len(non_consumer),
         "this_week_count": len(this_week_domains),
         "top_companies": top_companies,
+        # Full (domain, count) roster for the front-page company "word cloud"
+        # (the ranked list + per-company counts are replaced by a size-weighted
+        # cloud in the UI). Same non-consumer, actually-sent set as the counts
+        # above — one source of truth, just not truncated to 5. The UI strips
+        # the TLD for display; the domain is kept verbatim here (still the real,
+        # dedup-relevant key).
+        "all_companies": ranked,
     }
 
 
@@ -1278,6 +1286,13 @@ def active_leads(conn) -> list:
     return sorted(result, key=lambda e: e["real_tagged_at"], reverse=True)
 
 
+# Days after the last touch (real-tag or a "followed up"/LinkedIn interaction)
+# at which the dashboard suggests the next personal nudge. A plain display
+# cadence for manual follow-ups — not a send schedule (GMass's automated
+# cadence already stopped once someone replied/was marked Real, §3).
+FOLLOW_UP_NUDGE_DAYS = 7
+
+
 def follow_up_reminders(conn, *, today: date = None) -> list:
     """The "-N days, follow up" nag (post-launch): active_leads() (the exact
     same real-tag + not-stopped roster, reused rather than re-derived — see
@@ -1313,6 +1328,13 @@ def follow_up_reminders(conn, *, today: date = None) -> list:
             **lead,
             "days_since": (today - anchor_date).days,
             "last_interaction_at": interaction_at,
+            # Suggested date for the next personal nudge (req 4's "date column
+            # to remind on the next follow up"): the SAME anchor + a fixed gap,
+            # computed live, never stored. Because the anchor is
+            # max(real_tagged, latest interaction), clicking "Followed up"
+            # (which appends an interaction event) moves the anchor forward and
+            # this date recomputes on its own — no sticky note to go stale.
+            "next_follow_up_date": (anchor_date + timedelta(days=FOLLOW_UP_NUDGE_DAYS)).isoformat(),
         })
     return sorted(result, key=lambda e: e["days_since"], reverse=True)
 
