@@ -50,6 +50,28 @@
   color: var(--text-muted);
 }
 
+.agingRow {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--hairline);
+  font-size: 0.9rem;
+}
+.agingRow:last-child { border-bottom: none; }
+.agingWho {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agingDays {
+  font-family: Georgia, "Iowan Old Style", serif;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
 .empty {
   color: var(--text-muted);
   font-style: italic;
