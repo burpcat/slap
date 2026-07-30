@@ -1,0 +1,24 @@
+.wrap {
+  padding: 24px 0;
+}
+.title {
+  margin: 0 0 8px;
+}
+.body {
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  max-width: 60ch;
+}
+.detail {
+  margin-top: 12px;
+  padding: 10px 12px;
+  background: var(--page);
+  border: 1px solid var(--hairline);
+  border-left: 2px solid var(--critical);
+  border-radius: 6px;
+  font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
