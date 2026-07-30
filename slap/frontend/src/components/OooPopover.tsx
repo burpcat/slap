@@ -34,7 +34,10 @@ export function OooPopover({
       <div className={popoverStyles.row}>
         <Button
           small
-          variant="primary"
+          // OOO's accent is orange everywhere (matches the reach-outs OOO
+          // action being orange-when-selected). Inline tokens override the
+          // default button fill; no new Button variant needed.
+          style={{ background: 'var(--warning)', color: 'var(--ink-on-status)', borderColor: 'var(--warning)' }}
           disabled={pending}
           onClick={() => {
             onConfirm(date);

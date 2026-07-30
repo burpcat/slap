@@ -15,8 +15,8 @@ import styles from './Popover.module.css';
 
 /** A small anchored popover (OOO date picker, resend email prompt, ...)
  * rendered in a FloatingPortal with flip/shift middleware so it never clips
- * or renders offscreen near the bottom/edge of the viewport -- the same
- * pattern RowMenu uses for the Reach-outs "..." action menu. */
+ * or renders offscreen near the bottom/edge of the viewport -- shared by the
+ * OOO / Resend / Stop-confirm pickers on the Reach-outs page. */
 export function Popover({
   open,
   onOpenChange,

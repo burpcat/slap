@@ -40,8 +40,13 @@
   font-size: 0.85rem;
   color: var(--text-secondary);
   line-height: 1.5;
-  /* Keep the summary to a readable measure — the full dump lives in the log. */
+  /* Keep the summary to a readable measure and at most two lines — the full
+     dump lives in the log, never here. */
   max-width: 70ch;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 .log {

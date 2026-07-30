@@ -13,12 +13,48 @@
   background: var(--surface-1);
 }
 
+/* Animated wordmark (fish.audio-inspired): a gentle idle bob plus a slow
+   shimmer sweeping through the letters, and a quick wiggle on hover. CSS-only,
+   GPU-friendly (transform + background-position), no JS/canvas — and no
+   `will-change`, so it stays light on memory. Disabled under reduced-motion. */
 .brand {
   font-family: Georgia, "Iowan Old Style", serif;
   font-size: 1.25rem;
   font-weight: 700;
   letter-spacing: -0.01em;
   margin: 0;
+  cursor: default;
+  background-image: linear-gradient(
+    100deg,
+    var(--text-primary) 0%,
+    var(--text-primary) 42%,
+    var(--series-1) 50%,
+    var(--text-primary) 58%,
+    var(--text-primary) 100%
+  );
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+  animation: brandBob 3.6s ease-in-out infinite, brandShimmer 7s linear infinite;
+}
+.brand:hover {
+  animation: brandWiggle 0.55s ease-in-out;
+}
+
+@keyframes brandBob {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-2px); }
+}
+@keyframes brandShimmer {
+  0% { background-position: 120% 50%; }
+  100% { background-position: -20% 50%; }
+}
+@keyframes brandWiggle {
+  0%, 100% { transform: translateY(0) rotate(0deg); }
+  30% { transform: translateY(-1px) rotate(-4deg); }
+  70% { transform: translateY(-1px) rotate(4deg); }
 }
 
 .nav {
@@ -27,17 +63,39 @@
   font-size: 0.9rem;
 }
 
+/* Nav links get a smooth sliding underline on hover (a scaleX pseudo-element,
+   GPU-composited) instead of a static border; the active link keeps it shown. */
 .navLink {
   color: var(--text-secondary);
   text-decoration: none;
   padding: 4px 0;
   position: relative;
+  transition: color 0.2s ease;
+}
+.navLink::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -2px;
+  height: 2px;
+  background: var(--series-1);
+  transform: scaleX(0);
+  transform-origin: left center;
+  transition: transform 0.25s ease;
 }
 .navLink:hover { color: var(--text-primary); }
+.navLink:hover::after { transform: scaleX(1); }
 .navLinkActive {
   color: var(--text-primary);
   font-weight: 600;
-  border-bottom: 2px solid var(--series-1);
+}
+.navLinkActive::after { transform: scaleX(1); }
+
+@media (prefers-reduced-motion: reduce) {
+  .brand { animation: none; background-position: 0 50%; }
+  .navLink,
+  .navLink::after { transition: none; }
 }
 
 .badge {

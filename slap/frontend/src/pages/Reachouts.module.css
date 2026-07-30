@@ -177,3 +177,27 @@ table.table {
   justify-content: flex-end;
   width: 100%;
 }
+
+/* Triage buttons: neutral outline by default; only the currently-selected tag
+   is filled with its color (green/red/orange), per Image #13. */
+.actBtn {
+  all: unset;
+  cursor: pointer;
+  font-size: 0.78rem;
+  font-weight: 600;
+  line-height: 1;
+  padding: 5px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.actBtn:hover { border-color: var(--text-secondary); color: var(--text-primary); }
+.actBtn:disabled { opacity: 0.5; cursor: default; }
+
+.selReal { background: var(--good); border-color: var(--good); color: var(--ink-on-status); }
+.selReal:hover { color: var(--ink-on-status); border-color: var(--good); }
+.selNot { background: var(--critical); border-color: var(--critical); color: var(--ink-on-status); }
+.selNot:hover { color: var(--ink-on-status); border-color: var(--critical); }
+.selOoo { background: var(--warning); border-color: var(--warning); color: var(--ink-on-status); }
+.selOoo:hover { color: var(--ink-on-status); border-color: var(--warning); }
