@@ -10,9 +10,9 @@ import {
 import { useTheme } from '../theme/useTheme';
 import type { CampaignColor, ReachoutRow } from '../api/types';
 import { StatusChip, CampaignDot } from '../components/primitives/Chip';
-import { Button } from '../components/primitives/Button';
 import { OooPopover } from '../components/OooPopover';
-import { RowMenu } from '../components/RowMenu';
+import { ResendPopover } from '../components/ResendPopover';
+import { ConfirmPopover } from '../components/ConfirmPopover';
 import { shortDate } from '../utils/format';
 import styles from './Reachouts.module.css';
 
@@ -176,7 +176,14 @@ function RowActions({ row, colors }: { row: ReachoutRow; colors: Record<string, 
       </td>
       <td>{row.persona}</td>
       <td>
-        <StatusChip color={row.chip.color} label={row.chip.label} />
+        {/* Just the status here (Image #11) — the full bounce reason lives on
+            the Pipeline page. chip.label for a bounced row is
+            "Blocked — <full DSN>", so shorten it to the category word; every
+            other status label is already short. Chip color is unchanged. */}
+        <StatusChip
+          color={row.chip.color}
+          label={row.status === 'bounced' ? (row.bounce_category === 'block' ? 'Blocked' : 'Bounced') : row.chip.label}
+        />
       </td>
       <td>
         <ReplyCell row={row} />
@@ -184,21 +191,30 @@ function RowActions({ row, colors }: { row: ReachoutRow; colors: Record<string, 
       <td className={styles.dateCell}>{shortDate(row.date_local)}</td>
       <td>
         <div className={styles.actionsCell}>
-          {/* Inline triage — the common actions, no longer buried in the "…"
-              menu (req 9). Real / Not interested / OOO (date popup). */}
-          <Button small variant="primary" disabled={pending} onClick={() => tag.mutate({ tag: 'real' })}>
+          {/* Inline triage. Each button is neutral until it's the current tag,
+              then it lights up in its own color (Image #13): Real=green,
+              Not=red, OOO=orange. */}
+          <button
+            className={`${styles.actBtn} ${row.reply_tag === 'real' ? styles.selReal : ''}`}
+            disabled={pending}
+            onClick={() => tag.mutate({ tag: 'real' })}
+          >
             Real
-          </Button>
-          <Button small disabled={pending} onClick={() => tag.mutate({ tag: 'not_interested' })}>
+          </button>
+          <button
+            className={`${styles.actBtn} ${row.reply_tag === 'not_interested' ? styles.selNot : ''}`}
+            disabled={pending}
+            onClick={() => tag.mutate({ tag: 'not_interested' })}
+          >
             Not
-          </Button>
+          </button>
           <OooPopover
             pending={pending}
             onConfirm={(resume_date) => tag.mutate({ tag: 'ooo', resume_date })}
             trigger={
-              <Button small disabled={pending}>
+              <button className={`${styles.actBtn} ${row.reply_tag === 'ooo' ? styles.selOoo : ''}`} disabled={pending}>
                 OOO
-              </Button>
+              </button>
             }
           />
           <button
@@ -209,18 +225,24 @@ function RowActions({ row, colors }: { row: ReachoutRow; colors: Record<string, 
           >
             in
           </button>
-          {/* Overflow: less-common / destructive actions (Stop, Resend). */}
-          <RowMenu
-            row={row}
-            actions={{
-              pending,
-              onMarkOoo: (resume_date) => tag.mutate({ tag: 'ooo', resume_date }),
-              onStop: () => stop.mutate(),
-              onResend: (corrected_email) => resend.mutate({ corrected_email }),
-              onTagReal: () => tag.mutate({ tag: 'real' }),
-              onTagNotInterested: () => tag.mutate({ tag: 'not_interested' }),
-            }}
-          />
+          {/* Conditional recovery/halt actions — only where they apply, no
+              overflow menu (Image #12). */}
+          {row.status === 'bounced' && (
+            <ResendPopover
+              pending={resend.isPending}
+              onConfirm={(corrected_email) => resend.mutate({ corrected_email })}
+              trigger={<button className={styles.actBtn}>Resend</button>}
+            />
+          )}
+          {!row.stopped && row.status === 'active' && (
+            <ConfirmPopover
+              message={`Stop all further outreach to ${row.recipient}?`}
+              confirmLabel="Stop"
+              pending={stop.isPending}
+              onConfirm={() => stop.mutate()}
+              trigger={<button className={styles.actBtn}>Stop</button>}
+            />
+          )}
         </div>
       </td>
     </tr>
