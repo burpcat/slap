@@ -2,6 +2,7 @@ import type { ReactNode } from 'react';
 import { NavLink } from 'react-router-dom';
 import { useTheme } from '../theme/useTheme';
 import { useNav } from '../api/hooks';
+import { GlobalProgressBar } from './GlobalProgressBar';
 import { SyncBanner } from './SyncBanner';
 import styles from './Layout.module.css';
 
@@ -30,6 +31,7 @@ export function Layout({ children }: { children: ReactNode }) {
 
   return (
     <div className={styles.shell}>
+      <GlobalProgressBar />
       <header className={styles.header}>
         <h1 className={styles.brand}>slap</h1>
         <nav className={styles.nav}>
