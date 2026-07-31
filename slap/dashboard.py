@@ -1057,6 +1057,32 @@ def _linkedin_gated_recipients(conn) -> set:
     return {r["recipient"] for r in conn.execute("SELECT DISTINCT recipient FROM events WHERE type = 'linkedin_gate'")}
 
 
+def _pending_retry_recipients(conn) -> set:
+    """Every recipient whose MOST RECENT send-pipeline attempt ended in a
+    `send_failed` that no later `sent`/`requeued` has superseded — i.e. the
+    last drain couldn't deliver and the next drain will retry them (§11).
+
+    Derived live from the append-only event log, never a stored status column
+    (same discipline as _stopped_recipients()/_clicked_recipients() above):
+    `send_failed` is deliberately cache-inert in _apply_event_to_cache(), so
+    "is this recipient currently awaiting retry" MUST be recomputed from
+    whether a successful send has landed SINCE the failure, not frozen into
+    recipients.status — the moment the next drain delivers, a `sent`/`requeued`
+    becomes the latest attempt and the recipient drops out of this set on its
+    own. Ordered by id ASC so the last write per recipient wins (a recipient
+    whose latest attempt succeeded, or who never failed, is simply absent).
+    Only the three real send-outcome types are considered: `draft_created` is
+    an idempotency marker, not an attempt outcome, so it never masks a failure."""
+    rows = conn.execute(
+        "SELECT recipient, type FROM events "
+        "WHERE type IN ('sent', 'send_failed', 'requeued') ORDER BY id ASC"
+    ).fetchall()
+    latest: dict = {}
+    for row in rows:
+        latest[row["recipient"]] = row["type"]  # ORDER BY id ASC -> last attempt wins
+    return {r for r, t in latest.items() if t == "send_failed"}
+
+
 def _latest_reply_lifecycle_events(conn) -> dict:
     """Per recipient, the single most recent event among reply/ooo_tagged/
     reply_reviewed (raw `events` row, not yet reduced to a tag label) —
@@ -1617,6 +1643,17 @@ def _status_chip(*, status: str, engagement: str, reply_tag, bounce_category, bo
     if reply_tag == "not_interested":
         return {"color": None, "label": "Not interested"}
 
+    # Pending retry (see _pending_retry_recipients()): the recipient's last
+    # send attempt failed and the next drain will re-try it. Surfaced BEFORE
+    # replied/clicked so a row awaiting redelivery reads as the actionable
+    # "Retry pending" rather than a stale "Active"/"Queued" — `serious` (amber,
+    # not critical red) because it's transient and self-healing, not a durable
+    # dead-end like a bounce. Only ever reached when the base status was
+    # active/queued (reachouts_rows() gates the override on that), so it can
+    # never shadow a genuinely bounced/replied/done resting state.
+    if status == "pending_retry":
+        return {"color": "serious", "label": "Retry pending"}
+
     if engagement == "replied":
         return {"color": "good", "label": "Replied"}
 
@@ -1652,15 +1689,25 @@ def reachouts_rows(conn) -> list:
       'none'.
     - reply_tag: reply_tags() (mirrors needs_triage()'s resolution rule);
       None for a recipient who's never replied.
-    - status: recipients.status, EXCEPT a recipient with first_sent_at IS
-      NULL is reported as 'queued' rather than 'active' — the raw status
-      column alone can't distinguish "just staged, nothing sent yet" from
-      "sent at least once, still mid-sequence," both of which are 'active'.
-      There is no 'failed' status here on purpose: send_failed is a
-      transient per-attempt event, not a resting state — it's always
-      retried automatically by the next drain (§11), so a recipient is
-      never durably "in a failed state" the way they can durably be
-      bounced/replied/done.
+    - status: recipients.status, with two DERIVED display overrides layered
+      on top (neither is a stored column value — both are recomputed live so
+      they self-correct as new events land):
+        * a recipient with first_sent_at IS NULL is reported as 'queued'
+          rather than 'active' — the raw status column alone can't
+          distinguish "just staged, nothing sent yet" from "sent at least
+          once, still mid-sequence," both of which are 'active'.
+        * a recipient whose latest send attempt failed (in
+          _pending_retry_recipients()) and would otherwise show as
+          active/queued is reported as 'pending_retry' — send_failed is still
+          a transient per-attempt event that's auto-retried by the next drain
+          (§11) and is deliberately cache-inert (no stored 'failed' status),
+          but showing the awaiting-retry rows plainly as active/queued hid the
+          fact that their last send didn't land. This override is DERIVED from
+          "has a later sent/requeued superseded the failure," so it clears
+          itself the instant the next drain delivers — a recipient is still
+          never durably frozen "in a failed state" the way they can durably be
+          bounced/replied/done. Gated on the base status being active/queued
+          so it can never shadow a real bounced/replied/done resting state.
     - date: first_sent_at if set, else last_event_at — covers a
       queued-but-never-sent recipient (whose first_sent_at is always None)
       with their queued timestamp instead of leaving them dateless.
@@ -1733,6 +1780,7 @@ def reachouts_rows(conn) -> list:
     already_corrected_map = _already_corrected_to(conn)
     linkedin_replied_map = linkedin_replied_state(conn)
     linkedin_replied_at_map = linkedin_replied_at(conn)
+    pending_retry = _pending_retry_recipients(conn)
     rows = conn.execute("SELECT * FROM recipients").fetchall()
 
     result = []
@@ -1748,6 +1796,8 @@ def reachouts_rows(conn) -> list:
         status = row["status"]
         if row["first_sent_at"] is None and status == "active":
             status = "queued"
+        if status in ("active", "queued") and recipient in pending_retry:
+            status = "pending_retry"
 
         ooo_resume_date = None
         if status == "ooo_requeued":

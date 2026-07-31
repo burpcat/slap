@@ -228,9 +228,9 @@ python slap.py send my-campaign
 5. **Preview** — the exact rendered subject + body, the attachment name (or which archived
    résumé you chose to reuse, if you did), and the cadence that will actually be staged
    (reflecting your answer to the previous prompt). Nothing is sent yet.
-6. **`Stage this send? [y/N]`** — `y` writes a `queued` event and staged message data to
-   `workdir/`; the recipient now sits in the queue until the runner (or `--now`) drains
-   it. `n` discards this recipient.
+6. **`Stage this send? [Y/n]`** — defaults to **yes** (a bare Enter stages): writes a
+   `queued` event and staged message data to `workdir/`; the recipient now sits in the
+   queue until the runner (or `--now`) drains it. An explicit `n` discards this recipient.
 6. **`Add another? [Y/n]`** — loops back to step 1 for the next recipient, or exits.
 
 Add `--now` to also drain the queue immediately after staging, instead of waiting for
@@ -276,8 +276,9 @@ shadowed by it, so don't name a real campaign `custom`. The flow:
    - Write a LaTeX résumé right now (the same compile loop + the app's one hard gate, a
      forced confirmation past one page).
    - No attachment at all.
-5. **Dedup warnings** (hard/soft), a preview, and a `Stage this custom send? [y/N]`
-   confirm — same shape and same warn-don't-block behavior as a normal `send`.
+5. **Dedup warnings** (hard/soft), a preview, and a `Stage this custom send? [Y/n]`
+   confirm (defaults to **yes**, same as a normal `send`) — same shape and same
+   warn-don't-block behavior.
 
 A custom send is staged and drained through the exact same queue/runner machinery as any
 other campaign, tagged internally with a reserved campaign label (`__custom__`) that never

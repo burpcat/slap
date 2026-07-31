@@ -271,7 +271,9 @@ def cmd_send_custom(args):
     display.preview_panel(recipient, subject, body)
     print(f"Attachment: {attachment_name if attachment_name else '(none)'}")
     print(f"Cadence (custom): {cadence}" if cadence else "Cadence: initial send only (no follow-ups)")
-    if input("\nStage this custom send? [y/N]: ").strip().lower() != "y":
+    # Defaults to YES, same as the normal `send` flow: preview + dedup are
+    # already behind us, so a bare Enter stages; only an explicit n/no skips.
+    if input("\nStage this custom send? [Y/n]: ").strip().lower() in ("n", "no"):
         print("Skipped.")
         return
 
@@ -455,7 +457,10 @@ def _prep_one_recipient(conn, campaign, consumer_domains, values, recipient, arc
               f"{'s' if followup_count != 1 else ''}, persona={campaign.persona} "
               f"default is {campaign.cadence})")
 
-    if read_line("\nStage this send? [y/N]: ").strip().lower() != "y":
+    # Defaults to YES: by this point the drop has been pasted, previewed, and
+    # any dedup/résumé warnings cleared — staging is the expected next step, so
+    # a bare Enter proceeds; only an explicit n/no skips this recipient.
+    if read_line("\nStage this send? [Y/n]: ").strip().lower() in ("n", "no"):
         print("Skipped.")
         return
 

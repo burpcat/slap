@@ -24,6 +24,7 @@ from slap.dashboard import (
     bounce_breakdown, bounces, companies_contacted, compute_gmass_dependent_data, create_app,
     engagement_intelligence, event_display, filter_reachouts, follow_up_aging, follow_up_reminders,
     gate_linkedin, get_gmass_dependent_data, linkedin_replied_at, needs_triage, next_drain,
+    _pending_retry_recipients,
     pipeline, reachouts_rows,
     read_log_tail,
     recent_events, reply_tags, sent_reply_trend, stop_outreach, stopped_outreach_roster,
@@ -2027,6 +2028,61 @@ def test_reachouts_rows_status_queued_vs_active(conn):
     rows = {r["recipient"]: r for r in reachouts_rows(conn)}
     assert rows["sent@x.com"]["status"] == "active"
     assert rows["queued@x.com"]["status"] == "queued"
+
+
+# --- reachouts_rows: pending-retry (send_failed) display status ----------------
+
+def test_pending_retry_recipients_latest_attempt_failed(conn):
+    # sent then a LATER send_failed on the next stage -> awaiting retry.
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter", send=True)
+    append_event(conn, type="send_failed", recipient="a@x.com", campaign="c", stage=1)
+    assert _pending_retry_recipients(conn) == {"a@x.com"}
+
+
+def test_pending_retry_recipients_clears_after_a_later_success(conn):
+    # A send_failed superseded by a LATER successful send is no longer pending.
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter", send=False)
+    append_event(conn, type="send_failed", recipient="a@x.com", campaign="c", stage=0)
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=0, gmass_campaign_id="1")
+    assert _pending_retry_recipients(conn) == set()
+
+
+def test_reachouts_rows_status_pending_retry_after_send_failed(conn):
+    # A previously-sent recipient whose next-stage send failed shows as
+    # 'pending_retry' (not 'active') with a serious "Retry pending" chip.
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter", send=True)
+    append_event(conn, type="send_failed", recipient="a@x.com", campaign="c", stage=1)
+    row = {r["recipient"]: r for r in reachouts_rows(conn)}["a@x.com"]
+    assert row["status"] == "pending_retry"
+    assert row["chip"] == {"color": "serious", "label": "Retry pending"}
+
+
+def test_reachouts_rows_pending_retry_overrides_queued_on_never_sent_stage(conn):
+    # A first-stage send that fails before ANY send lands (first_sent_at still
+    # NULL) reads as 'pending_retry', not the bare 'queued' it would otherwise.
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter", send=False)
+    append_event(conn, type="send_failed", recipient="a@x.com", campaign="c", stage=0)
+    row = {r["recipient"]: r for r in reachouts_rows(conn)}["a@x.com"]
+    assert row["status"] == "pending_retry"
+
+
+def test_reachouts_rows_pending_retry_clears_once_the_retry_lands(conn):
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter", send=False)
+    append_event(conn, type="send_failed", recipient="a@x.com", campaign="c", stage=0)
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=0, gmass_campaign_id="1")
+    row = {r["recipient"]: r for r in reachouts_rows(conn)}["a@x.com"]
+    assert row["status"] == "active"
+
+
+def test_reachouts_rows_pending_retry_never_shadows_a_terminal_state(conn):
+    # If a reply lands after a send_failed, the resting 'replied' state wins —
+    # the pending_retry override is gated on the base status being active/queued.
+    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter", send=True)
+    append_event(conn, type="send_failed", recipient="a@x.com", campaign="c", stage=1)
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
+    row = {r["recipient"]: r for r in reachouts_rows(conn)}["a@x.com"]
+    assert row["status"] == "replied"
+    assert row["chip"] == {"color": "good", "label": "Replied"}
 
 
 def test_reachouts_rows_engagement_replied_beats_clicked(conn):

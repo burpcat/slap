@@ -195,7 +195,7 @@ function RowActions({ row, colors }: { row: ReachoutRow; colors: Record<string, 
               always-present triage buttons below stay pinned to the right edge:
               the cell is right-aligned, so a row that loses its Stop button no
               longer shifts Real/Not/OOO/in out of column alignment (Image #20). */}
-          {!row.stopped && row.status === 'active' && (
+          {!row.stopped && (row.status === 'active' || row.status === 'pending_retry') && (
             <ConfirmPopover
               message={`Stop all further outreach to ${row.recipient}?`}
               confirmLabel="Stop"
