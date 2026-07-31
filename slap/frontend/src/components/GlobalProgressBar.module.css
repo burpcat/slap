@@ -1,0 +1,57 @@
+/* Slim top-of-page refresh bar. Fixed to the top edge (above the header's
+   z-index) so toggling it never shifts page layout. Idle by default (opacity 0);
+   `.active` fades it in and starts the indeterminate slide. */
+.bar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  z-index: 100;
+  overflow: hidden;
+  pointer-events: none;
+  background: color-mix(in oklab, var(--series-1) 12%, transparent);
+  opacity: 0;
+  transition: opacity 150ms ease-out;
+}
+.active {
+  opacity: 1;
+}
+
+/* The moving segment: a partial-width sliver of the brand accent that sweeps
+   left -> right on transform (GPU-friendly, same discipline as the brand
+   shimmer in Layout.module.css). Only animates while the bar is `.active`. */
+.indicator {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 40%;
+  background: var(--series-1);
+  border-radius: 0 2px 2px 0;
+}
+.active .indicator {
+  animation: slide 1.1s ease-in-out infinite;
+}
+
+@keyframes slide {
+  0% {
+    transform: translateX(-100%);
+  }
+  50% {
+    transform: translateX(150%);
+  }
+  100% {
+    transform: translateX(400%);
+  }
+}
+
+/* Reduced motion: global.css already near-zeros the slide animation, so fall
+   back to a static full-width fill that still signals "refreshing" (in/out via
+   the opacity transition, no horizontal motion). */
+@media (prefers-reduced-motion: reduce) {
+  .indicator {
+    width: 100%;
+    animation: none;
+  }
+}
