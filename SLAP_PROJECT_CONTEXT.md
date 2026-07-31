@@ -316,11 +316,16 @@ treats a missing key as blank/unknown, never fabricates one):
   event-level columns.
 
 **Real `recipients.status` vocabulary is `active`/`done`/`replied`/`bounced`/
-`ooo_requeued`/`stopped` only** — there is no `queued`/`sent`/`failed` status. "Queued"
-(staged, never actually sent) is *derived*, not stored: `status = 'active' AND
-first_sent_at IS NULL`. There is deliberately no `failed` status either — `send_failed`
-is a transient per-attempt event, always retried by the next drain, never a durable
-resting state. `stopped` (§8: Stop outreach) is the newest addition — it's what actually
+`ooo_requeued`/`stopped` only** — there is no stored `queued`/`sent`/`failed`/
+`pending_retry` status. Two DISPLAY statuses are *derived* live for the Reach-outs page,
+never stored: "queued" (staged, never actually sent) = `status = 'active' AND
+first_sent_at IS NULL`, and "pending_retry" = the recipient's latest send attempt was a
+`send_failed` with no later `sent`/`requeued` (see `_pending_retry_recipients()`), shown
+in place of active/queued so an awaiting-retry row doesn't read as if it sent cleanly.
+There is still deliberately no stored `failed` status — `send_failed` is a transient
+per-attempt event, always retried by the next drain, and remains cache-inert; the
+`pending_retry` display self-clears the instant a later successful send lands, so it's a
+derived view of the log, not a durable resting state. `stopped` (§8: Stop outreach) is the newest addition — it's what actually
 removes a recipient from `due_recipients()`/`due_for_ooo_resend()`/`pipeline()`'s
 followups_scheduled (all three already filter FOR `active`/`ooo_requeued`, so nothing
 about those queries had to change), but it is NOT what the dashboard's Active Leads/

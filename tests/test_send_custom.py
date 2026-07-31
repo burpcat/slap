@@ -110,6 +110,24 @@ def test_send_custom_no_attachment_stages(tmp_path):
     assert rows[0]["campaign"] == "__custom__"
 
 
+def test_send_custom_stage_confirm_defaults_to_yes(tmp_path):
+    # The "Stage this custom send?" prompt defaults to YES — a bare Enter (empty
+    # line) at the confirm stages the recipient rather than skipping.
+    editor = _fake_editor(tmp_path)
+    _write_config(tmp_path, editor)
+    # recipient, no follow-up, attachment mode 4 (none), confirm = bare Enter
+    stdin = "jane@acme.com\nn\n4\n\n"
+    result = _run("send", "custom", cwd=tmp_path, stdin=stdin)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Staged jane@acme.com (custom send)." in result.stdout
+    assert "Skipped." not in result.stdout
+
+    conn = connect(tmp_path / "slap.db")
+    assert conn.execute(
+        "SELECT COUNT(*) FROM events WHERE type='queued' AND recipient='jane@acme.com'"
+    ).fetchone()[0] == 1
+
+
 def test_send_custom_with_one_followup_records_custom_cadence(tmp_path):
     editor = _fake_editor(tmp_path)
     _write_config(tmp_path, editor)
