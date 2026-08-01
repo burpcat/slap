@@ -23,13 +23,13 @@
   font-size: 0.75rem;
   font-weight: 500;
 }
-.stale { background: color-mix(in oklab, var(--warning) 22%, var(--surface-1)); color: var(--text-primary); }
-.unavailable { background: color-mix(in oklab, var(--critical) 18%, var(--surface-1)); color: var(--text-primary); }
+.stale { background: var(--warning-tint); color: var(--text-primary); }
+.unavailable { background: var(--critical-tint); color: var(--text-primary); }
 .freshDot { color: var(--good); }
 
 .warning {
   padding: 8px 32px;
-  background: color-mix(in oklab, var(--warning) 14%, var(--surface-1));
+  background: var(--warning-tint);
   border-bottom: 1px solid var(--warning);
   font-size: 0.85rem;
   color: var(--text-primary);

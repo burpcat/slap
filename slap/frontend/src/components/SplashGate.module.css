@@ -44,7 +44,7 @@
   border-radius: 8px;
   border: 1px solid var(--series-1);
   background: var(--series-1);
-  color: #ffffff;
+  color: var(--text-on-accent);
   cursor: pointer;
   font-weight: 600;
 }

@@ -27,7 +27,7 @@ from slap.dashboard import (
     _pending_retry_recipients,
     pipeline, reachouts_rows,
     read_log_tail,
-    recent_events, reply_tags, sent_reply_trend, stop_outreach, stopped_outreach_roster,
+    recent_events, recipient_timeline, reply_tags, sent_reply_trend, stop_outreach, stopped_outreach_roster,
     sync_reports, tag_reply, template_failures, this_week, today_strip, todays_runs,
     visible_warm_but_silent, warm_but_silent, weekly_goal_progress,
 )
@@ -478,7 +478,8 @@ def _fresh_cache_entry(**overrides):
         "cached_at": datetime.now(timezone.utc).isoformat(),
         "sync_result": {"synced_at": "2026-01-01T00:00:00+00:00", "new_replies": 0,
                         "new_clicks": 0, "new_bounces": 0, "errors": []},
-        "engagement": {"reply_rate_by_persona": {}, "reply_by_stage": {}, "click_by_stage": {},
+        "engagement": {"reply_rate_by_persona": {}, "reply_rate_by_campaign": {},
+                       "reply_by_stage": {}, "click_by_stage": {},
                        "time_to_first_reply": {"same_day": 0, "1_2_days": 0, "3_7_days": 0, "8_plus_days": 0},
                        "has_data": False},
         "warm_but_silent": [], "bounces": [], "replies": [],
@@ -490,6 +491,7 @@ def _fresh_cache_entry(**overrides):
 def test_get_gmass_dependent_data_fresh_cache_makes_zero_gmass_calls(conn, db_path):
     client = FakeRedis()
     gmass_cache.write_cache(client, _fresh_cache_entry(engagement={"has_data": True, "reply_rate_by_persona": {},
+                                                                    "reply_rate_by_campaign": {},
                                                                     "reply_by_stage": {}, "click_by_stage": {},
                                                                     "time_to_first_reply": {}}))
     with patch("slap.dashboard.gmass.get_reports") as mock_get:
@@ -664,6 +666,36 @@ def test_reply_rate_by_persona_survives_a_later_ooo_resend(conn):
     append_event(conn, type="requeued", recipient="a@x.com", campaign="c", stage=1, gmass_campaign_id="1")
     result = engagement_intelligence(conn)
     assert result["reply_rate_by_persona"]["recruiter"] == 100.0
+
+
+def test_reply_rate_by_campaign(conn):
+    # campaign rides directly on every event (and recipients.campaign), so no
+    # meta persona lookup is needed -- two recruited into campaign "c", one
+    # replied -> 50%.
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
+    append_event(conn, type="queued", recipient="b@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
+    result = engagement_intelligence(conn)
+    assert result["reply_rate_by_campaign"]["c"] == 50.0
+
+
+def test_reply_rate_by_campaign_splits_across_campaigns(conn):
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c1", stage=0, meta={"persona": "recruiter"})
+    append_event(conn, type="queued", recipient="b@x.com", campaign="c2", stage=0, meta={"persona": "recruiter"})
+    append_event(conn, type="reply", recipient="b@x.com", campaign="c2")
+    result = engagement_intelligence(conn)
+    assert result["reply_rate_by_campaign"] == {"c1": 0.0, "c2": 100.0}
+
+
+def test_reply_rate_by_campaign_survives_a_later_ooo_resend(conn):
+    # Same events-not-status subtlety as the persona rate: a repliER later
+    # requeued back to 'active' must still count as replied.
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
+    append_event(conn, type="ooo_tagged", recipient="a@x.com", campaign="c")
+    append_event(conn, type="requeued", recipient="a@x.com", campaign="c", stage=1, gmass_campaign_id="1")
+    result = engagement_intelligence(conn)
+    assert result["reply_rate_by_campaign"]["c"] == 100.0
 
 
 def test_reply_and_click_by_stage(conn):
@@ -2605,5 +2637,98 @@ def test_read_log_tail_returns_last_n_lines_newest_first(tmp_path):
 
 def test_read_log_tail_missing_file_returns_empty_list(tmp_path):
     assert read_log_tail(tmp_path / "does-not-exist.log") == []
+
+
+# --- recipient_timeline (Lifecycle page) ------------------------------------
+
+def test_recipient_timeline_unknown_recipient_returns_none(conn):
+    assert recipient_timeline(conn, "nobody@x.com") is None
+
+
+def test_recipient_timeline_orders_recorded_events_and_maps_click(conn):
+    # No cadence in meta -> no inferred markers, so we assert on the pure
+    # recorded stream: queued -> sent -> click -> reply, in order.
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter"}, timestamp=_ts(0, 9))
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=0, timestamp=_ts(0, 10))
+    click_iso = _ts(1).isoformat()
+    append_event(conn, type="click", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"url": "https://x/demo", "click_time": click_iso}, timestamp=_ts(1, 11))
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c",
+                 meta={"reply_time": _ts(2).isoformat()}, timestamp=_ts(2))
+
+    result = recipient_timeline(conn, "a@x.com")
+    assert result["recipient"] == "a@x.com"
+    assert result["campaign"] == "c"
+    kinds = [(n["type"], n["kind"]) for n in result["timeline"]]
+    assert kinds == [("queued", "event"), ("sent", "event"), ("click", "event"), ("reply", "event")]
+
+    click_node = next(n for n in result["timeline"] if n["type"] == "click")
+    assert click_node["chip"] == "neutral"            # 'chip-' prefix stripped
+    assert click_node["detail"] == "https://x/demo"   # url surfaced by event_display
+    assert click_node["meta"]["url"] == "https://x/demo"
+    assert click_node["time"] == click_iso            # GMass click_time preferred over append ts
+    sent_node = next(n for n in result["timeline"] if n["type"] == "sent")
+    assert sent_node["chip"] == "good"
+
+
+def test_recipient_timeline_infers_followup_stages_from_cadence(conn):
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter", "cadence": [2, 4, 6]}, timestamp=_ts(0, 9))
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=0, timestamp=_ts(0, 10))
+
+    result = recipient_timeline(conn, "a@x.com")
+    inferred = [n for n in result["timeline"] if n["inferred"]]
+    assert [n["stage"] for n in inferred] == [1, 2, 3]
+    assert all(n["type"] == "sent" and n["kind"] == "inferred" for n in inferred)
+    # Stage N fires sum(cadence[:N]) days after the first send: 2, 6, 12.
+    assert inferred[0]["time"].startswith("2026-01-17")  # _ts(0) day 15 + 2
+    assert inferred[1]["time"].startswith("2026-01-21")  # + 6
+    assert inferred[2]["time"].startswith("2026-01-27")  # + 12
+    # All in the past relative to the real "now", so none marked scheduled.
+    assert all(n["scheduled"] is False for n in inferred)
+
+
+def test_recipient_timeline_inference_caps_at_terminal_reply(conn):
+    # Reply on day 3 halts the GMass cadence: stage 1 (day 2, before) survives,
+    # stages 2 (day 6) and 3 (day 12) are suppressed as they'd be fiction.
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter", "cadence": [2, 4, 6]}, timestamp=_ts(0, 9))
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=0, timestamp=_ts(0, 10))
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c", timestamp=_ts(3))
+
+    result = recipient_timeline(conn, "a@x.com")
+    inferred_stages = [n["stage"] for n in result["timeline"] if n["inferred"]]
+    assert inferred_stages == [1]
+
+
+def test_recipient_timeline_skips_inferred_stage_with_a_real_requeue(conn):
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter", "cadence": [2, 4, 6]}, timestamp=_ts(0, 9))
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=0, timestamp=_ts(0, 10))
+    append_event(conn, type="requeued", recipient="a@x.com", campaign="c", stage=1,
+                 gmass_campaign_id="9", timestamp=_ts(1))
+
+    result = recipient_timeline(conn, "a@x.com")
+    inferred_stages = [n["stage"] for n in result["timeline"] if n["inferred"]]
+    assert inferred_stages == [2, 3]  # stage 1 covered by the real requeue
+
+
+def test_recipient_timeline_no_cadence_no_first_sent_yields_no_inferred(conn):
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter"}, timestamp=_ts(0))
+    result = recipient_timeline(conn, "a@x.com")
+    assert [n for n in result["timeline"] if n["inferred"]] == []
+
+
+def test_recipient_timeline_future_stage_marked_scheduled(conn):
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter", "cadence": [2, 4, 6]}, timestamp=_ts(0, 9))
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=0, timestamp=_ts(0, 10))
+    # Freeze "now" one day after the first send: stage 1 (day 2) is still in the
+    # future -> scheduled; a very old anchor would otherwise read all as past.
+    result = recipient_timeline(conn, "a@x.com", now=_ts(1))
+    inferred = [n for n in result["timeline"] if n["inferred"]]
+    assert inferred[0]["stage"] == 1 and inferred[0]["scheduled"] is True
 
 

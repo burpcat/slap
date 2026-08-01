@@ -108,7 +108,7 @@
   margin-left: 6px;
   border-radius: 8px;
   background: var(--critical);
-  color: #ffffff;
+  color: var(--text-on-accent);
   font-size: 0.65rem;
   font-weight: 700;
 }

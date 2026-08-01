@@ -9,7 +9,7 @@
 
 .good { background: var(--good); color: var(--ink-on-status); }
 .serious { background: var(--serious); color: var(--ink-on-status); }
-.critical { background: var(--critical); color: #ffffff; }
+.critical { background: var(--critical); color: var(--text-on-accent); }
 .warning { background: var(--warning); color: var(--ink-on-status); }
 .neutral { background: var(--hairline); color: var(--text-primary); }
 

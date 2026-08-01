@@ -16,7 +16,7 @@
 .primary {
   background: var(--series-1);
   border-color: var(--series-1);
-  color: #ffffff;
+  color: var(--text-on-accent);
 }
 .primary:hover { filter: brightness(1.08); }
 
@@ -24,7 +24,7 @@
   border-color: var(--critical);
   color: var(--critical);
 }
-.danger:hover { background: var(--critical); color: #ffffff; }
+.danger:hover { background: var(--critical); color: var(--text-on-accent); }
 
 .small {
   font-size: 0.75rem;

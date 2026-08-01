@@ -353,6 +353,7 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, api
                 "trend": dashboard.sent_reply_trend(conn, days=30),
                 "bounce_data": dashboard.bounce_breakdown(conn),
                 "reply_rate_by_persona": dashboard._reply_rate_by_persona(conn),
+                "reply_rate_by_campaign": dashboard._reply_rate_by_campaign(conn),
                 "time_to_first_reply": dashboard._time_to_first_reply_distribution(conn),
                 "weekly_goal": dashboard.weekly_goal_progress(conn, global_config.schedule.weekly_target),
             },
@@ -399,6 +400,15 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, api
         # table applies it as a CSS custom property, never a hardcoded hex.
         colors = {name: campaign_colors(name) for name in {r["campaign"] for r in rows if r["campaign"]}}
         return jsonify({"rows": rows, "total_count": len(rows), "campaign_colors": colors})
+
+    @app.route("/api/lifecycle/<string:recipient>")
+    def api_lifecycle_detail(recipient):
+        # One recipient's full lifecycle charter (Lifecycle page). The roster
+        # itself reuses /api/reachouts, so there's no list endpoint here.
+        data = dashboard.recipient_timeline(get_conn(), recipient, global_config=global_config)
+        if data is None:
+            return jsonify({"error": "unknown recipient"}), 404
+        return jsonify(data)
 
     @app.route("/api/logs")
     def api_logs():

@@ -142,6 +142,7 @@ export type CacheStatus = 'fresh' | 'stale_refreshing' | 'redis_unavailable';
 
 export interface EngagementIntelligence {
   reply_rate_by_persona: Record<string, number>;
+  reply_rate_by_campaign: Record<string, number>;
   reply_by_stage: Record<string, number>;
   click_by_stage: Record<string, number>;
   time_to_first_reply: {
@@ -233,6 +234,7 @@ export interface EngagementAnalytics {
   trend: TrendPoint[];
   bounce_data: BounceBreakdown;
   reply_rate_by_persona: Record<string, number>;
+  reply_rate_by_campaign: Record<string, number>;
   time_to_first_reply: EngagementIntelligence['time_to_first_reply'];
   weekly_goal: WeeklyGoalProgress | null;
 }
@@ -316,6 +318,34 @@ export interface ReachoutsResponse {
   rows: ReachoutRow[];
   total_count: number;
   campaign_colors: Record<string, CampaignColor>;
+}
+
+// --- /api/lifecycle/<recipient> --------------------------------------------------
+
+export interface LifecycleNode {
+  // 'event' = a recorded row from the events log; 'inferred' = a reconstructed
+  // GMass follow-up-send marker (never a real logged event).
+  kind: 'event' | 'inferred';
+  id?: number;
+  type: string;
+  stage: number | null;
+  time: string; // ISO — the event's most accurate instant (GMass time when known)
+  label: string;
+  chip: string; // 'good' | 'serious' | 'critical' | 'neutral'
+  detail: string;
+  meta?: Record<string, unknown>;
+  inferred: boolean;
+  scheduled?: boolean; // inferred markers only: true if the estimated send is still in the future
+}
+
+export interface LifecycleDetail {
+  recipient: string;
+  campaign: string;
+  persona: string | null;
+  status: string;
+  cadence: number[] | null;
+  first_sent_at: string | null;
+  timeline: LifecycleNode[];
 }
 
 // --- /api/logs ------------------------------------------------------------------

@@ -10,6 +10,7 @@ import type {
   CommandsResponse,
   EngagementResponse,
   HomeResponse,
+  LifecycleDetail,
   LinkedinRepliedBody,
   LogsResponse,
   NavResponse,
@@ -53,6 +54,14 @@ export function useCampaignSlice(campaign: string | null) {
 
 export function useReachouts() {
   return useQuery({ queryKey: ['reachouts'], queryFn: () => apiGet<ReachoutsResponse>('/api/reachouts') });
+}
+
+export function useLifecycleDetail(recipient: string | null) {
+  return useQuery({
+    queryKey: ['lifecycle', recipient],
+    queryFn: () => apiGet<LifecycleDetail>(`/api/lifecycle/${encodeURIComponent(recipient as string)}`),
+    enabled: recipient !== null,
+  });
 }
 
 export function useLogs(limit = 500) {

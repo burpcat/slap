@@ -363,6 +363,30 @@ def _reply_rate_by_persona(conn) -> dict:
     }
 
 
+def _reply_rate_by_campaign(conn) -> dict:
+    # Mirror of _reply_rate_by_persona keyed on campaign instead. Simpler,
+    # because `campaign` is a first-class column on `recipients` (always
+    # populated for a contacted recipient) rather than riding in a queued
+    # event's meta the way persona does -- so no persona-style meta lookup.
+    campaign_totals: dict = {}
+    campaign_of: dict = {}
+    for row in conn.execute("SELECT recipient, campaign FROM recipients WHERE campaign IS NOT NULL"):
+        campaign_totals[row["campaign"]] = campaign_totals.get(row["campaign"], 0) + 1
+        campaign_of[row["recipient"]] = row["campaign"]
+
+    campaign_replied: dict = {}
+    replied_recipients = {r["recipient"] for r in conn.execute("SELECT DISTINCT recipient FROM events WHERE type = 'reply'")}
+    for recipient in replied_recipients:
+        campaign = campaign_of.get(recipient)
+        if campaign:
+            campaign_replied[campaign] = campaign_replied.get(campaign, 0) + 1
+
+    return {
+        campaign: round(100 * campaign_replied.get(campaign, 0) / total, 1)
+        for campaign, total in campaign_totals.items()
+    }
+
+
 def _time_to_first_reply_distribution(conn) -> dict:
     rows = conn.execute(
         "SELECT first_sent_at, replied_at FROM recipients "
@@ -386,6 +410,7 @@ def _time_to_first_reply_distribution(conn) -> dict:
 
 def engagement_intelligence(conn) -> dict:
     reply_rate_by_persona = _reply_rate_by_persona(conn)
+    reply_rate_by_campaign = _reply_rate_by_campaign(conn)
     reply_by_stage = _count_by_stage(conn, "reply")
     click_by_stage = _count_by_stage(conn, "click")
     time_to_first_reply = _time_to_first_reply_distribution(conn)
@@ -395,11 +420,13 @@ def engagement_intelligence(conn) -> dict:
     # real data — it means recipients have actually been contacted, so a 0%
     # rate is informative, not a fabricated placeholder.
     has_data = (
-        bool(reply_rate_by_persona) or any(reply_by_stage.values())
+        bool(reply_rate_by_persona) or bool(reply_rate_by_campaign)
+        or any(reply_by_stage.values())
         or any(click_by_stage.values()) or any(time_to_first_reply.values())
     )
     return {
         "reply_rate_by_persona": reply_rate_by_persona,
+        "reply_rate_by_campaign": reply_rate_by_campaign,
         "reply_by_stage": reply_by_stage,
         "click_by_stage": click_by_stage,
         "time_to_first_reply": time_to_first_reply,
@@ -1984,7 +2011,8 @@ def _empty_gmass_data() -> dict:
         "cached_at": None,
         "sync_result": {"synced_at": None, "new_replies": 0, "new_clicks": 0, "new_bounces": 0, "errors": []},
         "engagement": {
-            "reply_rate_by_persona": {}, "reply_by_stage": {}, "click_by_stage": {},
+            "reply_rate_by_persona": {}, "reply_rate_by_campaign": {},
+            "reply_by_stage": {}, "click_by_stage": {},
             "time_to_first_reply": {"same_day": 0, "1_2_days": 0, "3_7_days": 0, "8_plus_days": 0},
             "has_data": False,
         },
@@ -2168,7 +2196,143 @@ def event_display(ev: dict) -> dict:
                 "detail": meta.get("bounce_reason", "") or ""}
     if t == "stopped":
         return {"label": "Stopped outreach", "chip": "chip-serious", "detail": meta.get("scope", "") or ""}
+    if t == "linkedin_gate":
+        return {"label": "LinkedIn reply-gate", "chip": "chip-serious",
+                "detail": meta.get("channel", "") or ""}
     return {"label": t, "chip": "chip-neutral", "detail": ""}  # future/unknown type — never crash
+
+
+# --- Lifecycle: one recipient's full journey (Lifecycle page) --------------
+
+# Events that halt the GMass follow-up cadence: once any of these lands, GMass
+# fires no further stages, so inferred follow-up-send markers past this point
+# would be fiction. Used to cap the inferred timeline (see recipient_timeline).
+_CADENCE_TERMINAL_TYPES = ("reply", "bounce", "stopped", "linkedin_gate")
+
+
+def recipient_timeline(conn, recipient: str, *, global_config=None, now: datetime = None) -> dict | None:
+    """One recipient's whole lifecycle as an ordered timeline, for the
+    Lifecycle page's charter. Returns None if the recipient was never staged
+    (not in the derived `recipients` cache) — the route turns that into a 404.
+
+    Two kinds of node, merged and time-sorted:
+
+    - RECORDED events — every row of `events` for this recipient, in true
+      append order, enriched with the SAME event_display() label/chip/detail
+      the Logs page uses (chip's `chip-` prefix stripped to the StatusChip
+      color vocabulary the React app renders). `time` is the event's most
+      accurate instant — GMass's own click/reply/bounce time from `meta` when
+      present, else the append `timestamp`.
+
+    - INFERRED follow-up-send markers — regular follow-up stages (1..N) are
+      fired by GMass itself and are NOT recorded as events (SLAP only writes a
+      `sent` for stage 0 and `requeued` for OOO resends). So the "next stage
+      sent" milestones the charter wants are reconstructed from the recipient's
+      cadence + first-send date (the SAME `sum(cadence[:stage])` day-offset the
+      follow-up scheduler uses), flagged `inferred: True` and never conflated
+      with recorded sends. A stage that already has a real send/requeue is not
+      re-inferred, and inference stops at the first cadence-terminal event
+      (reply/bounce/stop/linkedin-gate) since GMass halts the cadence there."""
+    rec = conn.execute(
+        "SELECT campaign, persona, status, current_stage, first_sent_at, cadence "
+        "FROM recipients WHERE recipient = ?", (recipient,)
+    ).fetchone()
+    if rec is None:
+        return None
+
+    now = now or datetime.now(timezone.utc)
+    events = conn.execute(
+        "SELECT id, timestamp, type, recipient, campaign, stage, "
+        "gmass_campaign_id, gmass_draft_id, meta FROM events "
+        "WHERE recipient = ? ORDER BY id ASC", (recipient,)
+    ).fetchall()
+
+    nodes = []
+    real_send_stages = set()
+    terminal_dt = None
+    for ev in events:
+        meta = json.loads(ev["meta"]) if ev["meta"] else {}
+        if ev["type"] in ("sent", "requeued") and ev["stage"] is not None:
+            real_send_stages.add(ev["stage"])
+        # The event's authoritative instant: GMass's own click/reply/bounce time
+        # when present (falling back to the append `timestamp` if it's absent or
+        # unparseable). Used for BOTH ordering and the terminal cap so the
+        # inferred-marker cutoff and the visible order agree with the shown time,
+        # and so a follow-up GMass actually suppressed (a reply that arrived
+        # before its estimated send but was synced after it) is never emitted.
+        display_time = (meta.get("click_time") or meta.get("reply_time")
+                        or meta.get("bounce_time") or ev["timestamp"])
+        ev_dt = _parse_utc(display_time) or _parse_utc(ev["timestamp"])
+        if ev["type"] in _CADENCE_TERMINAL_TYPES and ev_dt is not None:
+            if terminal_dt is None or ev_dt < terminal_dt:
+                terminal_dt = ev_dt
+        display = event_display({"type": ev["type"], "meta": meta})
+        nodes.append({
+            "sort": ev_dt or now,
+            "node": {
+                "kind": "event",
+                "id": ev["id"],
+                "type": ev["type"],
+                "stage": ev["stage"],
+                "time": display_time,
+                "label": display["label"],
+                "chip": display["chip"].removeprefix("chip-"),
+                "detail": display["detail"],
+                "meta": meta,
+                "inferred": False,
+            },
+        })
+
+    # Inferred follow-up-send markers from the cadence.
+    cadence = json.loads(rec["cadence"]) if rec["cadence"] else None
+    if cadence is None and global_config is not None:
+        cadence = global_config.personas.get(rec["persona"])
+    first_sent_dt = _parse_utc(rec["first_sent_at"])
+    if cadence and first_sent_dt is not None:
+        for stage in range(1, len(cadence) + 1):
+            if stage in real_send_stages:
+                continue  # a real send/requeue already covers this stage
+            est_dt = first_sent_dt + timedelta(days=sum(cadence[:stage]))
+            if terminal_dt is not None and est_dt >= terminal_dt:
+                break  # cadence halted at the terminal event — no later sends
+            nodes.append({
+                "sort": est_dt,
+                "node": {
+                    "kind": "inferred",
+                    "type": "sent",
+                    "stage": stage,
+                    "time": est_dt.isoformat(),
+                    "label": f"Follow-up {stage}",
+                    "chip": "neutral",
+                    "detail": "",
+                    "inferred": True,
+                    "scheduled": est_dt > now,  # future estimate vs already-past
+                },
+            })
+
+    # Sort by instant; on a tie a recorded event precedes an inferred marker.
+    nodes.sort(key=lambda n: (n["sort"], n["node"]["inferred"]))
+    return {
+        "recipient": recipient,
+        "campaign": rec["campaign"],
+        "persona": rec["persona"],
+        "status": rec["status"],
+        "cadence": cadence,
+        "first_sent_at": rec["first_sent_at"],
+        "timeline": [n["node"] for n in nodes],
+    }
+
+
+def _parse_utc(value):
+    """ISO string (as stored in events/recipients) -> aware UTC datetime, or
+    None. Naive strings are assumed UTC (that's how they were written)."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
 
 
 def read_log_tail(path: Path, *, n_lines: int = 200) -> list:
