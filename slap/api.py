@@ -401,6 +401,15 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, api
         colors = {name: campaign_colors(name) for name in {r["campaign"] for r in rows if r["campaign"]}}
         return jsonify({"rows": rows, "total_count": len(rows), "campaign_colors": colors})
 
+    @app.route("/api/lifecycle/<string:recipient>")
+    def api_lifecycle_detail(recipient):
+        # One recipient's full lifecycle charter (Lifecycle page). The roster
+        # itself reuses /api/reachouts, so there's no list endpoint here.
+        data = dashboard.recipient_timeline(get_conn(), recipient, global_config=global_config)
+        if data is None:
+            return jsonify({"error": "unknown recipient"}), 404
+        return jsonify(data)
+
     @app.route("/api/logs")
     def api_logs():
         # Mirrors logs_page() exactly -- same LIMIT-not-pagination

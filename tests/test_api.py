@@ -270,6 +270,26 @@ def test_api_reachouts_returns_rows_and_total_count(app, tmp_path):
     assert body["rows"][0]["recipient"] == "a@x.com"
 
 
+def test_api_lifecycle_detail_returns_timeline_for_known_recipient(app, tmp_path):
+    conn = connect(tmp_path / "test.db")
+    seed_sent_recipient(conn, recipient="a@x.com", campaign="c")
+    conn.close()
+
+    resp = app.test_client().get("/api/lifecycle/a@x.com")
+    assert resp.status_code == 200
+    body = resp.get_json()
+    for key in ("recipient", "campaign", "persona", "status", "cadence", "first_sent_at", "timeline"):
+        assert key in body, key
+    assert body["recipient"] == "a@x.com"
+    assert [n["type"] for n in body["timeline"]][:2] == ["queued", "sent"]
+
+
+def test_api_lifecycle_detail_unknown_recipient_404(app):
+    resp = app.test_client().get("/api/lifecycle/nobody@x.com")
+    assert resp.status_code == 404
+    assert resp.get_json() == {"error": "unknown recipient"}
+
+
 def test_api_logs_returns_expected_keys(app):
     resp = app.test_client().get("/api/logs")
     assert resp.status_code == 200

@@ -320,6 +320,34 @@ export interface ReachoutsResponse {
   campaign_colors: Record<string, CampaignColor>;
 }
 
+// --- /api/lifecycle/<recipient> --------------------------------------------------
+
+export interface LifecycleNode {
+  // 'event' = a recorded row from the events log; 'inferred' = a reconstructed
+  // GMass follow-up-send marker (never a real logged event).
+  kind: 'event' | 'inferred';
+  id?: number;
+  type: string;
+  stage: number | null;
+  time: string; // ISO — the event's most accurate instant (GMass time when known)
+  label: string;
+  chip: string; // 'good' | 'serious' | 'critical' | 'neutral'
+  detail: string;
+  meta?: Record<string, unknown>;
+  inferred: boolean;
+  scheduled?: boolean; // inferred markers only: true if the estimated send is still in the future
+}
+
+export interface LifecycleDetail {
+  recipient: string;
+  campaign: string;
+  persona: string | null;
+  status: string;
+  cadence: number[] | null;
+  first_sent_at: string | null;
+  timeline: LifecycleNode[];
+}
+
 // --- /api/logs ------------------------------------------------------------------
 
 export interface LogEvent {

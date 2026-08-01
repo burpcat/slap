@@ -1,0 +1,202 @@
+/* Campaign filter pills — same shape as the Campaigns page selector. */
+.selector {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 20px;
+}
+.pill {
+  all: unset;
+  cursor: pointer;
+  padding: 6px 14px;
+  border-radius: 20px;
+  border: 1px solid var(--border);
+  background: var(--surface-1);
+  font-size: 0.85rem;
+  display: flex;
+  align-items: center;
+}
+.pillActive {
+  border-color: var(--series-1);
+  font-weight: 600;
+}
+
+/* Two-pane master/detail: roster left, charter right. Collapses to stacked
+   on narrow screens. */
+.split {
+  display: grid;
+  grid-template-columns: minmax(240px, 320px) 1fr;
+  gap: 20px;
+  align-items: start;
+}
+@media (max-width: 720px) {
+  .split {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* --- Roster (left) ------------------------------------------------------- */
+.roster {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 70vh;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px;
+  background: var(--surface-1);
+}
+.rosterRow {
+  all: unset;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 6px;
+}
+.rosterRow:hover {
+  background: var(--hairline);
+}
+.rosterRowActive {
+  background: var(--series-tint);
+}
+.statusDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+}
+.rosterMain {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.rosterEmail {
+  font-size: 0.85rem;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rosterCampaign {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+}
+
+/* --- Charter (right) ----------------------------------------------------- */
+.charter {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 20px 24px;
+  background: var(--surface-1);
+  min-height: 200px;
+}
+.charterHead {
+  margin-bottom: 20px;
+}
+.charterTitle {
+  margin: 0;
+  font-size: 1.1rem;
+}
+.charterMeta {
+  margin-top: 4px;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+
+/* Vertical timeline rail: a continuous line down the left, one node per row. */
+.timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.node {
+  position: relative;
+  display: grid;
+  grid-template-columns: 16px 1fr;
+  gap: 12px;
+  padding: 0 0 20px 4px;
+}
+/* the connecting line, drawn behind the dots */
+.node:not(:last-child)::before {
+  content: '';
+  position: absolute;
+  left: 11px;
+  top: 14px;
+  bottom: 0;
+  width: 2px;
+  background: var(--hairline);
+}
+.nodeDot {
+  width: 12px;
+  height: 12px;
+  margin-top: 3px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  border: 2px solid var(--surface-1);
+  z-index: 1;
+}
+.nodeDot[data-chip='good'] { background: var(--good); }
+.nodeDot[data-chip='serious'] { background: var(--serious); }
+.nodeDot[data-chip='critical'] { background: var(--critical); }
+.nodeDot[data-chip='neutral'] { background: var(--series-1); }
+
+/* Inferred (reconstructed GMass follow-up) nodes read as estimates: hollow
+   dashed dot, muted text. Never mistaken for a recorded event. */
+.nodeInferred .nodeDot {
+  background: transparent;
+  border: 2px dashed var(--text-muted);
+}
+.nodeInferred .nodeLabel {
+  color: var(--text-secondary);
+}
+
+.nodeBody {
+  min-width: 0;
+}
+.nodeHead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.nodeLabel {
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+.inferredTag {
+  font-size: 0.68rem;
+  font-style: italic;
+  color: var(--text-muted);
+}
+.stageBadge {
+  font-size: 0.65rem;
+  padding: 1px 7px;
+  border-radius: 10px;
+  background: var(--hairline);
+  color: var(--text-secondary);
+}
+.nodeTime {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+.nodeDetail {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+}
+
+.empty {
+  color: var(--text-muted);
+  font-style: italic;
+  padding: 8px 0;
+}

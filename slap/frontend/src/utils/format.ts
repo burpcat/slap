@@ -42,3 +42,11 @@ export function shortDate(iso: string | null): string {
   const d = new Date(iso);
   return Number.isNaN(d.getTime()) ? '—' : d.toLocaleDateString();
 }
+
+/** Owner-local date + time, for timelines where the exact instant matters
+ * (e.g. a click). Returns "—" for null/empty or an unparseable value. */
+export function shortDateTime(iso: string | null): string {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? '—' : d.toLocaleString();
+}
