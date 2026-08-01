@@ -353,6 +353,7 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, api
                 "trend": dashboard.sent_reply_trend(conn, days=30),
                 "bounce_data": dashboard.bounce_breakdown(conn),
                 "reply_rate_by_persona": dashboard._reply_rate_by_persona(conn),
+                "reply_rate_by_campaign": dashboard._reply_rate_by_campaign(conn),
                 "time_to_first_reply": dashboard._time_to_first_reply_distribution(conn),
                 "weekly_goal": dashboard.weekly_goal_progress(conn, global_config.schedule.weekly_target),
             },

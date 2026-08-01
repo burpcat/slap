@@ -12,6 +12,7 @@ import { shortDate } from '../utils/format';
 import { TrendChart } from '../charts/TrendChart';
 import { BounceChart } from '../charts/BounceChart';
 import { PersonaReplyChart } from '../charts/PersonaReplyChart';
+import { CampaignReplyChart } from '../charts/CampaignReplyChart';
 import { TimeToReplyChart } from '../charts/TimeToReplyChart';
 import styles from './Engagement.module.css';
 
@@ -94,6 +95,14 @@ export default function Engagement() {
           )}
         </Card>
 
+        <Card title="Reply rate by campaign">
+          {data.engagement.has_data ? (
+            <PersonaBars rates={data.engagement.reply_rate_by_campaign} />
+          ) : (
+            <p className={styles.empty}>No engagement data yet.</p>
+          )}
+        </Card>
+
         <Card
           title={
             <>
@@ -124,6 +133,10 @@ export default function Engagement() {
 
         <Card title="Reply rate by persona (chart)">
           <PersonaReplyChart data={analytics.reply_rate_by_persona} theme={effective} />
+        </Card>
+
+        <Card title="Reply rate by campaign (chart)">
+          <CampaignReplyChart data={analytics.reply_rate_by_campaign} theme={effective} />
         </Card>
 
         <Card title="Time to first reply">

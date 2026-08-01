@@ -142,6 +142,7 @@ export type CacheStatus = 'fresh' | 'stale_refreshing' | 'redis_unavailable';
 
 export interface EngagementIntelligence {
   reply_rate_by_persona: Record<string, number>;
+  reply_rate_by_campaign: Record<string, number>;
   reply_by_stage: Record<string, number>;
   click_by_stage: Record<string, number>;
   time_to_first_reply: {
@@ -233,6 +234,7 @@ export interface EngagementAnalytics {
   trend: TrendPoint[];
   bounce_data: BounceBreakdown;
   reply_rate_by_persona: Record<string, number>;
+  reply_rate_by_campaign: Record<string, number>;
   time_to_first_reply: EngagementIntelligence['time_to_first_reply'];
   weekly_goal: WeeklyGoalProgress | null;
 }

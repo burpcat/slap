@@ -18,27 +18,57 @@
   --hairline: #e1e0d9; --border: rgba(11,11,11,0.10);
   --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
   --series-1: #2a78d6;
-  /* Fixed — status fills don't change with theme, so neither does the ink
-     that reads on them (see the chip-good/chip-serious contrast fix
-     below: var(--text-primary) would be wrong here since IT flips to
-     white in dark mode, which would reintroduce the same failure). */
+  /* Fixed — status fills don't change with theme, so neither does the dark
+     ink that reads on the light-ish ones (good/warning/serious). Critical is
+     the exception: white ink reads best on it, via --text-on-accent below. */
   --ink-on-status: #0b0b0b;
+  /* White ink for saturated accent fills (critical chips, primary buttons) —
+     correct in BOTH themes since it sits on a colored background, not the
+     surface. Replaces scattered #ffffff literals. */
+  --text-on-accent: #ffffff;
+  /* Elevation shadow (popovers). Theme-aware: a soft dark shadow on light,
+     a deeper one on dark where a faint shadow is invisible. */
+  --shadow-elevated: 0 8px 24px rgba(11,11,11,0.16);
+  /* Accent TINTS — faint status/accent washes used for gauge tracks, sync
+     pills, banners, the progress-bar track, etc. These are theme-aware on
+     PURPOSE: a fixed mix % that reads on the dark surface washes out to
+     near-invisible on the near-white light surface, so light uses a stronger
+     mix. Always mix into --surface-1 (which itself switches per theme). */
+  --good-tint: color-mix(in oklab, var(--good) 30%, var(--surface-1));
+  --warning-tint: color-mix(in oklab, var(--warning) 30%, var(--surface-1));
+  --serious-tint: color-mix(in oklab, var(--serious) 30%, var(--surface-1));
+  --critical-tint: color-mix(in oklab, var(--critical) 28%, var(--surface-1));
+  --series-tint: color-mix(in oklab, var(--series-1) 26%, var(--surface-1));
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     color-scheme: dark;
     --surface-1: #1a1a19; --page: #0d0d0d;
-    --text-primary: #ffffff; --text-secondary: #c3c2b7;
+    --text-primary: #ffffff; --text-secondary: #c3c2b7; --text-muted: #9a988f;
     --hairline: #2c2c2a; --border: rgba(255,255,255,0.10);
     --series-1: #3987e5;
+    --good: #16b516; --warning: #ffc233; --serious: #f0906a; --critical: #e24b4b;
+    --shadow-elevated: 0 8px 24px rgba(0,0,0,0.5);
+    --good-tint: color-mix(in oklab, var(--good) 20%, var(--surface-1));
+    --warning-tint: color-mix(in oklab, var(--warning) 20%, var(--surface-1));
+    --serious-tint: color-mix(in oklab, var(--serious) 20%, var(--surface-1));
+    --critical-tint: color-mix(in oklab, var(--critical) 18%, var(--surface-1));
+    --series-tint: color-mix(in oklab, var(--series-1) 16%, var(--surface-1));
   }
 }
 :root[data-theme="dark"] {
   color-scheme: dark;
   --surface-1: #1a1a19; --page: #0d0d0d;
-  --text-primary: #ffffff; --text-secondary: #c3c2b7;
+  --text-primary: #ffffff; --text-secondary: #c3c2b7; --text-muted: #9a988f;
   --hairline: #2c2c2a; --border: rgba(255,255,255,0.10);
   --series-1: #3987e5;
+  --good: #16b516; --warning: #ffc233; --serious: #f0906a; --critical: #e24b4b;
+  --shadow-elevated: 0 8px 24px rgba(0,0,0,0.5);
+  --good-tint: color-mix(in oklab, var(--good) 20%, var(--surface-1));
+  --warning-tint: color-mix(in oklab, var(--warning) 20%, var(--surface-1));
+  --serious-tint: color-mix(in oklab, var(--serious) 20%, var(--surface-1));
+  --critical-tint: color-mix(in oklab, var(--critical) 18%, var(--surface-1));
+  --series-tint: color-mix(in oklab, var(--series-1) 16%, var(--surface-1));
 }
 
 * { box-sizing: border-box; }

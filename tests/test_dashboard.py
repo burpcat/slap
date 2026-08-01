@@ -478,7 +478,8 @@ def _fresh_cache_entry(**overrides):
         "cached_at": datetime.now(timezone.utc).isoformat(),
         "sync_result": {"synced_at": "2026-01-01T00:00:00+00:00", "new_replies": 0,
                         "new_clicks": 0, "new_bounces": 0, "errors": []},
-        "engagement": {"reply_rate_by_persona": {}, "reply_by_stage": {}, "click_by_stage": {},
+        "engagement": {"reply_rate_by_persona": {}, "reply_rate_by_campaign": {},
+                       "reply_by_stage": {}, "click_by_stage": {},
                        "time_to_first_reply": {"same_day": 0, "1_2_days": 0, "3_7_days": 0, "8_plus_days": 0},
                        "has_data": False},
         "warm_but_silent": [], "bounces": [], "replies": [],
@@ -490,6 +491,7 @@ def _fresh_cache_entry(**overrides):
 def test_get_gmass_dependent_data_fresh_cache_makes_zero_gmass_calls(conn, db_path):
     client = FakeRedis()
     gmass_cache.write_cache(client, _fresh_cache_entry(engagement={"has_data": True, "reply_rate_by_persona": {},
+                                                                    "reply_rate_by_campaign": {},
                                                                     "reply_by_stage": {}, "click_by_stage": {},
                                                                     "time_to_first_reply": {}}))
     with patch("slap.dashboard.gmass.get_reports") as mock_get:
@@ -664,6 +666,36 @@ def test_reply_rate_by_persona_survives_a_later_ooo_resend(conn):
     append_event(conn, type="requeued", recipient="a@x.com", campaign="c", stage=1, gmass_campaign_id="1")
     result = engagement_intelligence(conn)
     assert result["reply_rate_by_persona"]["recruiter"] == 100.0
+
+
+def test_reply_rate_by_campaign(conn):
+    # campaign rides directly on every event (and recipients.campaign), so no
+    # meta persona lookup is needed -- two recruited into campaign "c", one
+    # replied -> 50%.
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
+    append_event(conn, type="queued", recipient="b@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
+    result = engagement_intelligence(conn)
+    assert result["reply_rate_by_campaign"]["c"] == 50.0
+
+
+def test_reply_rate_by_campaign_splits_across_campaigns(conn):
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c1", stage=0, meta={"persona": "recruiter"})
+    append_event(conn, type="queued", recipient="b@x.com", campaign="c2", stage=0, meta={"persona": "recruiter"})
+    append_event(conn, type="reply", recipient="b@x.com", campaign="c2")
+    result = engagement_intelligence(conn)
+    assert result["reply_rate_by_campaign"] == {"c1": 0.0, "c2": 100.0}
+
+
+def test_reply_rate_by_campaign_survives_a_later_ooo_resend(conn):
+    # Same events-not-status subtlety as the persona rate: a repliER later
+    # requeued back to 'active' must still count as replied.
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
+    append_event(conn, type="ooo_tagged", recipient="a@x.com", campaign="c")
+    append_event(conn, type="requeued", recipient="a@x.com", campaign="c", stage=1, gmass_campaign_id="1")
+    result = engagement_intelligence(conn)
+    assert result["reply_rate_by_campaign"]["c"] == 100.0
 
 
 def test_reply_and_click_by_stage(conn):

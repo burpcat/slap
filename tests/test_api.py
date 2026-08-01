@@ -167,7 +167,8 @@ def test_api_engagement_returns_expected_keys(app):
         assert key in body, key
     assert body["show_hidden"] is False
     analytics = body["engagement-analytics"]
-    for key in ("trend", "bounce_data", "reply_rate_by_persona", "time_to_first_reply", "weekly_goal"):
+    for key in ("trend", "bounce_data", "reply_rate_by_persona", "reply_rate_by_campaign",
+                "time_to_first_reply", "weekly_goal"):
         assert key in analytics, key
 
 

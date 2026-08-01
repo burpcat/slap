@@ -40,6 +40,6 @@
 .good { background: var(--good); }
 .warningFill { background: var(--warning); }
 .criticalFill { background: var(--critical); }
-.goodTrack { background: color-mix(in oklab, var(--good) 22%, var(--surface-1)); }
-.warningTrack { background: color-mix(in oklab, var(--warning) 22%, var(--surface-1)); }
-.criticalTrack { background: color-mix(in oklab, var(--critical) 22%, var(--surface-1)); }
+.goodTrack { background: var(--good-tint); }
+.warningTrack { background: var(--warning-tint); }
+.criticalTrack { background: var(--critical-tint); }

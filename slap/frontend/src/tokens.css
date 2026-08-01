@@ -14,20 +14,41 @@
   --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
   --series-1: #2a78d6;
   --ink-on-status: #0b0b0b;
+  --text-on-accent: #ffffff;
+  --shadow-elevated: 0 8px 24px rgba(11,11,11,0.16);
+  --good-tint: color-mix(in oklab, var(--good) 30%, var(--surface-1));
+  --warning-tint: color-mix(in oklab, var(--warning) 30%, var(--surface-1));
+  --serious-tint: color-mix(in oklab, var(--serious) 30%, var(--surface-1));
+  --critical-tint: color-mix(in oklab, var(--critical) 28%, var(--surface-1));
+  --series-tint: color-mix(in oklab, var(--series-1) 26%, var(--surface-1));
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     color-scheme: dark;
     --surface-1: #1a1a19; --page: #0d0d0d;
-    --text-primary: #ffffff; --text-secondary: #c3c2b7;
+    --text-primary: #ffffff; --text-secondary: #c3c2b7; --text-muted: #9a988f;
     --hairline: #2c2c2a; --border: rgba(255,255,255,0.10);
     --series-1: #3987e5;
+    --good: #16b516; --warning: #ffc233; --serious: #f0906a; --critical: #e24b4b;
+    --shadow-elevated: 0 8px 24px rgba(0,0,0,0.5);
+    --good-tint: color-mix(in oklab, var(--good) 20%, var(--surface-1));
+    --warning-tint: color-mix(in oklab, var(--warning) 20%, var(--surface-1));
+    --serious-tint: color-mix(in oklab, var(--serious) 20%, var(--surface-1));
+    --critical-tint: color-mix(in oklab, var(--critical) 18%, var(--surface-1));
+    --series-tint: color-mix(in oklab, var(--series-1) 16%, var(--surface-1));
   }
 }
 :root[data-theme="dark"] {
   color-scheme: dark;
   --surface-1: #1a1a19; --page: #0d0d0d;
-  --text-primary: #ffffff; --text-secondary: #c3c2b7;
+  --text-primary: #ffffff; --text-secondary: #c3c2b7; --text-muted: #9a988f;
   --hairline: #2c2c2a; --border: rgba(255,255,255,0.10);
   --series-1: #3987e5;
+  --good: #16b516; --warning: #ffc233; --serious: #f0906a; --critical: #e24b4b;
+  --shadow-elevated: 0 8px 24px rgba(0,0,0,0.5);
+  --good-tint: color-mix(in oklab, var(--good) 20%, var(--surface-1));
+  --warning-tint: color-mix(in oklab, var(--warning) 20%, var(--surface-1));
+  --serious-tint: color-mix(in oklab, var(--serious) 20%, var(--surface-1));
+  --critical-tint: color-mix(in oklab, var(--critical) 18%, var(--surface-1));
+  --series-tint: color-mix(in oklab, var(--series-1) 16%, var(--surface-1));
 }

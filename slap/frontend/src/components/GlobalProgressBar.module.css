@@ -10,7 +10,11 @@
   z-index: 100;
   overflow: hidden;
   pointer-events: none;
-  background: color-mix(in oklab, var(--series-1) 12%, transparent);
+  /* Theme-aware track: the old `12% over transparent` was tuned for the dark
+     page and washed out to invisible on the near-white light surface. The
+     --series-tint token mixes into --surface-1 (which switches per theme), so
+     the track reads clearly under the moving fill in BOTH modes. */
+  background: var(--series-tint);
   opacity: 0;
   transition: opacity 150ms ease-out;
 }

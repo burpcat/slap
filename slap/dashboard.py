@@ -363,6 +363,30 @@ def _reply_rate_by_persona(conn) -> dict:
     }
 
 
+def _reply_rate_by_campaign(conn) -> dict:
+    # Mirror of _reply_rate_by_persona keyed on campaign instead. Simpler,
+    # because `campaign` is a first-class column on `recipients` (always
+    # populated for a contacted recipient) rather than riding in a queued
+    # event's meta the way persona does -- so no persona-style meta lookup.
+    campaign_totals: dict = {}
+    campaign_of: dict = {}
+    for row in conn.execute("SELECT recipient, campaign FROM recipients WHERE campaign IS NOT NULL"):
+        campaign_totals[row["campaign"]] = campaign_totals.get(row["campaign"], 0) + 1
+        campaign_of[row["recipient"]] = row["campaign"]
+
+    campaign_replied: dict = {}
+    replied_recipients = {r["recipient"] for r in conn.execute("SELECT DISTINCT recipient FROM events WHERE type = 'reply'")}
+    for recipient in replied_recipients:
+        campaign = campaign_of.get(recipient)
+        if campaign:
+            campaign_replied[campaign] = campaign_replied.get(campaign, 0) + 1
+
+    return {
+        campaign: round(100 * campaign_replied.get(campaign, 0) / total, 1)
+        for campaign, total in campaign_totals.items()
+    }
+
+
 def _time_to_first_reply_distribution(conn) -> dict:
     rows = conn.execute(
         "SELECT first_sent_at, replied_at FROM recipients "
@@ -386,6 +410,7 @@ def _time_to_first_reply_distribution(conn) -> dict:
 
 def engagement_intelligence(conn) -> dict:
     reply_rate_by_persona = _reply_rate_by_persona(conn)
+    reply_rate_by_campaign = _reply_rate_by_campaign(conn)
     reply_by_stage = _count_by_stage(conn, "reply")
     click_by_stage = _count_by_stage(conn, "click")
     time_to_first_reply = _time_to_first_reply_distribution(conn)
@@ -395,11 +420,13 @@ def engagement_intelligence(conn) -> dict:
     # real data — it means recipients have actually been contacted, so a 0%
     # rate is informative, not a fabricated placeholder.
     has_data = (
-        bool(reply_rate_by_persona) or any(reply_by_stage.values())
+        bool(reply_rate_by_persona) or bool(reply_rate_by_campaign)
+        or any(reply_by_stage.values())
         or any(click_by_stage.values()) or any(time_to_first_reply.values())
     )
     return {
         "reply_rate_by_persona": reply_rate_by_persona,
+        "reply_rate_by_campaign": reply_rate_by_campaign,
         "reply_by_stage": reply_by_stage,
         "click_by_stage": click_by_stage,
         "time_to_first_reply": time_to_first_reply,
@@ -1984,7 +2011,8 @@ def _empty_gmass_data() -> dict:
         "cached_at": None,
         "sync_result": {"synced_at": None, "new_replies": 0, "new_clicks": 0, "new_bounces": 0, "errors": []},
         "engagement": {
-            "reply_rate_by_persona": {}, "reply_by_stage": {}, "click_by_stage": {},
+            "reply_rate_by_persona": {}, "reply_rate_by_campaign": {},
+            "reply_by_stage": {}, "click_by_stage": {},
             "time_to_first_reply": {"same_day": 0, "1_2_days": 0, "3_7_days": 0, "8_plus_days": 0},
             "has_data": False,
         },
