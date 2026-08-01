@@ -61,13 +61,24 @@ export default function Lifecycle() {
   const { data: campaigns } = useCampaigns();
   const [selectedCampaign, setSelectedCampaign] = useState<string | null>(null);
   const [selectedRecipient, setSelectedRecipient] = useState<string | null>(null);
+  const [query, setQuery] = useState('');
   const { data: detail, isLoading: detailLoading } = useLifecycleDetail(selectedRecipient);
 
   if (isLoading) return <p>Loading…</p>;
   if (error || !reachouts) return <p>Could not load reach-outs.</p>;
 
   const colors = reachouts.campaign_colors;
-  const rows = reachouts.rows.filter((r) => !selectedCampaign || r.campaign === selectedCampaign);
+  const q = query.trim().toLowerCase();
+  const rows = reachouts.rows.filter((r) => {
+    if (selectedCampaign && r.campaign !== selectedCampaign) return false;
+    if (!q) return true;
+    // Simple case-insensitive substring match over email, name, and company.
+    return (
+      r.recipient.toLowerCase().includes(q) ||
+      r.name.toLowerCase().includes(q) ||
+      r.company.toLowerCase().includes(q)
+    );
+  });
   const pill = (active: boolean) => `${styles.pill} ${active ? styles.pillActive : ''}`;
 
   return (
@@ -86,31 +97,41 @@ export default function Lifecycle() {
       </div>
 
       <div className={styles.split}>
-        <div className={styles.roster}>
-          {rows.length === 0 ? (
-            <p className={styles.empty}>No reach-outs in this campaign.</p>
-          ) : (
-            rows.map((r) => (
-              <button
-                key={r.recipient}
-                className={`${styles.rosterRow} ${selectedRecipient === r.recipient ? styles.rosterRowActive : ''}`}
-                onClick={() => setSelectedRecipient(r.recipient)}
-              >
-                <span
-                  className={styles.statusDot}
-                  style={{ background: r.chip.color ? DOT_COLOR[r.chip.color] : 'var(--text-muted)' }}
-                  title={r.chip.label}
-                />
-                <span className={styles.rosterMain}>
-                  <span className={styles.rosterEmail}>{r.recipient}</span>
-                  <span className={styles.rosterCampaign}>
-                    {colors[r.campaign] && <CampaignDot color={colors[r.campaign]} />}
-                    {r.campaign}
+        <div className={styles.rosterCol}>
+          <input
+            className={styles.search}
+            type="search"
+            placeholder="Search name, email, or company…"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            aria-label="Search reach-outs by name, email, or company"
+          />
+          <div className={styles.roster}>
+            {rows.length === 0 ? (
+              <p className={styles.empty}>No matching reach-outs.</p>
+            ) : (
+              rows.map((r) => (
+                <button
+                  key={r.recipient}
+                  className={`${styles.rosterRow} ${selectedRecipient === r.recipient ? styles.rosterRowActive : ''}`}
+                  onClick={() => setSelectedRecipient(r.recipient)}
+                >
+                  <span
+                    className={styles.statusDot}
+                    style={{ background: r.chip.color ? DOT_COLOR[r.chip.color] : 'var(--text-muted)' }}
+                    title={r.chip.label}
+                  />
+                  <span className={styles.rosterMain}>
+                    <span className={styles.rosterEmail}>{r.recipient}</span>
+                    <span className={styles.rosterCampaign}>
+                      {colors[r.campaign] && <CampaignDot color={colors[r.campaign]} />}
+                      {r.campaign}
+                    </span>
                   </span>
-                </span>
-              </button>
-            ))
-          )}
+                </button>
+              ))
+            )}
+          </div>
         </div>
 
         <div className={styles.charter}>
