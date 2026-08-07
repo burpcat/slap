@@ -123,7 +123,15 @@ def _plain_text_to_html(text: str) -> str:
         return f'<a href="{html.escape(url, quote=True)}">{html.escape(label)}</a>'
 
     linkified = _URL_RE.sub(_linkify, escaped)
-    return linkified.replace("\n", "<br>\n")
+    # Emit a bare <br> with NO trailing literal "\n". A residual newline is
+    # inert in the initial send (a Gmail draft typed messageType="html"), but
+    # follow-up stage text ships via stageNCampaignText with no messageType.
+    # Owner-observed symptom: follow-ups arrived with every paragraph gap
+    # doubled while the initial send looked right -- consistent with GMass
+    # applying its own newline->br pass to that untyped field, turning each
+    # leftover "\n" into a second break. Leaving zero newlines in the HTML makes
+    # the output render identically across both paths regardless of typing.
+    return linkified.replace("\n", "<br>")
 
 
 def _headers(api_key: str) -> dict:
