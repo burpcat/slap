@@ -64,7 +64,10 @@ def test_plain_text_to_html_escapes_special_characters():
 
 
 def test_plain_text_to_html_preserves_line_breaks():
-    assert _plain_text_to_html("Hi,\n\nBody line.\n") == "Hi,<br>\n<br>\nBody line.<br>\n"
+    # Bare <br> with no trailing literal newline: a residual "\n" doubled every
+    # paragraph gap in owner-observed follow-ups (untyped stageNCampaignText
+    # field, apparently re-run through GMass's own nl->br). See _plain_text_to_html.
+    assert _plain_text_to_html("Hi,\n\nBody line.\n") == "Hi,<br><br>Body line.<br>"
 
 
 def test_plain_text_to_html_handles_url_containing_ampersand():

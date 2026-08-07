@@ -741,6 +741,15 @@ behaviorally *unproven*, and that remains the case).
   click tracker — domain-only display text is sufficient, the full URL as text is not).
   This was a real, shipped bug (`clickTracking: true` present but zero clicks ever
   recorded) before the fix — see `slap/gmass.py::_plain_text_to_html()`.
+- **Two newline→`<br>` passes on follow-ups (shipped bug, fixed).** `_plain_text_to_html`
+  converts each `\n` to a `<br>`. The **initial** send is a Gmail draft typed
+  `messageType: "html"`, so any leftover source newline is inert. But **follow-up stage
+  bodies** ship via `stageNCampaignText` in `build_campaign_settings()` with **no
+  `messageType`**, and GMass appears to run its own newline→`<br>` pass over that untyped
+  field — so a `<br>\n` there became `<br><br>`, **doubling every paragraph gap in
+  follow-ups only** (owner-observed; templates were clean). Fix: emit a bare `<br>` with no
+  trailing `\n`, so both paths render identically. Do not reintroduce a literal newline
+  after `<br>` in `_plain_text_to_html`.
 - **launchd runs with a bare environment.** No shell, no `cd`, no aliases, no auto-loaded
   `.env`. The generated plist (via `slap.py plist`) uses absolute paths; the runner loads
   `.env` itself. **This is the #1 unattended-failure risk** — verify on any real wake test.
