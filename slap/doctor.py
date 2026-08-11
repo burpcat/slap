@@ -198,7 +198,11 @@ def check_resume_archive() -> CheckResult:
     send (warn, don't block — see archive.py's own docstring). This check is
     wired into print_report() only, so it's visible in the standalone
     `doctor` report (and `init`'s finish step) without ever being able to
-    fail a send or a drain."""
+    fail a send or a drain. A not-ok result here is rendered by print_report()
+    as a yellow WARN (never a FAIL) and never gates doctor's exit code; the
+    dangling-symlink case points the owner at `doctor --prune-archive`. The
+    `ok` flag on the returned CheckResult is therefore informational only —
+    callers must not fold it into a pass/fail gate."""
     archive_dir = archive.archive_dir_from_env()
     if archive_dir is None:
         return CheckResult(archive.ENV_VAR, True, "not set — résumé archiving is off")
@@ -257,21 +261,27 @@ def print_report(global_config: GlobalConfig) -> bool:
     `init`'s finish step, so there's exactly one place that defines what
     the report looks like. Returns True if everything REQUIRED passed.
 
-    Redis is deliberately the one exception to "every printed FAIL drags
-    down the overall result": check_redis() below still prints a genuine,
-    visible FAIL (with install instructions) when unreachable — never
-    silently hidden — but does NOT affect this function's returned bool or
-    `doctor`'s exit code. Unlike every other check here, there is no config
-    knob that turns Redis caching "off" the way an unset RESUME_ARCHIVE_DIR
-    means archiving is off — `redis_url` always has a default value — so an
-    owner who has simply never set up Redis would otherwise see a
-    permanent, unfixable-without-installing-something FAIL on every single
-    `doctor`/`init` run for a feature that's designed to be entirely
-    optional (the dashboard already falls back to live polling without
-    it). Loud and visible, per the task's own "fail loud" instruction; just
-    not gating, matching the same "warn, don't block" reasoning already
-    applied to check_resume_archive()'s own isolation from
-    run_global_checks()."""
+    Two checks here are deliberately printed-but-non-gating (never folded
+    into the returned bool or `doctor`'s exit code):
+
+    - check_resume_archive() renders as a yellow WARN (not a red FAIL) when
+      the archive dir is broken/missing/has dangling symlinks — cosmetic
+      staleness that already can't block a send (it isn't in
+      run_global_checks()), and the broken-symlink case is self-fixable via
+      `doctor --prune-archive`, so failing doctor's exit over it would be
+      pure noise. Warn, don't block.
+
+    - check_redis() still prints a genuine, visible FAIL (with install
+      instructions) when unreachable — never silently hidden — but does NOT
+      affect the returned bool either. Unlike every other check here, there
+      is no config knob that turns Redis caching "off" the way an unset
+      RESUME_ARCHIVE_DIR means archiving is off — `redis_url` always has a
+      default value — so an owner who has simply never set up Redis would
+      otherwise see a permanent, unfixable-without-installing-something FAIL
+      on every single `doctor`/`init` run for a feature that's designed to
+      be entirely optional (the dashboard already falls back to live polling
+      without it). Loud and visible, per the task's own "fail loud"
+      instruction; just not gating."""
     from slap import display
     from slap.config import ConfigError, discover_campaigns, load_campaign
 
@@ -281,8 +291,16 @@ def print_report(global_config: GlobalConfig) -> bool:
         ok = ok and result.ok
 
     archive_result = check_resume_archive()
-    print_check(archive_result)
-    ok = ok and archive_result.ok
+    if archive_result.ok:
+        print_check(archive_result)
+    else:
+        # Visible but non-gating (never folded into `ok`), same reasoning as
+        # check_redis below: a broken/missing archive dir is cosmetic staleness
+        # that already can't block a send (check_resume_archive() isn't in
+        # run_global_checks()), so it warns rather than failing doctor's exit.
+        hint = ("  (run `slap.py doctor --prune-archive` to remove)"
+                if "broken symlink" in archive_result.detail else "")
+        display.warn(f"{archive_result.name}: WARN — {archive_result.detail}{hint}")
 
     print_check(check_redis(global_config))  # visible, but never gates doctor's pass/fail — see docstring
     # Visible but non-gating, same reasoning as check_redis/check_resume_archive:
