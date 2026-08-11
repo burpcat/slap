@@ -599,7 +599,41 @@ def cmd_dashboard(args):
     app.run(host="127.0.0.1", port=5050)
 
 
+def _prune_resume_archive(*, confirm: bool):
+    """`doctor --prune-archive` — remove dangling symlinks from
+    RESUME_ARCHIVE_DIR (the staleness check_resume_archive() warns about).
+    Dry run by default (mirrors `cleanup`'s --confirm convention); fails loud
+    if the archive isn't configured/usable, since the owner explicitly asked
+    to prune it. Only ever unlinks broken symlinks — live entries and the 68's
+    real-résumé neighbors are never touched (see archive.prune_broken_symlinks)."""
+    archive_dir = archive.archive_dir_from_env()
+    if archive_dir is None:
+        display.fail(f"slap: {archive.ENV_VAR} is not set — nothing to prune (résumé archiving is off).")
+        sys.exit(1)
+    if not archive.is_valid_dir(archive_dir):
+        display.fail(f"slap: {archive.ENV_VAR} ({archive_dir}) does not exist or isn't writable.")
+        sys.exit(1)
+
+    broken = archive.find_broken_symlinks(archive_dir)
+    if not broken:
+        display.success(f"No dangling symlinks in {archive_dir}.")
+        return
+
+    heading = "Removed" if confirm else "Would remove (dry run — pass --confirm to actually delete)"
+    print(f"{heading}:")
+    for p in broken:
+        print(f"  {p.name}")
+
+    if confirm:
+        removed = archive.prune_broken_symlinks(archive_dir)
+        display.success(f"\nRemoved {len(removed)} dangling symlink(s) from {archive_dir}.")
+
+
 def cmd_doctor(args):
+    if getattr(args, "prune_archive", False):
+        _prune_resume_archive(confirm=args.confirm)
+        return
+
     try:
         global_config = load_global_config()
     except ConfigError as e:
@@ -980,7 +1014,12 @@ def build_parser():
     p_send.set_defaults(func=cmd_send)
 
     sub.add_parser("dashboard", help="Launch the localhost dashboard").set_defaults(func=cmd_dashboard)
-    sub.add_parser("doctor", help="Run preflight checks").set_defaults(func=cmd_doctor)
+    p_doctor = sub.add_parser("doctor", help="Run preflight checks")
+    p_doctor.add_argument("--prune-archive", action="store_true", dest="prune_archive",
+                          help="Delete dangling symlinks in RESUME_ARCHIVE_DIR (dry run by default)")
+    p_doctor.add_argument("--confirm", action="store_true",
+                          help="With --prune-archive: actually delete (default is dry run)")
+    p_doctor.set_defaults(func=cmd_doctor)
     sub.add_parser(
         "init", help="Interactive installer — config.yaml, .env, schedule, DB, launchd"
     ).set_defaults(func=cmd_init)

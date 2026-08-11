@@ -9,7 +9,8 @@ import pytest
 
 from slap.archive import (
     ArchiveError, ENV_VAR, archive_dir_from_env, archive_resume, copy_reused_resume,
-    find_broken_symlinks, find_matches_for_company, resolve_live_targets,
+    find_broken_symlinks, find_matches_for_company, prune_broken_symlinks,
+    resolve_live_targets,
 )
 
 WHEN = date(2026, 7, 8)
@@ -177,6 +178,46 @@ def test_find_broken_symlinks_empty_when_all_targets_exist(tmp_path):
     (archive_dir / "a.pdf").symlink_to(target)
 
     assert find_broken_symlinks(archive_dir) == []
+
+
+# --- prune_broken_symlinks -------------------------------------------------
+
+def test_prune_broken_symlinks_none_when_archive_dir_unset():
+    assert prune_broken_symlinks(None) == []
+
+
+def test_prune_broken_symlinks_removes_dangling_keeps_live(tmp_path):
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    live_target = make_pdf(tmp_path, "live.pdf")
+    live_link = archive_dir / "live.pdf"
+    live_link.symlink_to(live_target)
+
+    dead_a = make_pdf(tmp_path, "a.pdf")
+    dead_b = make_pdf(tmp_path, "b.pdf")
+    dangling_a = archive_dir / "dead-a.pdf"
+    dangling_b = archive_dir / "dead-b.pdf"
+    dangling_a.symlink_to(dead_a)
+    dangling_b.symlink_to(dead_b)
+    dead_a.unlink()
+    dead_b.unlink()
+
+    removed = prune_broken_symlinks(archive_dir)
+
+    assert removed == [dangling_a, dangling_b]  # sorted, only the dangling ones
+    assert not dangling_a.is_symlink() and not dangling_b.is_symlink()
+    assert live_link.is_symlink() and live_link.exists()  # live entry untouched
+    assert live_target.exists()  # the live target itself is never followed/deleted
+
+
+def test_prune_broken_symlinks_noop_when_nothing_dangling(tmp_path):
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    target = make_pdf(tmp_path)
+    (archive_dir / "a.pdf").symlink_to(target)
+
+    assert prune_broken_symlinks(archive_dir) == []
+    assert (archive_dir / "a.pdf").exists()
 
 
 # --- resolve_live_targets --------------------------------------------------

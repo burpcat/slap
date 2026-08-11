@@ -231,6 +231,26 @@ def test_check_resume_archive_fails_when_a_symlink_is_broken(tmp_path, monkeypat
     assert "acme-swe-2026-07-08.pdf" in result.detail
 
 
+def test_print_report_not_gated_by_broken_archive_symlink(tmp_path, monkeypatch):
+    # A broken archive symlink renders as a non-gating WARN — print_report()
+    # must still return True (doctor exits 0). Mirrors the Redis guard below:
+    # a broken archive is cosmetic staleness fixable via `doctor
+    # --prune-archive`, never a reason to fail doctor's exit code.
+    monkeypatch.chdir(tmp_path)  # discover_campaigns() reads cwd-relative campaigns/ (none here)
+    monkeypatch.setenv("GMASS_API_KEY", "real-key")
+
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    target = tmp_path / "gone.pdf"
+    target.write_bytes(b"%PDF-fake")
+    (archive_dir / "acme-swe-2026-07-08.pdf").symlink_to(target)
+    target.unlink()  # leave the symlink dangling
+    monkeypatch.setenv("RESUME_ARCHIVE_DIR", str(archive_dir))
+
+    gc = make_global_config(tmp_path, consumer_domains_file=str(tmp_path / "consumer_domains.txt"))
+    assert print_report(gc) is True  # broken archive symlink must not drag the overall result down
+
+
 # --- Redis (post-launch feature: dashboard GMass-data cache) ----------------
 # "Check, don't install" (CLAUDE.md): this only verifies Redis is reachable
 # via PING, never installs/starts it. Unlike every other check here, an

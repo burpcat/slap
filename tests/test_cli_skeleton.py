@@ -753,7 +753,7 @@ def test_send_soft_warn_archive_dir_unset_falls_through_no_prompt_no_error(tmp_p
     drop = f"Email: {recipient}\nCompany: Acme\nRole: Staff Engineer\n"
     scripted_stdin = f"{drop}\n<<<EOF>>>\ny\n\ny\nn\n"  # proceed-anyway, follow-ups-default, stage, no-more
 
-    env = {**os.environ, "GMASS_API_KEY": "fake-key"}  # RESUME_ARCHIVE_DIR left unset
+    env = {**os.environ, "GMASS_API_KEY": "fake-key", "RESUME_ARCHIVE_DIR": ""}  # archiving off (blank), hermetic
     result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
 
     assert result.returncode == 0, result.stdout + result.stderr

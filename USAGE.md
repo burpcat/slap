@@ -328,7 +328,7 @@ confirm it lands and looks right, then you're clear to send to real recipients.
 | `python slap.py send <campaign> [--now]` | The prep flow above. `--now` also drains immediately. |
 | `python slap.py send custom [--now]` | The editor-authored one-off flow above (see "`send custom`"). |
 | `python slap.py dashboard` | Starts the localhost dashboard at `http://127.0.0.1:5050` — a React SPA (see "Dashboard + replies" below), including the filterable all-campaigns Reach-outs tab. Requires the frontend to be built once first (`npm --prefix slap/frontend run build`). |
-| `python slap.py doctor` | Preflight checks — sender fields, API key, DB, consumer domains file, every campaign's attachment/LaTeX toolchain, and (separately, never blocking) `RESUME_ARCHIVE_DIR`'s validity, any dangling symlinks in it, and your configured `editor` command. Safe to run any time; the core checks also run automatically before every `send` and every drain. |
+| `python slap.py doctor [--prune-archive [--confirm]]` | Preflight checks — sender fields, API key, DB, consumer domains file, every campaign's attachment/LaTeX toolchain, and (separately, as a non-blocking WARN) `RESUME_ARCHIVE_DIR`'s validity, any dangling symlinks in it, and your configured `editor` command. Safe to run any time; the core checks also run automatically before every `send` and every drain. `--prune-archive` deletes the dangling `RESUME_ARCHIVE_DIR` symlinks the report warns about (dry run unless `--confirm`); live entries are never touched. |
 | `python slap.py domains` | Prints a read-only index of who you've contacted, grouped by email domain — for manual inspection. |
 | `python slap.py rebuild` | Rebuilds the `recipients` cache table by replaying the full `events` log from scratch. Use this if the cache ever looks wrong — `events` is always the source of truth, the cache is fully disposable. |
 | `python slap.py cleanup [--confirm] [--min-days-idle N]` | Deletes stale *compiled* résumé PDFs (LaTeX campaigns only) for recipients who are done/dead/never-replied and idle 15+ days by default — except a PDF still referenced by a live `RESUME_ARCHIVE_DIR` symlink, which is kept and reported separately. Dry run unless you pass `--confirm`. Never touches the `.tex` source. |
@@ -363,8 +363,11 @@ that land on the same name (same company/role/day) get `-2`, `-3`, ... appended.
 - **Unset, or pointing at a folder that doesn't exist / isn't writable → archiving is
   simply skipped, with a warning** — it never blocks a send. `doctor` reports
   `RESUME_ARCHIVE_DIR`'s status and flags any dangling symlink inside it (e.g. after a
-  `cleanup` run reclaimed the file it pointed at) separately from every other check, so a
-  stale archive folder can never fail a `send` or a scheduled drain.
+  `cleanup` run reclaimed the file it pointed at) separately from every other check as a
+  **WARN, never a FAIL** — a stale archive folder can never fail `doctor`'s exit code, a
+  `send`, or a scheduled drain. Clear the dangling symlinks with `python slap.py doctor
+  --prune-archive` (dry run — lists what it would remove; pass `--confirm` to actually
+  delete). It only ever removes broken symlinks; live entries are never touched.
 - **`cleanup` respects the archive**: a PDF `cleanup` would otherwise delete as
   stale/dead is kept instead if a live archive symlink still points at it, and reported in
   its own "kept — still referenced by a résumé archive symlink" line rather than being

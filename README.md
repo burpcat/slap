@@ -171,7 +171,7 @@ dashboard, deliverability tips). Quick reference:
 | `python slap.py send <campaign> [--now]` | Interactive prep: paste a drop, optionally compile/preview a LaTeX résumé, see domain-dedup warnings (and, for a static campaign, an offer to reuse an archived résumé), choose how many of the persona's follow-ups to actually stage for this recipient (0 up to the persona's full cadence), and a preview, then stage the send to the queue. `--now` also drains the queue immediately afterward instead of waiting for the scheduled runner. |
 | `python slap.py send custom` | A one-off, editor-authored send outside any campaign folder: compose the initial email (and, optionally, a custom per-recipient follow-up cadence) in your `editor`, pick an attachment (an existing PDF, a pasted path, a freshly-authored LaTeX résumé, or none), then stage it via the same queue/runner path as a normal send. Reserved campaign label `__custom__`. |
 | `python slap.py dashboard` | Starts the localhost dashboard at `http://127.0.0.1:5050` — a React + TypeScript + Vite single-page app served as a static bundle by this one Flask process (see ARCHITECTURE.md's "Frontend" section). Requires `npm --prefix slap/frontend run build` to have been run at least once (see Setup above); fails loud with that exact command if the bundle is missing. Tabs: Home, Campaigns, Engagement, Pipeline, Reach-outs, Commands. |
-| `python slap.py doctor` | Preflight checks — see Setup above. Safe to run any time. |
+| `python slap.py doctor [--prune-archive [--confirm]]` | Preflight checks — see Setup above. Safe to run any time. `--prune-archive` clears dangling `RESUME_ARCHIVE_DIR` symlinks (dry run unless `--confirm`). |
 | `python slap.py interaction <recipient> --channel {linkedin-reply,followed-up} [--off]` | CLI backend for two dashboard per-reachout toggles: `linkedin-reply` records (or, with `--off`, clears) a "replied on LinkedIn" flag; `followed-up` resets the follow-up-reminder timer. Both append an `interaction` event — no GMass call. |
 | `python slap.py remind [<recipient>] [--list] [--use SLUG] [--new] [--title T]` | Queues a one-shot saved follow-up ("Remind") for a warm-but-silent/LinkedIn-replied/real recipient — sent as a threaded reply on the normal drain, no scheduler of its own. `--list` shows saved templates (`followups/*.txt`); `--use SLUG` sends a saved one; `--new` authors a fresh body in your editor; add `--title` to also save it for reuse. |
 | `python slap.py domains` | Regenerates and prints a read-only domain index from tracked events (who you've contacted, grouped by email domain) — for manual inspection, not itself a source of truth. |
@@ -193,8 +193,9 @@ Set `RESUME_ARCHIVE_DIR` in `.env` to a folder path and every résumé you send 
 symlinked there (never copied) as `<company>-<role>-<date>.pdf` — one place to browse
 everything you've ever sent, while the real bytes stay in exactly one place. Off by
 default and never blocks a send — a missing/unwritable folder just warns. `doctor` reports
-its status separately, and `cleanup` won't delete a PDF a live archive symlink still
-points at.
+its status separately as a WARN (never a FAIL), and `cleanup` won't delete a PDF a live
+archive symlink still points at. Dangling symlinks (e.g. a target `cleanup` later reclaimed)
+can be cleared with `python slap.py doctor --prune-archive` (dry run; `--confirm` to delete).
 
 With the archive on, `send` also offers to **reuse** a previously-sent résumé when the
 domain soft-warn fires (a different person at a company you've already emailed) — for

@@ -120,6 +120,20 @@ def find_broken_symlinks(archive_dir: Path | None) -> list:
     return sorted(p for p in archive_dir.iterdir() if p.is_symlink() and not p.exists())
 
 
+def prune_broken_symlinks(archive_dir: Path | None) -> list:
+    """Delete every dangling symlink find_broken_symlinks() reports, returning
+    the removed paths (sorted, same order). Only ever unlinks the SYMLINK
+    entry itself — never follows it, so a real file is never at risk (a broken
+    symlink has no live target to touch anyway). Used by `slap.py doctor
+    --prune-archive` to clear staleness left behind when a symlink's target was
+    reclaimed/deleted. Returns [] for an unset/invalid archive dir, matching
+    find_broken_symlinks()'s own guard."""
+    removed = find_broken_symlinks(archive_dir)
+    for p in removed:
+        p.unlink()
+    return removed
+
+
 def resolve_live_targets(archive_dir: Path | None) -> set:
     """Resolved target paths of every currently-non-dangling symlink in
     `archive_dir`. Used by `slap.cleanup`'s delete guard (the archive/cleanup
