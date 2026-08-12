@@ -32,10 +32,15 @@ schedule:
 
 tracking:
   consumer_domains_file: consumer_domains.txt
+
+docs_dir: docs
+send_tags:
+  default: resume.pdf
 """
 
 VALID_CAMPAIGN_YAML = """
 persona: recruiter
+cadence: [2, 3, 5]
 latex:
   enabled: true
   attachment_name: "Firstname_Lastname_Resume.pdf"
@@ -336,7 +341,7 @@ def test_load_campaign_valid(tmp_path):
 
 def test_load_campaign_missing_stage_file_fails_loud(tmp_path):
     global_config = load_global_config(write_global_config(tmp_path))
-    # recruiter cadence has 3 stages; only provide 2.
+    # campaign cadence [2, 3, 5] has 3 stages; only provide 2.
     campaigns_dir, _ = write_campaign(tmp_path, stage_count=2)
     with pytest.raises(ConfigError, match="stage3.txt"):
         load_campaign("coldpost", global_config, campaigns_dir)
@@ -344,9 +349,29 @@ def test_load_campaign_missing_stage_file_fails_loud(tmp_path):
 
 def test_load_campaign_extra_stage_file_fails_loud(tmp_path):
     global_config = load_global_config(write_global_config(tmp_path))
-    # recruiter cadence has 3 stages; provide 4.
+    # campaign cadence [2, 3, 5] has 3 stages; provide 4.
     campaigns_dir, _ = write_campaign(tmp_path, stage_count=4)
     with pytest.raises(ConfigError, match="stage4.txt"):
+        load_campaign("coldpost", global_config, campaigns_dir)
+
+
+def test_load_campaign_missing_cadence_fails_loud(tmp_path):
+    # Cadence now lives in campaign.yaml (no longer derived from the persona map),
+    # so its absence must fail loud — there is no other source.
+    global_config = load_global_config(write_global_config(tmp_path))
+    no_cadence_yaml = VALID_CAMPAIGN_YAML.replace("cadence: [2, 3, 5]\n", "")
+    campaigns_dir, _ = write_campaign(tmp_path, campaign_yaml=no_cadence_yaml)
+    with pytest.raises(ConfigError, match="cadence"):
+        load_campaign("coldpost", global_config, campaigns_dir)
+
+
+@pytest.mark.parametrize("bad_cadence", ["cadence: []", "cadence: [2, 0, 5]", "cadence: [2, -1]",
+                                         "cadence: 5", "cadence: [2, foo]"])
+def test_load_campaign_invalid_cadence_fails_loud(tmp_path, bad_cadence):
+    global_config = load_global_config(write_global_config(tmp_path))
+    bad_yaml = VALID_CAMPAIGN_YAML.replace("cadence: [2, 3, 5]", bad_cadence)
+    campaigns_dir, _ = write_campaign(tmp_path, campaign_yaml=bad_yaml)
+    with pytest.raises(ConfigError, match="cadence"):
         load_campaign("coldpost", global_config, campaigns_dir)
 
 
@@ -432,14 +457,79 @@ def test_load_campaign_rejects_reserved_campaign_field(tmp_path, extra_field):
         load_campaign("coldpost", global_config, campaigns_dir)
 
 
-def test_load_campaign_latex_disabled_requires_attachment_file(tmp_path):
+STATIC_CAMPAIGN_YAML = VALID_CAMPAIGN_YAML.replace(
+    "latex:\n  enabled: true", "latex:\n  enabled: false"
+)
+
+
+def test_load_campaign_latex_disabled_requires_resumes(tmp_path):
+    # latex.enabled: false with no `resumes:` list → fail loud (the résumé must
+    # come from somewhere; it's now a docs/ send_tag, not a per-campaign file).
     global_config = load_global_config(write_global_config(tmp_path))
-    no_attachment_yaml = VALID_CAMPAIGN_YAML.replace(
-        "latex:\n  enabled: true", "latex:\n  enabled: false"
-    )
-    campaigns_dir, _ = write_campaign(tmp_path, campaign_yaml=no_attachment_yaml)
+    campaigns_dir, _ = write_campaign(tmp_path, campaign_yaml=STATIC_CAMPAIGN_YAML)
+    with pytest.raises(ConfigError, match="resumes"):
+        load_campaign("coldpost", global_config, campaigns_dir)
+
+
+def test_load_campaign_static_resolves_resume_tag_to_docs_path(tmp_path):
+    global_config = load_global_config(write_global_config(tmp_path))
+    static_yaml = STATIC_CAMPAIGN_YAML + "resumes: [default]\n"
+    campaigns_dir, _ = write_campaign(tmp_path, campaign_yaml=static_yaml)
+    campaign = load_campaign("coldpost", global_config, campaigns_dir)
+    # resume_paths maps the tag to docs_dir/<send_tags[tag]>.
+    assert list(campaign.resume_paths) == ["default"]
+    assert campaign.resume_paths["default"].name == "resume.pdf"
+    assert campaign.resume_paths["default"].parent.name == "docs"
+
+
+def test_load_campaign_unknown_resume_tag_fails_loud(tmp_path):
+    global_config = load_global_config(write_global_config(tmp_path))
+    static_yaml = STATIC_CAMPAIGN_YAML + "resumes: [nope]\n"
+    campaigns_dir, _ = write_campaign(tmp_path, campaign_yaml=static_yaml)
+    with pytest.raises(ConfigError, match="send_tags"):
+        load_campaign("coldpost", global_config, campaigns_dir)
+
+
+def test_load_campaign_obsolete_attachment_file_fails_loud(tmp_path):
+    # The old per-campaign attachment_file model is gone — a stale key is a
+    # fail-loud with migration guidance, not silently ignored.
+    global_config = load_global_config(write_global_config(tmp_path))
+    stale_yaml = STATIC_CAMPAIGN_YAML + "resumes: [default]\nattachment_file: resume.pdf\n"
+    campaigns_dir, _ = write_campaign(tmp_path, campaign_yaml=stale_yaml)
     with pytest.raises(ConfigError, match="attachment_file"):
         load_campaign("coldpost", global_config, campaigns_dir)
+
+
+# --- docs_dir / send_tags (global config) ----------------------------------
+
+def test_load_global_config_docs_dir_and_send_tags_parsed(tmp_path):
+    cfg = load_global_config(write_global_config(tmp_path))
+    assert cfg.docs_dir.name == "docs"
+    assert cfg.send_tags == {"default": "resume.pdf"}
+
+
+def test_load_global_config_docs_dir_defaults_when_absent(tmp_path):
+    text = VALID_CONFIG_YAML.replace("docs_dir: docs\n", "")
+    cfg = load_global_config(write_global_config(tmp_path, text))
+    assert cfg.docs_dir.name == "docs"  # dataclass default
+
+
+def test_load_global_config_send_tags_absent_is_empty(tmp_path):
+    text = VALID_CONFIG_YAML.replace("send_tags:\n  default: resume.pdf\n", "")
+    cfg = load_global_config(write_global_config(tmp_path, text))
+    assert cfg.send_tags == {}
+
+
+def test_load_global_config_send_tags_non_mapping_fails_loud(tmp_path):
+    text = VALID_CONFIG_YAML.replace("send_tags:\n  default: resume.pdf", "send_tags: oops")
+    with pytest.raises(ConfigError, match="send_tags"):
+        load_global_config(write_global_config(tmp_path, text))
+
+
+def test_load_global_config_send_tags_non_string_filename_fails_loud(tmp_path):
+    text = VALID_CONFIG_YAML.replace("  default: resume.pdf", "  default: 123")
+    with pytest.raises(ConfigError, match="send_tags"):
+        load_global_config(write_global_config(tmp_path, text))
 
 
 def test_load_campaign_name_field_absent_defaults_to_none(tmp_path):

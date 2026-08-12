@@ -119,17 +119,21 @@ campaigns/
     stage1.txt       # follow-up bodies — no subject line, they thread as replies
     stage2.txt
     stage3.txt
-    resume.pdf       # only needed when latex.enabled is false
 ```
+
+Résumé PDFs are **not** kept per-campaign — they live in one central `docs/` folder
+(`docs_dir` in `config.yaml`) and are referenced by tag (see below).
 
 `campaign.yaml`:
 
 ```yaml
-persona: recruiter                # -> derives the fixed cadence from config.yaml
+persona: recruiter                # content/register; must exist in config.yaml personas
+cadence: [2, 3, 5]                # follow-up stage offsets (days); length == stageN.txt count
 latex:
-  enabled: true                   # false -> use the static attachment_file instead
+  enabled: true                   # false -> attach a static résumé from docs/ (see resumes:)
   attachment_name: "Firstname_Lastname_Resume.pdf"   # filename the recipient sees
-attachment_file: resume.pdf       # used only when latex.enabled is false
+resumes: [fde, ds]                # (static only) which config.yaml send_tags this campaign
+                                   # offers; first is the default, picked interactively or via --resume
 fields:
   - { key: email,        label: Email }
   - { key: role_catted,  label: Role }

@@ -270,7 +270,7 @@ def build_campaign_settings(cadence: list, stage_bodies: list, *, open_tracking:
                              stop_action: str = "r", allowed_days: list = None,
                              skip_holidays: bool = None) -> dict:
     """Build the flat send_campaign() body for an initial send: one
-    stageNDays/stageNCampaignText/stageNAction triple per persona cadence
+    stageNDays/stageNCampaignText/stageNAction triple per campaign cadence
     stage, using GMass's English-ordinal field names. Does not cover the OOO
     send-as-reply shape (sendAsReply/campaignIdToReplyTo) — that's a
     distinct, simpler payload built by step 10's re-queue path.

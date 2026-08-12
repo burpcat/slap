@@ -92,11 +92,12 @@ def _set_env_value(path: Path, key: str, value: str) -> None:
 
 
 EXAMPLE_CAMPAIGN_FILES = {
-    "campaign.yaml": """persona: recruiter               # -> derives the fixed cadence from config.yaml's personas:
+    "campaign.yaml": """persona: recruiter               # content/register only (must exist in config.yaml's personas:)
+cadence: [2, 3, 5]               # follow-up stage offsets in days; length must match the stageN.txt count
 latex:
   enabled: false                 # true = paste + compile a LaTeX resume per recipient at send time
   attachment_name: "Your_Name_Resume.pdf"   # filename the recipient sees
-attachment_file: resume.pdf      # used only when latex.enabled is false -- replace this placeholder PDF
+resumes: [default]               # used when latex.enabled is false -- send_tags from config.yaml (first = default)
 fields:
   - { key: email,        label: Email }
   - { key: role_catted,  label: Role }
@@ -308,10 +309,16 @@ def step_first_campaign(*, read_line=input) -> None:
     dest.mkdir(parents=True)
     for filename, content in EXAMPLE_CAMPAIGN_FILES.items():
         (dest / filename).write_text(content)
-    (dest / "resume.pdf").write_bytes(_placeholder_pdf())
+    # The example campaign references send_tag 'default' -> docs/resume.pdf (see
+    # config.yaml.example). Seed a placeholder there, matching the default
+    # docs_dir; don't clobber a real résumé already placed.
+    docs_resume = Path("docs") / "resume.pdf"
+    docs_resume.parent.mkdir(parents=True, exist_ok=True)
+    if not docs_resume.exists():
+        docs_resume.write_bytes(_placeholder_pdf())
     display.success(
         f"  Scaffolded {dest}/ — edit campaign.yaml/initial.txt/stageN.txt, and replace the placeholder "
-        f"resume.pdf with your real resume, before running `send`."
+        f"{docs_resume} with your real resume, before running `send`."
     )
 
 

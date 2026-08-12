@@ -11,10 +11,21 @@ import pytest
 import yaml
 
 from slap import onboard
-from slap.config import ConfigError, load_campaign, load_global_config
+from slap.config import ConfigError, GlobalConfig, ScheduleConfig, load_campaign, load_global_config
 from slap.doctor import run_campaign_checks
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _gc_with_tags(send_tags={"default": "resume.pdf"}):
+    """Minimal GlobalConfig carrying send_tags, for the résumé-tag prompts."""
+    return GlobalConfig(
+        from_email="o@x.com", from_name="O", api_key_env="GMASS_API_KEY",
+        personas={"recruiter": [2, 3, 5]},
+        schedule=ScheduleConfig("09:00", "09:15", 10, 15, 500, 3, ["mon"]),
+        consumer_domains_file="consumer_domains.txt", path=Path("config.yaml"),
+        send_tags=send_tags,
+    )
 
 
 def _plain(out: str) -> str:
@@ -221,33 +232,37 @@ def test_review_returns_false_on_decline():
 # --- _ask_latex_and_attachment ----------------------------------------------
 
 def test_ask_latex_and_attachment_latex_enabled_skips_resume_prompt():
-    result = onboard._ask_latex_and_attachment(read_line=ScriptedInput(["y", "MyResume.pdf"]))
-    assert result == {"latex_enabled": True, "attachment_name": "MyResume.pdf",
-                       "attachment_file": None, "resume_bytes": None}
+    result = onboard._ask_latex_and_attachment(_gc_with_tags(), read_line=ScriptedInput(["y", "MyResume.pdf"]))
+    assert result == {"latex_enabled": True, "attachment_name": "MyResume.pdf", "resumes": []}
 
 
-def test_ask_latex_and_attachment_static_copies_real_pdf(tmp_path):
-    real_pdf = tmp_path / "real.pdf"
-    real_pdf.write_bytes(b"%PDF-1.4 real content")
+def test_ask_latex_and_attachment_static_picks_named_tag(tmp_path):
+    # Static campaigns now choose from config.yaml send_tags (résumés live in
+    # docs/), not by copying a PDF into the campaign folder.
     result = onboard._ask_latex_and_attachment(
-        read_line=ScriptedInput(["n", "Resume.pdf", str(real_pdf)])
+        _gc_with_tags({"default": "resume.pdf", "fde": "fde.pdf"}),
+        read_line=ScriptedInput(["n", "Resume.pdf", "fde"]),
     )
-    assert result["latex_enabled"] is False
-    assert result["attachment_file"] == "resume.pdf"
-    assert result["resume_bytes"] == b"%PDF-1.4 real content"
+    assert result == {"latex_enabled": False, "attachment_name": "Resume.pdf", "resumes": ["fde"]}
 
 
-def test_ask_latex_and_attachment_static_blank_path_falls_back_to_placeholder():
-    result = onboard._ask_latex_and_attachment(read_line=ScriptedInput(["n", "Resume.pdf", ""]))
-    assert result["resume_bytes"] == onboard.placeholder_pdf()
+def test_ask_latex_and_attachment_static_blank_uses_default_tag():
+    # Blank at the tag prompt accepts the first (default) send_tag.
+    result = onboard._ask_latex_and_attachment(_gc_with_tags(), read_line=ScriptedInput(["n", "Resume.pdf", ""]))
+    assert result["resumes"] == ["default"]
 
 
-def test_ask_latex_and_attachment_static_bad_path_falls_back_to_placeholder_with_warning(capsys):
+def test_ask_latex_and_attachment_static_rejects_unknown_tag_then_accepts(capsys):
     result = onboard._ask_latex_and_attachment(
-        read_line=ScriptedInput(["n", "Resume.pdf", "/no/such/file.pdf"])
+        _gc_with_tags(), read_line=ScriptedInput(["n", "Resume.pdf", "bogus", "default"])
     )
-    assert result["resume_bytes"] == onboard.placeholder_pdf()
-    assert "Could not read" in capsys.readouterr().out
+    assert result["resumes"] == ["default"]
+    assert "Unknown tag" in capsys.readouterr().out
+
+
+def test_ask_latex_and_attachment_static_no_send_tags_fails_loud():
+    with pytest.raises(onboard.OnboardError, match="send_tags"):
+        onboard._ask_latex_and_attachment(_gc_with_tags({}), read_line=ScriptedInput(["n", "Resume.pdf"]))
 
 
 # --- _write_campaign + load_campaign round-trip -----------------------------
@@ -261,14 +276,18 @@ def test_write_campaign_produces_a_valid_loadable_campaign(tmp_path, monkeypatch
         "company": {"key": "company", "label": "Company", "optional": False},
         "req_id": {"key": "req_id", "label": "Req ID", "optional": True},
     }
+    # Static campaign references the docs/ résumé via the `default` send_tag;
+    # seed the file so doctor's existence check passes.
+    (tmp_path / "docs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "docs" / "resume.pdf").write_bytes(b"%PDF-1.4 x")
     dest = onboard._write_campaign(
-        "my-camp", persona="recruiter",
+        "my-camp", persona="recruiter", cadence=[2, 3, 5],
         raw_initial_text="Subject: hi {{company}}{{req_id}}\n\nbody {{company}} {{signature}}",
         stage_bodies_raw=["follow 1 {{signature}}", "follow 2 {{signature}}", "follow 3 {{signature}}"],
-        fields=fields, latex_enabled=False, attachment_name="Resume.pdf",
-        attachment_file="resume.pdf", resume_bytes=b"%PDF-1.4 x",
+        fields=fields, latex_enabled=False, attachment_name="Resume.pdf", resumes=["default"],
     )
     assert dest.resolve() == (tmp_path / "campaigns" / "my-camp").resolve()
+    assert not (dest / "resume.pdf").exists()  # no per-campaign PDF anymore
     campaign = load_campaign("my-camp", gc, campaigns_dir=tmp_path / "campaigns")
     assert campaign.persona == "recruiter"
     assert campaign.cadence == [2, 3, 5]
@@ -283,20 +302,28 @@ def test_write_campaign_latex_enabled_writes_no_resume_file(tmp_path, monkeypatc
     _copy_config(tmp_path)
     fields = {"email": {"key": "email", "label": "Email", "optional": False}}
     dest = onboard._write_campaign(
-        "latex-camp", persona="founder", raw_initial_text="Subject: hi\n\nbody {{signature}}",
+        "latex-camp", persona="founder", cadence=[2, 4, 6],
+        raw_initial_text="Subject: hi\n\nbody {{signature}}",
         stage_bodies_raw=["f1 {{signature}}", "f2 {{signature}}", "f3 {{signature}}"],
-        fields=fields, latex_enabled=True, attachment_name="Resume.pdf",
-        attachment_file=None, resume_bytes=None,
+        fields=fields, latex_enabled=True, attachment_name="Resume.pdf", resumes=[],
     )
     assert not (dest / "resume.pdf").exists()
+    # cadence is persisted to campaign.yaml (no longer derived from the persona map)
+    assert yaml.safe_load((dest / "campaign.yaml").read_text())["cadence"] == [2, 4, 6]
 
 
 # --- full run_onboard_campaign() integration --------------------------------
 
-def _full_answers(*, persona="recruiter", followups=3, latex_answer="n",
+def _full_answers(*, persona="recruiter", followups=3, cadence=None, latex_answer="n",
                    attachment_name="", resume_path=""):
+    # cadence: the answer typed at the wizard's cadence prompt (which now
+    # immediately follows persona). None -> an explicit comma-joined list of
+    # length `followups`, independent of the persona map. "" -> accept the
+    # suggested default (the chosen persona's cadence).
+    if cadence is None:
+        cadence = ",".join(str(d) for d in range(2, 2 + followups))
     return (
-        ["my-campaign", persona]
+        ["my-campaign", persona, cadence]
         + INITIAL_TEMPLATE.split("\n")
         + ["", "",   # byebye
            "", "",   # company
@@ -312,6 +339,10 @@ def _full_answers(*, persona="recruiter", followups=3, latex_answer="n",
 def test_run_onboard_campaign_end_to_end_writes_valid_campaign(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     _copy_config(tmp_path)
+    # Static campaign resolves the `default` send_tag -> docs/resume.pdf; seed it
+    # so the campaign passes doctor's résumé-existence check.
+    (tmp_path / "docs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "docs" / "resume.pdf").write_bytes(b"%PDF-real")
 
     onboard.run_onboard_campaign(read_line=ScriptedInput(_full_answers()))
 
@@ -325,16 +356,15 @@ def test_run_onboard_campaign_end_to_end_writes_valid_campaign(tmp_path, monkeyp
     assert fields_declared == {"email", "byebye", "company", "contact_name", "role_catted"}
 
 
-def test_run_onboard_campaign_follow_up_count_tracks_persona_cadence_length(tmp_path, monkeypatch):
-    # Real owner's config.yaml has an actual undocumented 2-stage persona
-    # ("vibe: [2, 4]") -- reused here to prove the wizard asks for exactly
-    # the CHOSEN persona's cadence length, not a hardcoded 3.
+def test_run_onboard_campaign_follow_up_count_tracks_chosen_cadence_length(tmp_path, monkeypatch):
+    # Cadence is now chosen per campaign (no longer derived from the persona
+    # map), so the wizard must ask for exactly len(chosen cadence) stage bodies
+    # -- here a 2-stage cadence, not a hardcoded 3.
     monkeypatch.chdir(tmp_path)
-    _copy_config(tmp_path, extra_persona_yaml="  vibe: { stages: [2, 4] }\n")
+    _copy_config(tmp_path)
     gc = load_global_config(tmp_path / "config.yaml")
-    assert gc.personas["vibe"] == [2, 4]
 
-    onboard.run_onboard_campaign(read_line=ScriptedInput(_full_answers(persona="vibe", followups=2)))
+    onboard.run_onboard_campaign(read_line=ScriptedInput(_full_answers(cadence="2,4", followups=2)))
 
     campaign = load_campaign("my-campaign", gc, campaigns_dir=tmp_path / "campaigns")
     assert campaign.cadence == [2, 4]
@@ -371,9 +401,13 @@ def test_run_onboard_campaign_never_overwrites_existing_folder(tmp_path, monkeyp
 def test_run_onboard_campaign_placeholder_resume_warns_via_doctor(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
     _copy_config(tmp_path)
+    # The default send_tag resolves to docs/resume.pdf; seed it with the exact
+    # placeholder bytes so doctor's per-tag placeholder check fires.
+    (tmp_path / "docs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "docs" / "resume.pdf").write_bytes(onboard.placeholder_pdf())
     onboard.run_onboard_campaign(read_line=ScriptedInput(_full_answers()))
     out = _plain(capsys.readouterr().out)
-    assert "resume placeholder: FAIL" in out
+    assert "resume placeholder 'default': FAIL" in out
     assert "replace it with your real résumé" in out
 
 

@@ -262,7 +262,8 @@ def test_step_first_campaign_scaffolds_and_passes_doctor(tmp_path, monkeypatch):
 
     campaign_dir = tmp_path / "campaigns" / "example-campaign"
     assert (campaign_dir / "campaign.yaml").exists()
-    assert (campaign_dir / "resume.pdf").exists()
+    assert not (campaign_dir / "resume.pdf").exists()  # résumé lives centrally now
+    assert (tmp_path / "docs" / "resume.pdf").exists()  # seeded in docs/ instead
 
     from slap.config import load_campaign
     gc = load_global_config(tmp_path / "config.yaml")
@@ -362,14 +363,14 @@ def test_run_init_end_to_end(tmp_path, monkeypatch, capsys):
     from slap.doctor import print_report
     gc = load_global_config(tmp_path / "config.yaml")
     capsys.readouterr()  # discard run_init's own output before the standalone report below
-    # The scaffolded example campaign's resume.pdf is the exact placeholder
+    # The scaffolded example campaign's docs/resume.pdf is the exact placeholder
     # `check_placeholder_resume` (post-launch, onboard-campaign) exists to
     # flag -- print_report correctly returns False here until it's replaced,
     # not a regression. Assert THAT's the one and only thing wrong.
     assert print_report(gc) is False
     out = capsys.readouterr().out
-    assert "resume placeholder: FAIL" in out
-    assert "attachment_file: OK" in out
+    assert "resume placeholder 'default': FAIL" in out
+    assert "resume 'default': OK" in out  # the file exists (it's just the placeholder)
 
 
 def test_run_init_is_fully_idempotent_on_second_run(tmp_path, monkeypatch):

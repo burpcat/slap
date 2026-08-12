@@ -51,6 +51,21 @@ schedule:
 tracking:
   consumer_domains_file: consumer_domains.txt
 
+# Optional — folder holding every résumé PDF (defaults to "docs" if omitted).
+# Replaces the old per-campaign campaigns/<name>/resume.pdf: each static
+# (latex-off) campaign now references one or more of the send_tags below.
+docs_dir: docs
+
+# Optional — named résumé shortcuts: tag -> filename inside docs_dir. A campaign
+# lists which tags it offers under `resumes:` in its campaign.yaml (first = the
+# default); `slap.py send --resume <tag>` forces one from the command line and
+# skips the interactive picker. A campaign that references an undefined tag fails
+# loud. Hold as many résumés here as you like (e.g. fde.pdf, ds.pdf).
+send_tags:
+  default: resume.pdf
+  # fde: fde.pdf
+  # ds:  ds.pdf
+
 # Optional — the command `slap.py send custom` (and `remind --new`) uses to open
 # a scratch file for authoring. Defaults to "code --wait" if omitted. Use a FULL
 # command: GUI editors need a blocking flag (VS Code: `code --wait`, Sublime:
