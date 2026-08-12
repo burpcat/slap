@@ -61,10 +61,16 @@ def test_help_lists_all_subcommands():
         assert cmd in result.stdout
 
 
-def test_send_without_campaign_is_argparse_usage_error():
-    result = run("send")
-    assert result.returncode == 2
-    assert "not yet implemented" not in result.stderr
+def test_send_without_campaign_enters_unified_mode_and_fails_loud_without_config(tmp_path):
+    # Bare `send` is no longer an argparse usage error — it dispatches to
+    # unified mode (campaign named per-drop). With no config.yaml it must still
+    # fail loud on load_global_config BEFORE ever reading stdin for a paste
+    # (no input= here: a hang would time out the test instead of returning).
+    result = run("send", cwd=tmp_path)
+    assert result.returncode != 0
+    assert "config.yaml" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not (tmp_path / "slap.db").exists()
 
 
 def test_send_fails_loud_for_unknown_campaign(tmp_path):
@@ -252,6 +258,81 @@ def test_send_stray_old_terminator_line_inside_paste_does_not_truncate(tmp_path)
     assert result.returncode == 0, result.stderr
     assert "empty fields" not in result.stdout
     assert "Staged" in result.stdout
+
+
+# --- unified `send` mode (bare `send`, campaign named per-drop) ------------
+
+def _setup_second_campaign(tmp_path, name="warmpost"):
+    # A second campaign alongside coldpost (from _setup_three_field_campaign),
+    # so one unified session can be shown routing consecutive drops to distinct
+    # campaigns. Distinct subject template makes the per-drop routing visible.
+    campaign = tmp_path / "campaigns" / name
+    campaign.mkdir(parents=True)
+    (campaign / "campaign.yaml").write_text(
+        "persona: recruiter\n"
+        "latex: { enabled: false, attachment_name: r2.pdf }\n"
+        "attachment_file: resume.pdf\n"
+        "fields:\n  - { key: email, label: Email }\n  - { key: company, label: Company }\n"
+    )
+    (campaign / "resume.pdf").write_bytes(b"%PDF-fake2")
+    (campaign / "initial.txt").write_text("Subject: Warm {{company}}\n\nWarm hi {{company}}\n")
+    for i in (1, 2, 3):
+        (campaign / f"stage{i}.txt").write_text(f"warm stage {i}\n")
+    return campaign
+
+
+def test_send_unified_routes_consecutive_drops_to_their_own_campaigns(tmp_path):
+    _setup_three_field_campaign(tmp_path)  # coldpost
+    _setup_second_campaign(tmp_path)       # warmpost
+
+    scripted_stdin = "\n".join([
+        # drop 1 -> coldpost
+        "campaign: coldpost", "Email: jane@acme.com", "Company: Acme", "",
+        "<<<EOF>>>", "", "y", "y",          # follow-ups default, stage, add-another
+        # drop 2 -> warmpost, SAME session
+        "campaign: warmpost", "Email: bob@beta.com", "Company: Beta", "",
+        "<<<EOF>>>", "", "y", "n", "",      # follow-ups default, stage, stop
+    ])
+
+    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    result = run("send", cwd=tmp_path, env=env, input=scripted_stdin)  # bare `send` = unified
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Staged jane@acme.com" in result.stdout
+    assert "Staged bob@beta.com" in result.stdout
+
+    cold = json.loads((tmp_path / "workdir" / "coldpost" / "jane@acme.com" / "staged.json").read_text())
+    warm = json.loads((tmp_path / "workdir" / "warmpost" / "bob@beta.com" / "staged.json").read_text())
+    assert cold["campaign"] == "coldpost"
+    assert cold["subject"] == "Hi from Acme"
+    assert warm["campaign"] == "warmpost"
+    assert warm["subject"] == "Warm Beta"
+
+
+def test_send_unified_fails_loud_per_drop_but_keeps_looping(tmp_path):
+    _setup_three_field_campaign(tmp_path)  # coldpost
+
+    scripted_stdin = "\n".join([
+        # drop 1: no `campaign :` line -> error, nothing staged, loop continues
+        "Email: jane@acme.com", "Company: Acme", "",
+        "<<<EOF>>>", "y",
+        # drop 2: unknown campaign -> error, nothing staged, loop continues
+        "campaign: does-not-exist", "Email: jane@acme.com", "Company: Acme", "",
+        "<<<EOF>>>", "y",
+        # drop 3: valid -> stages, proving the session survived both failures
+        "campaign: coldpost", "Email: jane@acme.com", "Company: Acme", "",
+        "<<<EOF>>>", "", "y", "n", "",
+    ])
+
+    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    result = run("send", cwd=tmp_path, env=env, input=scripted_stdin)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "No 'campaign :' value" in result.stdout      # drop 1 error (stdout, non-fatal)
+    assert "does-not-exist" in result.stdout             # drop 2 error (stdout, non-fatal)
+    assert "Staged jane@acme.com" in result.stdout       # drop 3 succeeded
+    assert (tmp_path / "workdir" / "coldpost" / "jane@acme.com" / "staged.json").exists()
+    assert "Traceback" not in result.stderr
 
 
 def test_doctor_fails_loud_without_config(tmp_path):
