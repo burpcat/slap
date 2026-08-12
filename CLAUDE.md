@@ -81,16 +81,16 @@ that sends may target **only** the owner's own inbox via Gmail plus-tags
 
 ## Config & layout (§4)
 
-- `config.yaml` (global): sender, `gmass.api_key_env`, fixed **persona cadences**
-  (`hiring_manager [2,4,6]`, `recruiter [2,3,5]`, `founder [2,5,7]`), schedule knobs,
-  tracking.
+- `config.yaml` (global): sender, `gmass.api_key_env`, **personas** (content register +
+  suggested/legacy stage lists — the live cadence is now per-campaign, see below),
+  `docs_dir` + `send_tags` (central résumé store: tag → filename), schedule knobs, tracking.
 - `campaigns/<name>/` is **auto-discovered** — any folder with a valid `campaign.yaml` is
   live. No central registry. Contains `campaign.yaml`, `initial.txt`, `stageN.txt`. Static
   (latex-off) campaigns reference résumés from the central `docs/` folder by tag
   (`config.yaml` `docs_dir` + `send_tags`; campaign.yaml lists `resumes: [tag, …]`), rather
   than keeping a per-campaign `resume.pdf`.
 - Loader is **fail-loud**: `initial.txt` needs a `Subject:` first line + blank-line
-  separator; the number of `stageN.txt` files must equal the persona cadence length.
+  separator; the number of `stageN.txt` files must equal the campaign's own `cadence:` length.
 - **Template fill is local** (`{{key}}`), not GMass merge. A field marked `optional: true`
   that is empty **drops its whole line**.
 - **Drop parser** (preserve exactly): split each line on the **first** colon

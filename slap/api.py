@@ -163,11 +163,13 @@ def _command_examples(name: str, args: list, campaigns: list, recipient: str) ->
     c1 = campaigns[1] if len(campaigns) > 1 else c0
     curated = {
         "list": ["slap.py list"],
-        "send": [f"slap.py send {c0}", f"slap.py send {c1} --now", "slap.py send custom"],
+        "send": [f"slap.py send {c0}", "slap.py send", f"slap.py send {c1} --now",
+                 f"slap.py send {c0} --resume default", "slap.py send custom"],
         "runner": ["slap.py runner"],
         "sync": ["slap.py sync"],
         "dashboard": ["slap.py dashboard"],
-        "doctor": ["slap.py doctor"],
+        "doctor": ["slap.py doctor", "slap.py doctor --prune-archive",
+                   "slap.py doctor --prune-archive --confirm"],
         "domains": ["slap.py domains"],
         "rebuild": ["slap.py rebuild"],
         "bounced": ["slap.py bounced"],
