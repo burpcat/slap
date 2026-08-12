@@ -346,6 +346,13 @@ def load_campaign(name: str, global_config: GlobalConfig, campaigns_dir: Path = 
         fields.append(CampaignField(key=f["key"], label=f["label"], optional=bool(f.get("optional", False))))
     if not any(f.key == "email" for f in fields):
         raise ConfigError(f"{yaml_path}: 'fields' must include a field with key 'email' — send needs it")
+    # 'campaign' is reserved as the unified-mode selector — reject it as BOTH a
+    # key and a label, since parse_drop matches a drop line against either
+    # (slap/templates.py); a colliding label would otherwise silently capture
+    # the `campaign :` selector value into this field and leak it into templates.
+    if any(f.key.lower() == "campaign" or f.label.lower() == "campaign" for f in fields):
+        raise ConfigError(f"{yaml_path}: 'campaign' is reserved as a field key/label — it selects the "
+                          f"campaign in unified `slap.py send` mode; rename this field")
 
     name_field = raw.get("name_field")
     if name_field is not None:

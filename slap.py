@@ -17,7 +17,8 @@ from dotenv import load_dotenv
 from slap import display
 from slap.cleanup import DEFAULT_MIN_DAYS_IDLE, delete_eligible, find_cleanup_candidates
 from slap.config import (
-    ConfigError, discover_campaigns, load_campaign, load_global_config, parse_initial_txt_text,
+    CampaignField, ConfigError, discover_campaigns, load_campaign, load_global_config,
+    parse_initial_txt_text,
 )
 from slap.latex import recipient_workdir, run_latex_loop
 from slap.prompts import PASTE_TERMINATOR, read_paste
@@ -67,12 +68,30 @@ def _run_doctor_or_exit(global_config, campaign=None):
         sys.exit(1)
 
 
+def _campaign_doctor_ok(campaign) -> bool:
+    """Per-campaign preflight for unified mode, WITHOUT exiting. Unlike
+    _run_doctor_or_exit (which sys.exit(1)s on any failure), a bad campaign here
+    must only fail THIS drop and let cmd_send_unified's loop keep going for the
+    next paste. The global battery is still hard-gated once up front, since a
+    broken global env can't be worked around per-drop."""
+    failures = [r for r in doctor.run_campaign_checks(campaign) if not r.ok]
+    if failures:
+        lines = "\n".join(f"    - {r.name}: {r.detail}" for r in failures)
+        display.error(f"⚠ Campaign '{campaign.name}' failed preflight — run `slap.py doctor` "
+                      f"for details:\n{lines}")
+    return not failures
+
+
 def cmd_send(args):
     # `slap.py send custom` is a distinct one-off mode, not a real campaign
     # folder — "custom" is a reserved campaign token (a campaigns/custom/ folder
     # would be shadowed by this branch; documented in USAGE).
     if args.campaign == "custom":
         return cmd_send_custom(args)
+    # Bare `slap.py send` (no campaign arg) → unified mode: each drop carries a
+    # `campaign :` line naming its own campaign, so one session can span many.
+    if args.campaign is None:
+        return cmd_send_unified(args)
     try:
         global_config = load_global_config()
         campaign = load_campaign(args.campaign, global_config)
@@ -104,6 +123,94 @@ def cmd_send(args):
         else:
             _prep_one_recipient(conn, campaign, consumer_domains, values, recipient, archive_dir,
                                 signature=global_config.signature)
+
+        if input("\nAdd another? [Y/n]: ").strip().lower() == "n":
+            break
+
+    if args.now:
+        print("\n--now: draining the queue immediately...")
+        result = runner.drain(conn, global_config, os.environ.get(global_config.api_key_env, ""))
+        _print_drain_result(result)
+
+
+# Reserved drop key that selects the campaign in unified mode. load_campaign()
+# rejects any campaign that declares a field with this key (see slap/config.py).
+CAMPAIGN_SELECTOR_KEY = "campaign"
+
+
+def _extract_campaign_selector(drop_text: str) -> str:
+    """Pass 1 of the unified-mode two-pass parse: pull just the `campaign :`
+    value out of a drop, reusing parse_drop's exact partition/strip semantics so
+    the selector line is read identically to every other field. Returns '' when
+    the line is absent/empty. The real per-campaign parse (pass 2) runs later
+    with the resolved campaign's own fields; the `campaign :` line is an unknown
+    key there and is harmlessly ignored, so it never reaches template values."""
+    selector_field = [CampaignField(key=CAMPAIGN_SELECTOR_KEY, label=CAMPAIGN_SELECTOR_KEY)]
+    return parse_drop(drop_text, selector_field)[CAMPAIGN_SELECTOR_KEY].strip()
+
+
+def cmd_send_unified(args):
+    """Unified `send` (bare, no campaign arg): one interactive session that can
+    stage drops for ANY campaign back-to-back. Each drop names its own campaign
+    via a `campaign :` line; the campaign's settings/cadence/templates are
+    resolved per-drop. Fail-loud but session-preserving — a drop with a
+    missing/unknown campaign errors and is skipped, but the loop keeps going."""
+    try:
+        global_config = load_global_config()
+    except ConfigError as e:
+        display.fail(f"slap: {e}")
+        sys.exit(1)
+
+    # Global battery only, once up front (no campaign known yet). Per-campaign
+    # checks run inside the loop, non-fatally, as each campaign is first seen.
+    _run_doctor_or_exit(global_config)
+
+    try:
+        consumer_domains = domains.load_consumer_domains(Path(global_config.consumer_domains_file))
+    except domains.DomainsError as e:
+        display.fail(f"slap: {e}")
+        sys.exit(1)
+
+    conn = tracking.connect()
+
+    archive_dir = archive.archive_dir_from_env()
+    if archive_dir is None:
+        display.plain(f"Résumé archive is off ({archive.ENV_VAR} not set) — see .env.example to enable.")
+
+    # Per-session cache of resolved campaigns — a campaign is loaded and
+    # doctor-checked at most once even if many drops target it.
+    resolved = {}
+
+    while True:
+        drop_text = read_paste("\nPaste a drop (include a 'campaign :' line naming the campaign)")
+
+        campaign_name = _extract_campaign_selector(drop_text)
+        if not campaign_name:
+            display.error("No 'campaign :' value found in the drop — skipping this recipient.")
+        elif campaign_name in (CUSTOM_CAMPAIGN, "custom"):
+            display.error(f"'{campaign_name}' is reserved — use `slap.py send custom` for a one-off "
+                          f"send. Skipping this recipient.")
+        else:
+            campaign = resolved.get(campaign_name)
+            if campaign is None:
+                try:
+                    campaign = load_campaign(campaign_name, global_config)
+                except ConfigError as e:
+                    display.error(f"⚠ Campaign '{campaign_name}': {e} — skipping this recipient.")
+                    campaign = None
+                if campaign is not None and not _campaign_doctor_ok(campaign):
+                    campaign = None
+                if campaign is not None:
+                    resolved[campaign_name] = campaign
+
+            if campaign is not None:
+                values = parse_drop(drop_text, campaign.fields)
+                recipient = values.get("email", "").strip()
+                if not recipient:
+                    display.error("No 'Email' value found in the drop — skipping this recipient.")
+                else:
+                    _prep_one_recipient(conn, campaign, consumer_domains, values, recipient, archive_dir,
+                                        signature=global_config.signature)
 
         if input("\nAdd another? [Y/n]: ").strip().lower() == "n":
             break
@@ -1007,9 +1114,14 @@ def build_parser():
     sub.add_parser("list", help="List auto-discovered campaigns").set_defaults(func=cmd_list)
 
     p_send = sub.add_parser(
-        "send", help="Prep flow: stage a recipient to the queue (use `send custom` for a one-off editor-authored send)"
+        "send", help="Prep flow: stage a recipient to the queue. Bare `send` = unified mode "
+                     "(each drop names its own campaign via a 'campaign :' line); "
+                     "`send <name>` locks the session to one campaign; `send custom` = one-off editor send"
     )
-    p_send.add_argument("campaign", help="Campaign name, or the literal 'custom' for an editor-authored one-off send")
+    p_send.add_argument(
+        "campaign", nargs="?", default=None,
+        help="Campaign name to lock this session to; omit for unified mode (campaign read from each "
+             "drop's 'campaign :' line); or the literal 'custom' for an editor-authored one-off send")
     p_send.add_argument("--now", action="store_true", help="Also drain immediately after staging")
     p_send.set_defaults(func=cmd_send)
 

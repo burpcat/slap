@@ -189,7 +189,28 @@ Company signal: you shipped the new search re-ranking system
 ## The send flow
 
 ```bash
-python slap.py send my-campaign
+python slap.py send my-campaign   # lock the whole session to one campaign
+python slap.py send               # unified: each drop names its own campaign
+```
+
+`send` has two interactive forms (plus `send custom`, below). **`send <campaign>`** locks
+the whole session to that one campaign. **Bare `send`** is *unified mode*: you don't name a
+campaign on the command line — instead each drop carries a reserved **`campaign :`** line
+naming its own campaign, so a single window can stage for many campaigns back-to-back (a
+recruiter drop, then a founder drop, then a hiring-manager drop). Everything else about the
+flow below is identical. In unified mode a drop whose `campaign :` is missing or names an
+unknown/invalid campaign prints an error and is skipped — the loop keeps going for the next
+paste, nothing is staged for the bad drop. `campaign` is a reserved drop key: a campaign
+can't declare a field named `campaign` (`load_campaign` fails loud if one does).
+
+A unified-mode drop just adds one line:
+
+```
+campaign: coldpost-recruiter
+Email: jane@acme.com
+Role: Staff Engineer
+Company: Acme Corp
+<<<EOF>>>
 ```
 
 1. **Paste the drop** (above), terminated with `<<<EOF>>>`.
@@ -325,7 +346,7 @@ confirm it lands and looks right, then you're clear to send to real recipients.
 |---|---|
 | `python slap.py init` | Interactive installer (config.yaml, .env, schedule, DB, launchd). Re-runnable any time. |
 | `python slap.py list` | Lists every auto-discovered campaign (persona, LaTeX on/off). |
-| `python slap.py send <campaign> [--now]` | The prep flow above. `--now` also drains immediately. |
+| `python slap.py send [<campaign>] [--now]` | The prep flow above. With a campaign name, the whole session is locked to it; bare `send` is unified mode (each drop names its own campaign via a `campaign :` line). `--now` also drains immediately. |
 | `python slap.py send custom [--now]` | The editor-authored one-off flow above (see "`send custom`"). |
 | `python slap.py dashboard` | Starts the localhost dashboard at `http://127.0.0.1:5050` — a React SPA (see "Dashboard + replies" below), including the filterable all-campaigns Reach-outs tab. Requires the frontend to be built once first (`npm --prefix slap/frontend run build`). |
 | `python slap.py doctor [--prune-archive [--confirm]]` | Preflight checks — sender fields, API key, DB, consumer domains file, every campaign's attachment/LaTeX toolchain, and (separately, as a non-blocking WARN) `RESUME_ARCHIVE_DIR`'s validity, any dangling symlinks in it, and your configured `editor` command. Safe to run any time; the core checks also run automatically before every `send` and every drain. `--prune-archive` deletes the dangling `RESUME_ARCHIVE_DIR` symlinks the report warns about (dry run unless `--confirm`); live entries are never touched. |

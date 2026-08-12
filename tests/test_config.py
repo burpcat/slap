@@ -413,6 +413,25 @@ def test_load_campaign_requires_an_email_field(tmp_path):
         load_campaign("coldpost", global_config, campaigns_dir)
 
 
+@pytest.mark.parametrize("extra_field", [
+    "  - { key: campaign,     label: Campaign }\n",       # reserved as a key
+    "  - { key: campaign_ref, label: Campaign }\n",       # reserved as a LABEL too
+])
+def test_load_campaign_rejects_reserved_campaign_field(tmp_path, extra_field):
+    # `campaign` is the reserved drop selector in unified `slap.py send` mode.
+    # parse_drop matches a line against EITHER a field's key or its label, so a
+    # collision on either would silently capture the `campaign :` selector value
+    # into this field and leak it into templates — hence both are fail-loud.
+    global_config = load_global_config(write_global_config(tmp_path))
+    reserved_yaml = VALID_CAMPAIGN_YAML.replace(
+        "  - { key: email,        label: Email }\n",
+        "  - { key: email,        label: Email }\n" + extra_field,
+    )
+    campaigns_dir, _ = write_campaign(tmp_path, campaign_yaml=reserved_yaml)
+    with pytest.raises(ConfigError, match="reserved"):
+        load_campaign("coldpost", global_config, campaigns_dir)
+
+
 def test_load_campaign_latex_disabled_requires_attachment_file(tmp_path):
     global_config = load_global_config(write_global_config(tmp_path))
     no_attachment_yaml = VALID_CAMPAIGN_YAML.replace(
