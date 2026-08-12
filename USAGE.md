@@ -54,16 +54,19 @@ The easiest way to create one is the interactive wizard:
 python slap.py onboard-campaign
 ```
 
-It walks you through: a campaign folder name, picking a persona (which fixes how many
-follow-ups you'll author, since a persona's cadence length is fixed), composing the
-initial email, declaring its variables (auto-detected from `{{key}}` placeholders as you
-paste — you're only asked to label/optional-flag ones it doesn't already know), composing
-exactly as many follow-ups as the persona's cadence needs, a review panel showing the
-whole template set with every placeholder highlighted, then the rest of `campaign.yaml`
-(LaTeX on/off, attachment filename, and — for a static campaign — a path to a real résumé
-PDF, or a scaffolded placeholder if you don't have one ready yet). Nothing is written to
-disk until you confirm the review. The result is validated the same way `send`/`doctor`
-validate any other campaign before it declares success.
+It walks you through: a campaign folder name, picking a persona (content register only),
+choosing the follow-up **cadence** for this campaign — a list of day offsets like `2,3,5`,
+which fixes how many follow-ups you'll author (the chosen persona's usual cadence is
+offered as a starting default) — composing the initial email, declaring its variables
+(auto-detected from `{{key}}` placeholders as you paste — you're only asked to
+label/optional-flag ones it doesn't already know), composing exactly as many follow-ups as
+your cadence needs, a review panel showing the whole template set with every placeholder
+highlighted, then the rest of `campaign.yaml` (LaTeX on/off, the attachment filename the
+recipient sees, and — for a static campaign — which résumé **send tags** from `config.yaml`
+this campaign offers, e.g. `default` or `fde,ds`; no per-campaign PDF is written, the
+résumés live in `docs/`). Nothing is written to disk until you confirm the review. The
+result is validated the same way `send`/`doctor` validate any other campaign before it
+declares success.
 
 `onboard-campaign` only scaffolds this app-facing half — the config and templates
 `slap.py` reads. It has no opinion on how you produce the real per-recipient values that
@@ -271,10 +274,10 @@ Company: Acme Corp
      (optional)" below. `0` (or just pressing enter) declines and uses the default; this
      is an offer, never forced.
 4. **`Follow-ups for this recipient? [0-N, default N]`** — per-recipient cadence override.
-   Press enter to keep the persona's full cadence (the default), or type a smaller number
+   Press enter to keep the campaign's full cadence (the default), or type a smaller number
    (down to `0`, meaning only the initial email goes out, no follow-ups at all) if this
-   particular recipient doesn't warrant the persona's usual follow-up intensity. This
-   truncates the persona's cadence to a PREFIX — there's no way to skip stage 2 but keep
+   particular recipient doesn't warrant the campaign's usual follow-up intensity. This
+   truncates the campaign's cadence to a PREFIX — there's no way to skip stage 2 but keep
    stage 3, since a cadence is an ordered sequence of day-offsets, not independently
    pickable stages.
 5. **Preview** — the exact rendered subject + body, the attachment name (or which archived
@@ -417,9 +420,9 @@ that land on the same name (same company/role/day) get `-2`, `-3`, ... appended.
   `RESUME_ARCHIVE_DIR`'s status and flags any dangling symlink inside it (e.g. after a
   `cleanup` run reclaimed the file it pointed at) separately from every other check as a
   **WARN, never a FAIL** — a stale archive folder can never fail `doctor`'s exit code, a
-  `send`, or a scheduled drain. Clear the dangling symlinks with `python slap.py doctor
-  --prune-archive` (dry run — lists what it would remove; pass `--confirm` to actually
-  delete). It only ever removes broken symlinks; live entries are never touched.
+  `send`, or a scheduled drain. Clear the dangling symlinks with `slap.py doctor --prune-archive`
+  (a dry run — it lists what it would remove); add `--confirm` (`slap.py doctor --prune-archive --confirm`)
+  to actually delete. It only ever removes broken symlinks; live entries are never touched.
 - **`cleanup` respects the archive**: a PDF `cleanup` would otherwise delete as
   stale/dead is kept instead if a live archive symlink still points at it, and reported in
   its own "kept — still referenced by a résumé archive symlink" line rather than being

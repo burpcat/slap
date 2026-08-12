@@ -150,9 +150,9 @@ Every template can also end with `{{signature}}` — filled from `config.yaml`'s
 `signature:` key (one place, shared by every campaign), not a per-campaign `fields`
 entry. No campaign.yaml declaration needed for it.
 
-The number of `stageN.txt` files must exactly match the chosen persona's cadence length
-(e.g. `recruiter`'s default `[2, 3, 5]` needs `stage1.txt`/`stage2.txt`/`stage3.txt`) —
-`doctor` and `send` both fail loud if it doesn't.
+The number of `stageN.txt` files must exactly match the campaign's own `cadence:` length
+(e.g. `cadence: [2, 3, 5]` needs `stage1.txt`/`stage2.txt`/`stage3.txt`) — `doctor` and
+`send` both fail loud if it doesn't.
 
 Setting up a campaign this way gets you the app-facing half — the config and templates
 `slap.py` actually reads. It says nothing about how you come up with the real
@@ -170,9 +170,9 @@ dashboard, deliverability tips). Quick reference:
 | Command | What it does |
 |---|---|
 | `python slap.py init` | Interactive installer — see Setup above. Safe to re-run any time. |
-| `python slap.py onboard-campaign` | Interactive wizard that scaffolds a brand-new `campaigns/<name>/` folder — compose the initial email, declare its variables (auto-detected from what you paste), review the whole template set with placeholders highlighted, then fill in persona/LaTeX/attachment — instead of hand-writing `campaign.yaml`/`initial.txt`/`stageN.txt`. |
+| `python slap.py onboard-campaign` | Interactive wizard that scaffolds a brand-new `campaigns/<name>/` folder — compose the initial email, declare its variables (auto-detected from what you paste), review the whole template set with placeholders highlighted, then fill in persona, the per-campaign follow-up `cadence`, LaTeX on/off, and (for a static campaign) which `config.yaml` résumé `send_tags` it offers — instead of hand-writing `campaign.yaml`/`initial.txt`/`stageN.txt`. |
 | `python slap.py list` | Lists every auto-discovered campaign (persona, LaTeX on/off). |
-| `python slap.py send [<campaign>] [--now]` | Interactive prep: paste a drop, optionally compile/preview a LaTeX résumé, see domain-dedup warnings (and, for a static campaign, an offer to reuse an archived résumé), choose how many of the persona's follow-ups to actually stage for this recipient (0 up to the persona's full cadence), and a preview, then stage the send to the queue. With a campaign name the session is locked to it; **bare `send`** is unified mode — each drop names its own campaign via a reserved `campaign :` line, so one session can stage for many campaigns (a bad/unknown `campaign :` is skipped, the loop continues). `--now` also drains the queue immediately afterward instead of waiting for the scheduled runner. |
+| `python slap.py send [<campaign>] [--now] [--resume TAG]` | Interactive prep: paste a drop, optionally compile/preview a LaTeX résumé, pick which résumé to attach for a static campaign (a numbered picker when it offers more than one under `resumes:`; `--resume TAG` forces one and skips the picker), see domain-dedup warnings (and, for a static campaign, an offer to reuse an archived résumé), choose how many of the campaign's follow-ups to actually stage for this recipient (0 up to the campaign's full `cadence`), and a preview, then stage the send to the queue. With a campaign name the session is locked to it; **bare `send`** is unified mode — each drop names its own campaign via a reserved `campaign :` line, so one session can stage for many campaigns (a bad/unknown `campaign :` is skipped, the loop continues). `--now` also drains the queue immediately afterward instead of waiting for the scheduled runner. |
 | `python slap.py send custom` | A one-off, editor-authored send outside any campaign folder: compose the initial email (and, optionally, a custom per-recipient follow-up cadence) in your `editor`, pick an attachment (an existing PDF, a pasted path, a freshly-authored LaTeX résumé, or none), then stage it via the same queue/runner path as a normal send. Reserved campaign label `__custom__`. |
 | `python slap.py dashboard` | Starts the localhost dashboard at `http://127.0.0.1:5050` — a React + TypeScript + Vite single-page app served as a static bundle by this one Flask process (see ARCHITECTURE.md's "Frontend" section). Requires `npm --prefix slap/frontend run build` to have been run at least once (see Setup above); fails loud with that exact command if the bundle is missing. Tabs: Home, Campaigns, Engagement, Pipeline, Reach-outs, Commands. |
 | `python slap.py doctor [--prune-archive [--confirm]]` | Preflight checks — see Setup above. Safe to run any time. `--prune-archive` clears dangling `RESUME_ARCHIVE_DIR` symlinks (dry run unless `--confirm`). |
