@@ -54,6 +54,17 @@ def run(*args, cwd=None, env=None, input=None):
     )
 
 
+def _seed_docs_resume(tmp_path, data=b"%PDF-fake"):
+    """Seed the central docs/ résumé the `default` send_tag resolves to (these
+    subprocess tests run with cwd=tmp_path, so docs_dir 'docs' -> tmp_path/docs).
+    Returns the path so callers can also assert on it."""
+    docs = tmp_path / "docs"
+    docs.mkdir(parents=True, exist_ok=True)
+    path = docs / "resume.pdf"
+    path.write_bytes(data)
+    return path
+
+
 def test_help_lists_all_subcommands():
     result = run("--help")
     assert result.returncode == 0
@@ -101,7 +112,7 @@ def test_send_fails_loud_when_doctor_preflight_fails(tmp_path):
     (campaign / "campaign.yaml").write_text(
         "persona: recruiter\n"
         "latex: { enabled: false, attachment_name: r.pdf }\n"
-        "attachment_file: resume.pdf\n"
+        "cadence: [2, 3, 5]\nresumes: [default]\n"
         "fields:\n  - { key: email, label: Email }\n"
     )
     (campaign / "initial.txt").write_text("Subject: Hi\n\nBody\n")
@@ -113,7 +124,8 @@ def test_send_fails_loud_when_doctor_preflight_fails(tmp_path):
     result = run("send", "coldpost", cwd=tmp_path, env=env_with_key)
     assert result.returncode != 0
     assert "doctor preflight failed" in result.stderr
-    assert "attachment_file" in result.stderr
+    assert "resume 'default'" in result.stderr
+    assert "not found" in result.stderr
     assert "Traceback" not in result.stderr
 
 
@@ -139,10 +151,10 @@ def test_send_never_leaks_ansi_into_the_staged_message_even_with_color_forced(tm
     (campaign / "campaign.yaml").write_text(
         "persona: recruiter\n"
         "latex: { enabled: false, attachment_name: r.pdf }\n"
-        "attachment_file: resume.pdf\n"
+        "cadence: [2, 3, 5]\nresumes: [default]\n"
         "fields:\n  - { key: email, label: Email }\n  - { key: company, label: Company }\n"
     )
-    (campaign / "resume.pdf").write_bytes(b"%PDF-fake")
+    _seed_docs_resume(tmp_path, b"%PDF-fake")
     (campaign / "initial.txt").write_text("Subject: Hi from {{company}}\n\nHello {{company}} team\n")
     for i in (1, 2, 3):
         (campaign / f"stage{i}.txt").write_text(f"stage {i}\n")
@@ -199,13 +211,13 @@ def _setup_three_field_campaign(tmp_path):
     (campaign / "campaign.yaml").write_text(
         "persona: recruiter\n"
         "latex: { enabled: false, attachment_name: r.pdf }\n"
-        "attachment_file: resume.pdf\n"
+        "cadence: [2, 3, 5]\nresumes: [default]\n"
         "fields:\n"
         "  - { key: email, label: Email }\n"
         "  - { key: company, label: Company }\n"
         "  - { key: req_id, label: Req ID, optional: true }\n"
     )
-    (campaign / "resume.pdf").write_bytes(b"%PDF-fake")
+    _seed_docs_resume(tmp_path, b"%PDF-fake")
     (campaign / "initial.txt").write_text("Subject: Hi from {{company}}\n\nHello {{company}} team\n")
     for i in (1, 2, 3):
         (campaign / f"stage{i}.txt").write_text(f"stage {i}\n")
@@ -271,10 +283,10 @@ def _setup_second_campaign(tmp_path, name="warmpost"):
     (campaign / "campaign.yaml").write_text(
         "persona: recruiter\n"
         "latex: { enabled: false, attachment_name: r2.pdf }\n"
-        "attachment_file: resume.pdf\n"
+        "cadence: [2, 3, 5]\nresumes: [default]\n"
         "fields:\n  - { key: email, label: Email }\n  - { key: company, label: Company }\n"
     )
-    (campaign / "resume.pdf").write_bytes(b"%PDF-fake2")
+    _seed_docs_resume(tmp_path, b"%PDF-fake2")
     (campaign / "initial.txt").write_text("Subject: Warm {{company}}\n\nWarm hi {{company}}\n")
     for i in (1, 2, 3):
         (campaign / f"stage{i}.txt").write_text(f"warm stage {i}\n")
@@ -335,6 +347,107 @@ def test_send_unified_fails_loud_per_drop_but_keeps_looping(tmp_path):
     assert "Traceback" not in result.stderr
 
 
+# --- résumé send tags + --resume / interactive picker (static campaigns) ----
+
+def _setup_two_resume_campaign(tmp_path):
+    # config.yaml with TWO send_tags (default + alt), a campaign offering both,
+    # and both docs/ PDFs seeded — so the picker and --resume have real choices.
+    config_text = (
+        (Path(__file__).resolve().parent.parent / "config.yaml.example")
+        .read_text()
+        .replace("<Owner Name>", "Test Owner")
+        .replace("  default: resume.pdf\n", "  default: resume.pdf\n  alt: alt.pdf\n")
+    )
+    (tmp_path / "config.yaml").write_text(config_text)
+    (tmp_path / "consumer_domains.txt").write_text(
+        (Path(__file__).resolve().parent.parent / "consumer_domains.txt").read_text()
+    )
+    campaign = tmp_path / "campaigns" / "coldpost"
+    campaign.mkdir(parents=True)
+    (campaign / "campaign.yaml").write_text(
+        "persona: recruiter\n"
+        "latex: { enabled: false, attachment_name: AvinashArutla.pdf }\n"
+        "cadence: [2, 3, 5]\nresumes: [default, alt]\n"
+        "fields:\n  - { key: email, label: Email }\n  - { key: company, label: Company }\n"
+    )
+    _seed_docs_resume(tmp_path, b"%PDF-default")
+    (tmp_path / "docs" / "alt.pdf").write_bytes(b"%PDF-alt")
+    (campaign / "initial.txt").write_text("Subject: Hi from {{company}}\n\nHello {{company}} team\n")
+    for i in (1, 2, 3):
+        (campaign / f"stage{i}.txt").write_text(f"stage {i}\n")
+    return campaign
+
+
+def test_send_resume_flag_forces_the_named_resume_and_skips_picker(tmp_path):
+    _setup_two_resume_campaign(tmp_path)
+    recipient = "jane@acme.com"
+    drop = f"Email: {recipient}\nCompany: Acme\n"
+    scripted_stdin = f"{drop}\n<<<EOF>>>\n\ny\nn\n"  # drop, follow-ups-default, stage, no-more
+    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+
+    result = run("send", "coldpost", "--resume", "alt", cwd=tmp_path, env=env, input=scripted_stdin)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Pick a résumé" not in result.stdout  # forced tag skips the picker
+    assert "(résumé: alt)" in result.stdout
+    manifest = json.loads((tmp_path / "workdir" / "coldpost" / recipient / "staged.json").read_text())
+    assert manifest["attachment_source"] == str((tmp_path / "docs" / "alt.pdf").resolve())
+
+
+def test_send_resume_unknown_tag_fails_loud_before_staging(tmp_path):
+    _setup_two_resume_campaign(tmp_path)
+    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    # No input piped: must fail loud on the bad tag BEFORE reading any drop.
+    result = run("send", "coldpost", "--resume", "nope", cwd=tmp_path, env=env)
+    assert result.returncode != 0
+    assert "not a defined send_tag" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_send_resume_tag_not_offered_by_locked_campaign_fails_loud(tmp_path):
+    # 'default' is a valid send_tag but this campaign only offers 'alt' → locked
+    # mode fails loud up front rather than skipping every recipient.
+    _setup_two_resume_campaign(tmp_path)
+    (tmp_path / "campaigns" / "coldpost" / "campaign.yaml").write_text(
+        "persona: recruiter\n"
+        "latex: { enabled: false, attachment_name: AvinashArutla.pdf }\n"
+        "cadence: [2, 3, 5]\nresumes: [alt]\n"
+        "fields:\n  - { key: email, label: Email }\n  - { key: company, label: Company }\n"
+    )
+    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    result = run("send", "coldpost", "--resume", "default", cwd=tmp_path, env=env)
+    assert result.returncode != 0
+    assert "doesn't offer résumé 'default'" in result.stderr
+
+
+def test_send_interactive_picker_selects_chosen_resume(tmp_path):
+    _setup_two_resume_campaign(tmp_path)
+    recipient = "jane@acme.com"
+    drop = f"Email: {recipient}\nCompany: Acme\n"
+    # drop, PICK résumé #2 (alt), follow-ups-default, stage, no-more
+    scripted_stdin = f"{drop}\n<<<EOF>>>\n2\n\ny\nn\n"
+    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+
+    result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Pick a résumé" in result.stdout  # >1 résumé → picker shown
+    manifest = json.loads((tmp_path / "workdir" / "coldpost" / recipient / "staged.json").read_text())
+    assert manifest["attachment_source"] == str((tmp_path / "docs" / "alt.pdf").resolve())
+
+
+def test_send_single_resume_campaign_shows_no_picker(tmp_path):
+    _setup_three_field_campaign(tmp_path)  # offers only [default]
+    recipient = "jane@acme.com"
+    drop = f"Email: {recipient}\nCompany: Acme\n"
+    scripted_stdin = f"{drop}\n<<<EOF>>>\n\ny\nn\n"
+    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Pick a résumé" not in result.stdout  # single résumé → attached silently
+    assert "Staged" in result.stdout
+
+
 def test_doctor_fails_loud_without_config(tmp_path):
     result = run("doctor", cwd=tmp_path)
     assert result.returncode != 0
@@ -383,7 +496,7 @@ def test_doctor_reports_campaign_attachment_issues(tmp_path):
     (broken / "campaign.yaml").write_text(
         "persona: recruiter\n"
         "latex: { enabled: false, attachment_name: r.pdf }\n"
-        "attachment_file: resume.pdf\n"
+        "cadence: [2, 3, 5]\nresumes: [default]\n"
         "fields:\n  - { key: email, label: Email }\n"
     )
     (broken / "initial.txt").write_text("Subject: Hi\n\nBody\n")
@@ -395,7 +508,7 @@ def test_doctor_reports_campaign_attachment_issues(tmp_path):
     result = run("doctor", cwd=tmp_path, env=env_with_key)
     assert result.returncode != 0
     assert "campaign 'broken-campaign': FAIL" in result.stdout
-    assert "attachment_file: FAIL" in result.stdout
+    assert "resume 'default': FAIL" in result.stdout
 
 
 def test_runner_fails_loud_without_config(tmp_path):
@@ -581,7 +694,7 @@ def test_list_reports_broken_campaign_inline_and_continues(tmp_path):
     (good / "campaign.yaml").write_text(
         "persona: recruiter\n"
         "latex: { enabled: false, attachment_name: r.pdf }\n"
-        "attachment_file: resume.pdf\n"
+        "cadence: [2, 3, 5]\nresumes: [default]\n"
         "fields:\n  - { key: email, label: Email }\n"
     )
     (good / "initial.txt").write_text("Subject: Hi\n\nBody\n")
@@ -593,7 +706,7 @@ def test_list_reports_broken_campaign_inline_and_continues(tmp_path):
     (broken / "campaign.yaml").write_text(
         "persona: recruiter\n"
         "latex: { enabled: false, attachment_name: r.pdf }\n"
-        "attachment_file: resume.pdf\n"
+        "cadence: [2, 3, 5]\nresumes: [default]\n"
         "fields:\n  - { key: email, label: Email }\n"
     )
     (broken / "initial.txt").write_text("No subject line here\n")
@@ -709,13 +822,13 @@ def _setup_reuse_campaign(tmp_path):
     (campaign / "campaign.yaml").write_text(
         "persona: recruiter\n"
         "latex: { enabled: false, attachment_name: AvinashArutla.pdf }\n"
-        "attachment_file: resume.pdf\n"
+        "cadence: [2, 3, 5]\nresumes: [default]\n"
         "fields:\n"
         "  - { key: email,       label: Email }\n"
         "  - { key: company,     label: Company }\n"
         "  - { key: role_catted, label: Role }\n"
     )
-    (campaign / "resume.pdf").write_bytes(b"%PDF-default-resume")
+    _seed_docs_resume(tmp_path, b"%PDF-default-resume")
     (campaign / "initial.txt").write_text("Subject: Hi {{company}}\n\nHello {{company}} re {{role_catted}}\n")
     for i in (1, 2, 3):
         (campaign / f"stage{i}.txt").write_text(f"stage {i}\n")
@@ -870,7 +983,7 @@ def test_send_declining_resume_reuse_uses_default(tmp_path):
     workdir = tmp_path / "workdir" / "coldpost" / recipient
     assert not (workdir / "AvinashArutla.pdf").exists()
     manifest = json.loads((workdir / "staged.json").read_text())
-    assert manifest["attachment_source"] == str((campaign / "resume.pdf").resolve())
+    assert manifest["attachment_source"] == str((tmp_path / "docs" / "resume.pdf").resolve())
 
 
 def test_send_reuse_of_broken_archive_entry_fails_loud_for_that_recipient_only(tmp_path):
@@ -961,13 +1074,13 @@ def _setup_signature_campaign(tmp_path, *, config_signature=SIGNATURE_TEXT, sign
     (campaign / "campaign.yaml").write_text(
         "persona: recruiter\n"
         "latex: { enabled: false, attachment_name: r.pdf }\n"
-        "attachment_file: resume.pdf\n"
+        "cadence: [2, 3, 5]\nresumes: [default]\n"
         "fields:\n"
         "  - { key: email,   label: Email }\n"
         "  - { key: company, label: Company }\n"
         "  - { key: byebye,  label: Signoff }\n"
     )
-    (campaign / "resume.pdf").write_bytes(b"%PDF-fake")
+    _seed_docs_resume(tmp_path, b"%PDF-fake")
     # initial.txt: the "replace an existing hardcoded sign-off" path.
     (campaign / "initial.txt").write_text(
         "Subject: Hi {{company}}\n\nBody text about {{company}}.\n\n{{byebye}},\n{{signature}}\n"
@@ -1237,7 +1350,7 @@ def test_template_reload_missing_placeholder_reported_in_failures_file(tmp_path)
     campaign_dir.joinpath("campaign.yaml").write_text(
         "persona: recruiter\n"
         "latex: { enabled: false, attachment_name: r.pdf }\n"
-        "attachment_file: resume.pdf\n"
+        "cadence: [2, 3, 5]\nresumes: [default]\n"
         "fields:\n"
         "  - { key: email, label: Email }\n"
         "  - { key: company, label: Company }\n"

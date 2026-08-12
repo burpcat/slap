@@ -82,11 +82,24 @@ def _campaign_doctor_ok(campaign) -> bool:
     return not failures
 
 
+def _validate_resume_tag_or_exit(global_config, resume_tag):
+    """`send --resume <tag>` must name a real send_tag from config.yaml. Global
+    check for both locked and unified modes (a CLI-arg error → hard exit)."""
+    if resume_tag is not None and resume_tag not in global_config.send_tags:
+        display.fail(f"slap: --resume '{resume_tag}' is not a defined send_tag in "
+                     f"{global_config.path} (known: {sorted(global_config.send_tags)})")
+        sys.exit(1)
+
+
 def cmd_send(args):
+    resume_tag = args.resume
     # `slap.py send custom` is a distinct one-off mode, not a real campaign
     # folder — "custom" is a reserved campaign token (a campaigns/custom/ folder
     # would be shadowed by this branch; documented in USAGE).
     if args.campaign == "custom":
+        if resume_tag is not None:
+            display.fail("slap: --resume does not apply to `send custom` — it authors its own attachment")
+            sys.exit(1)
         return cmd_send_custom(args)
     # Bare `slap.py send` (no campaign arg) → unified mode: each drop carries a
     # `campaign :` line naming its own campaign, so one session can span many.
@@ -100,6 +113,14 @@ def cmd_send(args):
         sys.exit(1)
 
     _run_doctor_or_exit(global_config, campaign)
+
+    # Locked mode knows the one campaign up front, so a --resume tag it doesn't
+    # offer fails loud here rather than silently skipping every recipient.
+    _validate_resume_tag_or_exit(global_config, resume_tag)
+    if resume_tag is not None and resume_tag not in campaign.resume_paths:
+        display.fail(f"slap: campaign '{campaign.name}' doesn't offer résumé '{resume_tag}' "
+                     f"(offers: {sorted(campaign.resume_paths)})")
+        sys.exit(1)
 
     try:
         consumer_domains = domains.load_consumer_domains(Path(global_config.consumer_domains_file))
@@ -122,7 +143,7 @@ def cmd_send(args):
             display.error("No 'Email' value found in the drop — skipping this recipient.")
         else:
             _prep_one_recipient(conn, campaign, consumer_domains, values, recipient, archive_dir,
-                                signature=global_config.signature)
+                                signature=global_config.signature, resume_tag=resume_tag)
 
         if input("\nAdd another? [Y/n]: ").strip().lower() == "n":
             break
@@ -164,6 +185,12 @@ def cmd_send_unified(args):
     # Global battery only, once up front (no campaign known yet). Per-campaign
     # checks run inside the loop, non-fatally, as each campaign is first seen.
     _run_doctor_or_exit(global_config)
+
+    # A --resume tag that isn't even a defined send_tag is a CLI-arg error → hard
+    # exit up front. The per-campaign "does THIS campaign offer it?" check is
+    # per-drop and fail-loud-skip (each drop names its own campaign).
+    resume_tag = args.resume
+    _validate_resume_tag_or_exit(global_config, resume_tag)
 
     try:
         consumer_domains = domains.load_consumer_domains(Path(global_config.consumer_domains_file))
@@ -210,7 +237,7 @@ def cmd_send_unified(args):
                     display.error("No 'Email' value found in the drop — skipping this recipient.")
                 else:
                     _prep_one_recipient(conn, campaign, consumer_domains, values, recipient, archive_dir,
-                                        signature=global_config.signature)
+                                        signature=global_config.signature, resume_tag=resume_tag)
 
         if input("\nAdd another? [Y/n]: ").strip().lower() == "n":
             break
@@ -438,6 +465,36 @@ def _offer_resume_reuse(matches: list, *, read_line=input):
         display.warn(f"  Not understood — enter a number 0-{len(matches)}.")
 
 
+def _select_resume(campaign, *, forced_tag=None, read_line=input):
+    """Pick which résumé tag to attach for a static campaign, from the campaign's
+    own `resume_paths` (config.yaml send_tags it lists under `resumes:`). Returns
+    the chosen tag, or None when a forced `--resume` tag isn't one this campaign
+    offers (the caller fail-loud-skips that recipient). A single-résumé campaign
+    is used silently (parity with the pre-multi-résumé behavior); more than one
+    prompts a numbered pick defaulting to the first (resumes[0])."""
+    tags = list(campaign.resume_paths)
+    if forced_tag is not None:
+        return forced_tag if forced_tag in campaign.resume_paths else None
+    if len(tags) == 1:
+        return tags[0]
+    display.plain("\nRésumé:")
+    for i, tag in enumerate(tags, start=1):
+        marker = " (default)" if i == 1 else ""
+        display.plain(f"  {i}. {tag}  [{campaign.resume_paths[tag].name}]{marker}")
+    while True:
+        raw = read_line(f"Pick a résumé [1-{len(tags)}, default 1]: ").strip()
+        if raw == "":
+            return tags[0]
+        try:
+            choice = int(raw)
+        except ValueError:
+            display.warn(f"  Not understood — enter a number 1-{len(tags)}.")
+            continue
+        if 1 <= choice <= len(tags):
+            return tags[choice - 1]
+        display.warn(f"  Not understood — enter a number 1-{len(tags)}.")
+
+
 def _ask_followup_count(campaign, *, read_line=input) -> int:
     """Per-recipient follow-up override (post-launch): lets the owner choose,
     for THIS recipient only, how many of the persona's configured follow-up
@@ -469,8 +526,12 @@ def _ask_followup_count(campaign, *, read_line=input) -> int:
 
 
 def _prep_one_recipient(conn, campaign, consumer_domains, values, recipient, archive_dir, *,
-                         signature: str, read_line=input):
+                         signature: str, resume_tag=None, read_line=input):
+    chosen_resume_tag = None
     if campaign.latex_enabled:
+        if resume_tag is not None:  # --resume is a static-résumé knob; latex authors its own
+            display.warn(f"⚠ --resume '{resume_tag}' ignored for latex campaign '{campaign.name}' — "
+                         f"its résumé is compiled per recipient from your pasted source.")
         tex_source = read_paste(f"\nPaste the LaTeX résumé source for {recipient}")
         workdir = recipient_workdir(campaign.name, recipient)
         staged = run_latex_loop(workdir, tex_source, campaign.attachment_name)
@@ -479,10 +540,15 @@ def _prep_one_recipient(conn, campaign, consumer_domains, values, recipient, arc
             return
         attachment_path = staged.path
     else:
-        attachment_path = campaign.path / campaign.attachment_file
-        placeholder_check = doctor.check_placeholder_resume(campaign)
-        if not placeholder_check.ok:
-            display.warn(f"⚠ {placeholder_check.detail}")
+        chosen_resume_tag = _select_resume(campaign, forced_tag=resume_tag, read_line=read_line)
+        if chosen_resume_tag is None:  # forced --resume tag not offered by THIS campaign
+            display.error(f"⚠ Campaign '{campaign.name}' doesn't offer résumé '{resume_tag}' "
+                          f"(offers: {list(campaign.resume_paths)}) — skipping this recipient.")
+            return
+        attachment_path = campaign.resume_paths[chosen_resume_tag]
+        if doctor.is_placeholder_pdf(attachment_path):
+            display.warn(f"⚠ {attachment_path} is still the placeholder résumé scaffolded by "
+                         f"onboard-campaign/init — replace it with your real résumé before sending.")
 
     dedup = domains.check_recipient(conn, recipient, consumer_domains)
     if dedup.hard_warning:
@@ -555,6 +621,8 @@ def _prep_one_recipient(conn, campaign, consumer_domains, values, recipient, arc
     display.preview_panel(recipient, subject, body)
     if reused_from:
         print(f"Attachment: reused from {reused_from}")
+    elif chosen_resume_tag:
+        print(f"Attachment: {campaign.attachment_name} (résumé: {chosen_resume_tag})")
     else:
         print(f"Attachment: {campaign.attachment_name}")
     if followup_count == len(campaign.cadence):
@@ -1123,6 +1191,9 @@ def build_parser():
         help="Campaign name to lock this session to; omit for unified mode (campaign read from each "
              "drop's 'campaign :' line); or the literal 'custom' for an editor-authored one-off send")
     p_send.add_argument("--now", action="store_true", help="Also drain immediately after staging")
+    p_send.add_argument("--resume", metavar="TAG", default=None,
+                        help="Force a résumé send_tag (from config.yaml) for this session, skipping the "
+                             "interactive picker. Must be a tag the target campaign offers under `resumes:`.")
     p_send.set_defaults(func=cmd_send)
 
     sub.add_parser("dashboard", help="Launch the localhost dashboard").set_defaults(func=cmd_dashboard)

@@ -85,8 +85,10 @@ that sends may target **only** the owner's own inbox via Gmail plus-tags
   (`hiring_manager [2,4,6]`, `recruiter [2,3,5]`, `founder [2,5,7]`), schedule knobs,
   tracking.
 - `campaigns/<name>/` is **auto-discovered** — any folder with a valid `campaign.yaml` is
-  live. No central registry. Contains `campaign.yaml`, `initial.txt`, `stageN.txt`, and
-  `resume.pdf` (when latex disabled).
+  live. No central registry. Contains `campaign.yaml`, `initial.txt`, `stageN.txt`. Static
+  (latex-off) campaigns reference résumés from the central `docs/` folder by tag
+  (`config.yaml` `docs_dir` + `send_tags`; campaign.yaml lists `resumes: [tag, …]`), rather
+  than keeping a per-campaign `resume.pdf`.
 - Loader is **fail-loud**: `initial.txt` needs a `Subject:` first line + blank-line
   separator; the number of `stageN.txt` files must equal the persona cadence length.
 - **Template fill is local** (`{{key}}`), not GMass merge. A field marked `optional: true`

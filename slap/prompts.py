@@ -118,6 +118,30 @@ def ask_days(prompt: str, *, default: list, read_line=input) -> list:
         return days
 
 
+def ask_cadence(prompt: str, *, default: list, read_line=input) -> list:
+    """Comma-separated list of positive integer day-offsets, one per follow-up
+    stage. Mirrors ask_days' parse-with-default shape. `default` is a suggested
+    starting cadence (e.g. the chosen persona's historical stages) — the owner
+    is free to override it per campaign. Validated to the same rule
+    slap.config.load_campaign enforces: non-empty, all positive ints."""
+    default_str = ",".join(str(d) for d in default)
+    while True:
+        raw = ask(f"{prompt} (comma-separated days)", default=default_str, read_line=read_line)
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        try:
+            days = [int(p) for p in parts]
+        except ValueError:
+            display.warn(f"  {raw!r} must be whole numbers, e.g. 2,4,7 — try again.")
+            continue
+        if not days:
+            display.warn("  Need at least one follow-up stage.")
+            continue
+        if any(d <= 0 for d in days):
+            display.warn("  Day offsets must be positive — try again.")
+            continue
+        return days
+
+
 def placeholder_pdf() -> bytes:
     """Smallest valid one-page PDF — a scaffold placeholder only, clearly
     meant to be replaced before a real send (doctor still passes with it in

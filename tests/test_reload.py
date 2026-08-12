@@ -43,6 +43,9 @@ def make_global_config(tmp_path, *, signature=""):
         ),
         consumer_domains_file=str(tmp_path / "consumer_domains.txt"), path=tmp_path / "config.yaml",
         signature=signature,
+        # Static campaigns resolve `resumes: [default]` -> docs_dir/resume.pdf.
+        # Absolute docs_dir under tmp_path keeps these in-process tests hermetic.
+        docs_dir=tmp_path / "docs", send_tags={"default": "resume.pdf"},
     )
 
 
@@ -58,19 +61,24 @@ def write_campaign(tmp_path, name="coldpost", *, initial_txt=None, stage_bodies=
     campaigns_dir = tmp_path / "campaigns"
     campaign_dir = campaigns_dir / name
     campaign_dir.mkdir(parents=True, exist_ok=True)
+    stage_bodies = stage_bodies or ["Following up 1", "Following up 2", "Following up 3"]
+    cadence = [2 * i for i in range(1, len(stage_bodies) + 1)]
     (campaign_dir / "campaign.yaml").write_text(
         "persona: recruiter\n"
+        f"cadence: {cadence}\n"
         "latex:\n"
         "  enabled: false\n"
         "  attachment_name: resume.pdf\n"
-        "attachment_file: resume.pdf\n"
+        "resumes: [default]\n"
         "fields:\n" + fields_yaml
     )
-    (campaign_dir / "resume.pdf").write_bytes(b"%PDF-fake")
+    # Central docs/ résumé referenced by the `default` send_tag (see make_global_config).
+    docs = tmp_path / "docs"
+    docs.mkdir(parents=True, exist_ok=True)
+    (docs / "resume.pdf").write_bytes(b"%PDF-fake")
     (campaign_dir / "initial.txt").write_text(
         initial_txt or "Subject: Hi {{company}}\n\nHello from {{founder_name}}.\n"
     )
-    stage_bodies = stage_bodies or ["Following up 1", "Following up 2", "Following up 3"]
     for i, body in enumerate(stage_bodies, start=1):
         (campaign_dir / f"stage{i}.txt").write_text(body + "\n")
     return campaigns_dir
@@ -190,10 +198,11 @@ def test_scan_missing_placeholder_fails_only_that_recipient(tmp_path):
     # Owner adds a new field + references it in stage1.txt.
     (campaigns_dir / "coldpost" / "campaign.yaml").write_text(
         "persona: recruiter\n"
+        "cadence: [2, 4, 6]\n"
         "latex:\n"
         "  enabled: false\n"
         "  attachment_name: resume.pdf\n"
-        "attachment_file: resume.pdf\n"
+        "resumes: [default]\n"
         "fields:\n" + DEFAULT_FIELDS_YAML + "  - { key: special_note, label: Special note, optional: true }\n"
     )
     (campaigns_dir / "coldpost" / "stage1.txt").write_text("Following up 1: {{special_note}}\n")

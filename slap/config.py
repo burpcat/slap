@@ -7,7 +7,7 @@ required files present with the right shape) — not external system state like
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
@@ -93,7 +93,12 @@ class GlobalConfig:
     from_email: str
     from_name: str
     api_key_env: str
-    personas: dict  # persona name -> cadence stage-day list, e.g. {"recruiter": [2, 3, 5]}
+    personas: dict  # persona name -> stage-day list, e.g. {"recruiter": [2, 3, 5]}.
+    # NOTE: as of the campaign-level-cadence refactor, `stages` here is NO LONGER the live
+    # cadence source — each campaign.yaml now declares its own `cadence:` (see
+    # load_campaign). These stage lists survive only as (a) the set of valid persona names
+    # and (b) the legacy fallback for old recipient rows whose recipients.cadence column is
+    # NULL (runner.py / dashboard.py / cleanup.py). New sends never read them for cadence.
     schedule: ScheduleConfig
     consumer_domains_file: str
     path: Path
@@ -147,6 +152,17 @@ class GlobalConfig:
     # supplies the same default when the key is absent. doctor.check_editor()
     # verifies the FIRST token resolves on PATH (check-don't-install).
     editor: str = "code --wait"
+    # Folder holding every résumé PDF (central store, replacing the old
+    # per-campaign campaigns/<name>/resume.pdf). Defaulted like `editor` so the
+    # many tests that construct GlobalConfig directly don't care;
+    # load_global_config() supplies the same default when `docs_dir` is absent.
+    docs_dir: Path = Path("docs")
+    # Named résumé shortcuts: tag -> filename inside docs_dir. A campaign's
+    # `resumes:` list references these tags; `slap.py send --resume <tag>` picks
+    # one from the command line. Defaulted to {} for the same test-construction
+    # reason above; a campaign that references a tag not defined here fails loud
+    # in load_campaign (the persona cross-ref pattern).
+    send_tags: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -164,7 +180,7 @@ class CampaignConfig:
     cadence: list
     latex_enabled: bool
     attachment_name: str
-    attachment_file: str | None
+    resume_paths: dict  # ordered tag -> resolved docs_dir/<file> Path; {} for latex campaigns
     fields: list
     subject_template: str
     body_template: str
@@ -279,6 +295,28 @@ def load_global_config(path: Path = CONFIG_PATH) -> GlobalConfig:
     if not isinstance(editor, str) or not editor.strip():
         raise ConfigError(f"{path}: 'editor' must be a non-empty string — got {editor!r}")
 
+    # Optional top-level path (like `editor`): absent -> the dataclass default
+    # "docs". The résumé PDFs live here; campaigns reference them by tag.
+    docs_dir_raw = raw.get("docs_dir", "docs")
+    if not isinstance(docs_dir_raw, str) or not docs_dir_raw.strip():
+        raise ConfigError(f"{path}: 'docs_dir' must be a non-empty string — got {docs_dir_raw!r}")
+    docs_dir = Path(docs_dir_raw)
+
+    # Optional mapping tag -> filename (validated like `personas`): a dict of
+    # non-empty str->str. Absent -> {} (a config with only latex campaigns needs
+    # no send_tags). A static campaign that references an undefined tag fails
+    # loud in load_campaign, so an empty/partial map is only a problem when used.
+    send_tags_raw = raw.get("send_tags") or {}
+    if not isinstance(send_tags_raw, dict):
+        raise ConfigError(f"{path}: 'send_tags' must be a mapping of tag -> filename — got {send_tags_raw!r}")
+    send_tags = {}
+    for tag, filename in send_tags_raw.items():
+        if not isinstance(tag, str) or not tag.strip():
+            raise ConfigError(f"{path}: send_tags keys must be non-empty strings — got {tag!r}")
+        if not isinstance(filename, str) or not filename.strip():
+            raise ConfigError(f"{path}: send_tags.{tag} must be a non-empty filename string — got {filename!r}")
+        send_tags[tag] = filename
+
     return GlobalConfig(
         from_email=from_email,
         from_name=from_name,
@@ -292,6 +330,8 @@ def load_global_config(path: Path = CONFIG_PATH) -> GlobalConfig:
         gmass_allowed_days=gmass_allowed_days,
         gmass_skip_holidays=gmass_skip_holidays,
         editor=editor,
+        docs_dir=docs_dir,
+        send_tags=send_tags,
     )
 
 
@@ -323,18 +363,48 @@ def load_campaign(name: str, global_config: GlobalConfig, campaigns_dir: Path = 
             f"{yaml_path}: persona '{persona}' is not defined in {global_config.path} "
             f"(known personas: {sorted(global_config.personas)})"
         )
-    cadence = global_config.personas[persona]
+
+    # Cadence now lives per-campaign (not derived from the persona map) — fail loud if
+    # absent, since there is no other source. Same shape/validation as personas.stages
+    # above, plus s > 0 because these are day offsets. len(cadence) must equal the number
+    # of stageN.txt files (enforced by _validate_stage_files below).
+    cadence = _require(raw, "cadence", yaml_path)
+    if not isinstance(cadence, list) or not cadence or not all(
+        isinstance(s, int) and not isinstance(s, bool) and s > 0 for s in cadence
+    ):
+        raise ConfigError(f"{yaml_path}: 'cadence' must be a non-empty list of positive integers")
 
     latex_enabled = _require(raw, "latex.enabled", yaml_path)
     if not isinstance(latex_enabled, bool):
         raise ConfigError(f"{yaml_path}: latex.enabled must be true or false")
     attachment_name = _require(raw, "latex.attachment_name", yaml_path)
 
-    attachment_file = raw.get("attachment_file")
-    if not latex_enabled and not attachment_file:
+    # The old per-campaign `attachment_file: resume.pdf` model is gone — résumés
+    # now live centrally in docs_dir and are referenced by tag. Fail loud with
+    # migration guidance rather than silently ignoring a stale key.
+    if "attachment_file" in raw:
         raise ConfigError(
-            f"{yaml_path}: latex.enabled is false, so 'attachment_file' is required"
+            f"{yaml_path}: 'attachment_file' is no longer supported — put the résumé in "
+            f"{global_config.docs_dir}/, give it a tag in config.yaml's send_tags, and list "
+            f"that tag under 'resumes:' here"
         )
+    resume_paths = {}
+    if not latex_enabled:
+        resumes_raw = raw.get("resumes")
+        if not isinstance(resumes_raw, list) or not resumes_raw:
+            raise ConfigError(
+                f"{yaml_path}: latex.enabled is false, so 'resumes' is required — a non-empty list "
+                f"of send_tags from config.yaml (first is the default), e.g. [default]"
+            )
+        for tag in resumes_raw:
+            if not isinstance(tag, str):
+                raise ConfigError(f"{yaml_path}: each 'resumes' entry must be a tag string — got {tag!r}")
+            if tag not in global_config.send_tags:
+                raise ConfigError(
+                    f"{yaml_path}: résumé tag '{tag}' is not defined in {global_config.path}'s send_tags "
+                    f"(known tags: {sorted(global_config.send_tags)})"
+                )
+            resume_paths[tag] = global_config.docs_dir / global_config.send_tags[tag]
 
     fields_raw = _require(raw, "fields", yaml_path)
     if not isinstance(fields_raw, list) or not fields_raw:
@@ -378,7 +448,7 @@ def load_campaign(name: str, global_config: GlobalConfig, campaigns_dir: Path = 
         cadence=cadence,
         latex_enabled=latex_enabled,
         attachment_name=attachment_name,
-        attachment_file=attachment_file,
+        resume_paths=resume_paths,
         fields=fields,
         subject_template=subject_template,
         body_template=body_template,
@@ -417,13 +487,13 @@ def _validate_stage_files(campaign_path: Path, cadence: list) -> None:
     missing = expected - found
     if missing:
         raise ConfigError(
-            f"{campaign_path}: persona cadence has {len(cadence)} stage(s) but is missing "
+            f"{campaign_path}: campaign cadence has {len(cadence)} stage(s) but is missing "
             f"{sorted(missing)}"
         )
     extra = found - expected
     if extra:
         raise ConfigError(
-            f"{campaign_path}: found unexpected stage file(s) {sorted(extra)} — persona "
+            f"{campaign_path}: found unexpected stage file(s) {sorted(extra)} — campaign "
             f"cadence only defines {len(cadence)} stage(s)"
         )
 

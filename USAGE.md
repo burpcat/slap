@@ -85,20 +85,23 @@ campaigns/
     stage1.txt       # follow-up bodies — no subject line, they thread as replies
     stage2.txt
     stage3.txt
-    resume.pdf       # only needed when latex.enabled is false
 ```
+
+Résumé PDFs live centrally in one `docs/` folder (`docs_dir` in `config.yaml`), not in the
+campaign folder — a campaign references them by tag (see `resumes:` below and the "docs/
+folder & résumé send tags" section further down).
 
 `campaign.yaml`:
 
 ```yaml
-persona: recruiter                # -> looks up the FIXED cadence for this persona in
-                                   #    config.yaml's personas: block (e.g. [2, 3, 5])
+persona: recruiter                # content/register only — must be a config.yaml personas: key
+cadence: [2, 3, 5]                # follow-up stage offsets in days; length == stageN.txt count
 latex:
   enabled: false                  # true = paste + compile a LaTeX resume per recipient
-                                   # false = attach the same static PDF every send
+                                   # false = attach a static résumé from docs/ (see resumes:)
   attachment_name: "Firstname_Lastname_Resume.pdf"   # filename the recipient sees
-attachment_file: resume.pdf       # required when latex.enabled is false; put the real
-                                   # PDF at campaigns/my-campaign/resume.pdf
+resumes: [fde, ds]                # (static only) config.yaml send_tags this campaign offers;
+                                   # first is the default, picked interactively or via --resume
 fields:
   - { key: email,          label: Email }
   - { key: role_catted,    label: Role }
@@ -110,19 +113,19 @@ fields:
 
 Key rules, enforced fail-loud by `doctor` and `send`:
 
-- **`persona`** must be one of `config.yaml`'s `personas:` keys — that's what fixes the
-  follow-up cadence (number of stages and days between them). Cadences are fixed per
-  persona, not per campaign.
-- **The number of `stageN.txt` files must exactly equal the persona's cadence length.**
-  `hiring_manager: [2, 4, 6]` needs exactly `stage1.txt`/`stage2.txt`/`stage3.txt`; a
-  persona with 2 stages needs exactly 2 stage files. Too many or too few fails loud.
-  `initial.txt`'s `Subject:` line is only for the initial send — stage files have no
-  subject line since they thread as replies into the same conversation.
+- **`persona`** must be one of `config.yaml`'s `personas:` keys — it sets the content
+  register. (The follow-up cadence itself is set per-campaign by `cadence:`, below.)
+- **`cadence`** is a per-campaign list of day offsets (e.g. `[2, 3, 5]`). **Its length must
+  exactly equal the number of `stageN.txt` files** — `[2, 4, 6]` needs exactly
+  `stage1.txt`/`stage2.txt`/`stage3.txt`; too many or too few fails loud. `initial.txt`'s
+  `Subject:` line is only for the initial send — stage files have no subject line since they
+  thread as replies into the same conversation.
 - **`fields`** must include one with `key: email` — `send` needs it to know who to mail.
   Every other field is a label you'll see when pasting a drop (see below).
-- **Static campaigns** (`latex.enabled: false`) need `attachment_file` pointing at a real
-  PDF in the campaign folder — the same file is attached (freshly read at drain time) for
-  every recipient, never duplicated per recipient.
+- **Static campaigns** (`latex.enabled: false`) need a non-empty `resumes:` list of send_tags
+  defined in `config.yaml` (see the "docs/ folder & résumé send tags" section). The chosen
+  résumé's file (from `docs/`) is attached — freshly read at drain time — for every
+  recipient, never duplicated per recipient.
 - **LaTeX campaigns** (`latex.enabled: true`) compile a fresh, genuinely per-recipient
   résumé at send time — see "The send flow" below.
 - **`{{signature}}`** is available in every template without declaring it in `fields` —
@@ -155,6 +158,34 @@ This distinction matters and is easy to get backwards:
   the field lives on its own dedicated line (a personalization sentence, a P.S.) that
   should vanish completely rather than leave a blank line or a dangling "I noticed ." when
   you have nothing to say.
+
+### docs/ folder & résumé send tags
+
+Every résumé PDF lives in one central folder — `docs/` by default (`docs_dir` in
+`config.yaml`). You give each one a short **send tag** in `config.yaml`:
+
+```yaml
+docs_dir: docs
+send_tags:            # tag -> filename inside docs_dir
+  default: resume.pdf
+  fde:     fde.pdf    # e.g. a front-end-heavy cut
+  ds:      ds.pdf     # e.g. a data/ML cut
+```
+
+A static campaign lists which tags it offers under `resumes:` (first = the default). Two
+ways to choose which one gets attached for a given drop:
+
+- **Interactively** — if a campaign offers more than one résumé, `send` shows a numbered
+  picker after you paste the drop (a single-résumé campaign attaches it silently). The
+  preview line shows the choice: `Attachment: AvinashArutla.pdf (résumé: fde)`.
+- **Up front with `--resume <tag>`** — `python slap.py send --resume fde` forces that
+  résumé for the whole session and skips the picker. The tag must be one the target
+  campaign offers under `resumes:` (an unknown tag, or one a campaign doesn't list, fails
+  loud). The recipient always sees the campaign's `attachment_name`, whichever résumé you
+  pick — the `docs/` filename stays internal.
+
+Résumés are personal, so `docs/` is gitignored (like `campaigns/`); `init` seeds a
+placeholder `docs/resume.pdf` you replace with your real one.
 
 ## Write a drop
 
@@ -346,7 +377,7 @@ confirm it lands and looks right, then you're clear to send to real recipients.
 |---|---|
 | `python slap.py init` | Interactive installer (config.yaml, .env, schedule, DB, launchd). Re-runnable any time. |
 | `python slap.py list` | Lists every auto-discovered campaign (persona, LaTeX on/off). |
-| `python slap.py send [<campaign>] [--now]` | The prep flow above. With a campaign name, the whole session is locked to it; bare `send` is unified mode (each drop names its own campaign via a `campaign :` line). `--now` also drains immediately. |
+| `python slap.py send [<campaign>] [--now] [--resume TAG]` | The prep flow above. With a campaign name, the whole session is locked to it; bare `send` is unified mode (each drop names its own campaign via a `campaign :` line). `--resume TAG` forces a résumé send_tag and skips the picker. `--now` also drains immediately. |
 | `python slap.py send custom [--now]` | The editor-authored one-off flow above (see "`send custom`"). |
 | `python slap.py dashboard` | Starts the localhost dashboard at `http://127.0.0.1:5050` — a React SPA (see "Dashboard + replies" below), including the filterable all-campaigns Reach-outs tab. Requires the frontend to be built once first (`npm --prefix slap/frontend run build`). |
 | `python slap.py doctor [--prune-archive [--confirm]]` | Preflight checks — sender fields, API key, DB, consumer domains file, every campaign's attachment/LaTeX toolchain, and (separately, as a non-blocking WARN) `RESUME_ARCHIVE_DIR`'s validity, any dangling symlinks in it, and your configured `editor` command. Safe to run any time; the core checks also run automatically before every `send` and every drain. `--prune-archive` deletes the dangling `RESUME_ARCHIVE_DIR` symlinks the report warns about (dry run unless `--confirm`); live entries are never touched. |
@@ -402,8 +433,7 @@ that land on the same name (same company/role/day) get `-2`, `-3`, ... appended.
 
 With the archive on, `send` offers something extra when the domain SOFT WARN fires (see
 "The send flow" above): a numbered choice of every archived résumé matching that
-company, to reuse for the new recipient instead of the campaign's usual
-`attachment_file`.
+company, to reuse for the new recipient instead of the campaign's selected `docs/` résumé.
 
 - Only offered for **static** (`latex.enabled: false`) campaigns — there's no LaTeX
   paste/compile loop to skip cleanly for a LaTeX campaign, so this doesn't apply there.

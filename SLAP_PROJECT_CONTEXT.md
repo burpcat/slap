@@ -153,11 +153,12 @@ slap/                       # package:
     display.py                    #   rich-based terminal colorization (warn/error/success/preview panel)
 config.yaml                 # global: sender, gmass key env, signature, persona cadences, schedule, tracking
 config.yaml.example
+docs/                       # central résumé store (docs_dir; gitignored) — send_tags map tag -> file here
+    resume.pdf              #   e.g. the `default` tag; hold as many résumé cuts as you like (fde.pdf, ds.pdf)
 campaigns/<name>/           # per campaign, auto-discovered:
-    campaign.yaml           #   persona, latex{enabled,attachment_name}, attachment_file, fields[]
+    campaign.yaml           #   persona, cadence[], latex{enabled,attachment_name}, resumes[] (send_tags), fields[]
     initial.txt             #   "Subject: ..." line + blank line + body, {{key}} + {{signature}} placeholders
     stage1.txt stage2.txt stage3.txt   # follow-up bodies (no subject; thread as replies; end in {{signature}})
-    resume.pdf              #   static attachment (latex-off campaigns only)
     prompt.md               #   per-recipient generation prompt (gitignored — see prompt-store/CLAUDE.md)
 prompt-store/               # Claude-Code-only convenience layer (no app code, not read by
                              #   slap.py) — CLAUDE.md (tracked: reusable meta-prompt
@@ -351,7 +352,7 @@ archive symlink still points at.
 *soft* warn fires (never the hard warn) for a `latex.enabled: false` campaign, and the
 archive has at least one entry matching the new recipient's company
 (`archive.find_matches_for_company()`), `send` offers a numbered choice to reuse one of
-those PDFs instead of the campaign's default `attachment_file`. Default (`0`/blank) is
+those PDFs instead of the campaign's selected `docs/` résumé. Default (`0`/blank) is
 decline. A chosen entry is resolved, validated as a real non-empty readable PDF, and
 **copied** (never symlinked) into the new recipient's own `workdir/` — so it's correct
 regardless of what `cleanup` later does to the *original* recipient's files, and the
@@ -440,11 +441,11 @@ confirmation, no y/n shortcut), then rename to `attachment_name`, attach.
 mismatched anchor text — see §5's GMass send path note and §7).
 
 **Static-campaign attachments are not duplicated per recipient.** A static
-(`latex.enabled: false`) campaign's shared `resume.pdf` is never copied into a
+(`latex.enabled: false`) campaign's selected `docs/` résumé is never copied into a
 recipient's `workdir/` — the manifest records `attachment_source` (the shared file's own
-path), and the runner reads bytes from there fresh **at drain time**, not frozen at stage
-time (so editing `campaigns/<name>/resume.pdf` between staging and draining changes what
-already-staged-but-unsent recipients get — an intentional choice, not a bug). LaTeX-
+path under `docs_dir`), and the runner reads bytes from there fresh **at drain time**, not
+frozen at stage time (so editing the `docs/` résumé between staging and draining changes
+what already-staged-but-unsent recipients get — an intentional choice, not a bug). LaTeX-
 enabled campaigns, and any résumé-reuse recipient (which is genuinely per-recipient
 state), still get their own file copied into their own `workdir/`.
 

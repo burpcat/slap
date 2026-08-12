@@ -142,16 +142,26 @@ def check_attachment(campaign: CampaignConfig) -> list:
             found = shutil.which(binary) is not None
             results.append(CheckResult(binary, found, "" if found else f"{binary} not found on PATH"))
         return results
-    attachment_path = campaign.path / campaign.attachment_file
-    found = attachment_path.exists()
-    return [CheckResult("attachment_file", found, "" if found else f"{attachment_path} not found")]
+    results = []
+    for tag, path in campaign.resume_paths.items():
+        found = path.exists()
+        results.append(CheckResult(f"resume '{tag}'", found, "" if found else f"{path} not found"))
+    return results
 
 
 def run_campaign_checks(campaign: CampaignConfig) -> list:
     return check_attachment(campaign)
 
 
-def check_placeholder_resume(campaign: CampaignConfig) -> CheckResult:
+def is_placeholder_pdf(path: Path) -> bool:
+    """True iff `path` exists and its bytes are exactly the scaffold placeholder
+    PDF (`slap.prompts.placeholder_pdf()`). Shared by check_placeholder_resume()
+    (the doctor report) and slap.py::_prep_one_recipient (the live send-time warn
+    on the chosen résumé) so both judge "still a placeholder" identically."""
+    return path.exists() and path.read_bytes() == placeholder_pdf()
+
+
+def check_placeholder_resume(campaign: CampaignConfig) -> list:
     """Is a static campaign's `attachment_file` still the exact scaffold
     placeholder PDF (`slap.prompts.placeholder_pdf()`) that `onboard-campaign`/
     `init` write when the owner hasn't supplied a real résumé yet? Content-
@@ -178,17 +188,21 @@ def check_placeholder_resume(campaign: CampaignConfig) -> CheckResult:
     `check_attachment()`'s own job to flag, already covered elsewhere in the
     same report)."""
     if campaign.latex_enabled:
-        return CheckResult("resume placeholder", True, "not applicable — latex.enabled is true")
-    attachment_path = campaign.path / campaign.attachment_file
-    if not attachment_path.exists():
-        return CheckResult("resume placeholder", True, "attachment_file not found — see attachment_file check above")
-    if attachment_path.read_bytes() == placeholder_pdf():
-        return CheckResult(
-            "resume placeholder", False,
-            f"{attachment_path} is still the placeholder PDF scaffolded by onboard-campaign/init — "
-            f"replace it with your real résumé before sending to real recipients"
-        )
-    return CheckResult("resume placeholder", True)
+        return [CheckResult("resume placeholder", True, "not applicable — latex.enabled is true")]
+    results = []
+    for tag, path in campaign.resume_paths.items():
+        if not path.exists():
+            results.append(CheckResult(f"resume placeholder '{tag}'", True,
+                                       "not found — see resume check above"))
+        elif is_placeholder_pdf(path):
+            results.append(CheckResult(
+                f"resume placeholder '{tag}'", False,
+                f"{path} is still the placeholder PDF scaffolded by onboard-campaign/init — "
+                f"replace it with your real résumé before sending to real recipients"
+            ))
+        else:
+            results.append(CheckResult(f"resume placeholder '{tag}'", True))
+    return results
 
 
 def check_resume_archive() -> CheckResult:
@@ -324,7 +338,7 @@ def print_report(global_config: GlobalConfig) -> bool:
         # _run_doctor_or_exit uses to gate every send/drain preflight, and a
         # placeholder résumé must never be able to block a send (see that
         # check's own docstring).
-        campaign_results = run_campaign_checks(campaign) + [check_placeholder_resume(campaign)]
+        campaign_results = run_campaign_checks(campaign) + check_placeholder_resume(campaign)
         campaign_ok = all(r.ok for r in campaign_results)
         if campaign_ok:
             display.success(f"campaign '{name}': OK")

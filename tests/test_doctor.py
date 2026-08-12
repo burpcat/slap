@@ -31,13 +31,19 @@ def make_global_config(tmp_path, *, from_email="owner@gmail.com", from_name="Own
     )
 
 
-def make_campaign_config(tmp_path, *, latex_enabled=False, attachment_file="resume.pdf"):
+def make_campaign_config(tmp_path, *, latex_enabled=False, resume_paths=None):
     campaign_path = tmp_path / "campaigns" / "coldpost"
     campaign_path.mkdir(parents=True, exist_ok=True)
+    if resume_paths is None:
+        docs = tmp_path / "docs"
+        docs.mkdir(parents=True, exist_ok=True)
+        # Static campaigns now reference central docs/ résumés by tag; latex
+        # campaigns carry no static résumé at all.
+        resume_paths = {} if latex_enabled else {"default": docs / "resume.pdf"}
     return CampaignConfig(
         name="coldpost", path=campaign_path, persona="recruiter", cadence=[2, 3, 5],
         latex_enabled=latex_enabled, attachment_name="r.pdf",
-        attachment_file=None if latex_enabled else attachment_file,
+        resume_paths=resume_paths,
         fields=[CampaignField(key="email", label="Email")],
         subject_template="Hi", body_template="Body", stage_bodies=["s1", "s2", "s3"],
     )
@@ -144,7 +150,7 @@ def test_run_global_checks_returns_all_four_and_reuses_given_conn(tmp_path, monk
 
 def test_check_attachment_latex_off_passes_when_file_exists(tmp_path):
     campaign = make_campaign_config(tmp_path, latex_enabled=False)
-    (campaign.path / campaign.attachment_file).write_bytes(b"%PDF-fake")
+    campaign.resume_paths["default"].write_bytes(b"%PDF-fake")
     results = check_attachment(campaign)
     assert len(results) == 1
     assert results[0].ok
@@ -182,7 +188,7 @@ def test_check_attachment_latex_on_fails_when_binary_missing(tmp_path):
 
 def test_run_campaign_checks_matches_check_attachment(tmp_path):
     campaign = make_campaign_config(tmp_path, latex_enabled=False)
-    (campaign.path / campaign.attachment_file).write_bytes(b"%PDF-fake")
+    campaign.resume_paths["default"].write_bytes(b"%PDF-fake")
     assert run_campaign_checks(campaign) == check_attachment(campaign)
 
 
