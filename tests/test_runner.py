@@ -13,7 +13,8 @@ import pytest
 from slap.config import GlobalConfig, ScheduleConfig
 from slap.queue import due_for_ooo_resend, due_recipients, load_manifest, stage_recipient, tag_ooo
 from slap.runner import (
-    DrainResult, cap_headroom, drain, is_active_day, staleness_warning, wait_for_fire_window,
+    DrainResult, cap_headroom, drain, is_active_day, next_fire_moment, staleness_warning,
+    wait_for_fire_window,
     _roll_fire_time,
 )
 from slap.tracking import append_event, connect, latest_open_draft_id
@@ -733,6 +734,34 @@ def test_is_active_day_true_every_day_when_all_seven_configured(tmp_path):
 def test_is_active_day_defaults_to_todays_real_local_date(tmp_path):
     gc = make_global_config(tmp_path, active_days=["mon", "tue", "wed", "thu", "fri", "sat", "sun"])
     assert is_active_day(gc.schedule) is True  # every day active — today always passes
+
+
+# --- next_fire_moment (queued-recipient "next shoot" estimate) --------------
+
+def test_next_fire_moment_today_when_active_and_before_window(tmp_path):
+    gc = make_global_config(tmp_path, active_days=["mon", "tue", "wed", "thu", "fri"])
+    monday = datetime(2026, 1, 5, 8, 0)  # active day, before 09:00
+    assert next_fire_moment(gc.schedule, now=monday) == datetime(2026, 1, 5, 9, 0)
+
+
+def test_next_fire_moment_next_active_day_when_window_passed(tmp_path):
+    gc = make_global_config(tmp_path, active_days=["mon", "tue", "wed", "thu", "fri"])
+    monday = datetime(2026, 1, 5, 10, 0)  # active day, after 09:00 window
+    assert next_fire_moment(gc.schedule, now=monday) == datetime(2026, 1, 6, 9, 0)
+
+
+def test_next_fire_moment_skips_inactive_days(tmp_path):
+    gc = make_global_config(tmp_path, active_days=["mon", "tue", "wed", "thu", "fri"])
+    friday_afternoon = datetime(2026, 1, 9, 12, 0)  # Fri after window
+    assert friday_afternoon.weekday() == 4
+    # skips Sat+Sun -> Monday
+    assert next_fire_moment(gc.schedule, now=friday_afternoon) == datetime(2026, 1, 12, 9, 0)
+
+
+def test_next_fire_moment_inactive_today_goes_to_next_active(tmp_path):
+    gc = make_global_config(tmp_path, active_days=["mon", "tue", "wed", "thu", "fri"])
+    saturday = datetime(2026, 1, 10, 8, 0)  # inactive even though before window
+    assert next_fire_moment(gc.schedule, now=saturday) == datetime(2026, 1, 12, 9, 0)
 
 
 # --- staleness_warning (dashboard "silent runner failure" banner) ----------

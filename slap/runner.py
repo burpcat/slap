@@ -69,6 +69,34 @@ def is_active_day(schedule, *, today: date = None) -> bool:
     return _WEEKDAY_ABBR[today.weekday()] in schedule.active_days
 
 
+def next_fire_moment(schedule, *, now: datetime = None) -> datetime:
+    """Next LOCAL datetime the unattended runner is expected to drain: today at
+    fire_window_start if today is an active day and that time hasn't yet passed,
+    otherwise the first active day after today, at fire_window_start. Walks
+    forward day-by-day reusing is_active_day — no launchd/plist coupling.
+
+    Used to estimate a queued (not-yet-sent) recipient's "next shoot" on the
+    Reach-outs page; like every other timing estimate in this module it's
+    best-effort (a Mac asleep through the window fires on wake, the send moment
+    is randomized within the window), never a promise. Local time throughout,
+    matching is_active_day / the fire window's own local-time interpretation."""
+    now = now or datetime.now()
+    start_h, start_m = (int(x) for x in schedule.fire_window_start.split(":"))
+    today = now.date()
+    todays_fire = datetime.combine(today, dt_time(start_h, start_m))
+    if is_active_day(schedule, today=today) and now <= todays_fire:
+        return todays_fire
+    # Walk forward to the next active day. Bounded at a full week so a
+    # misconfigured (empty) active_days can never spin forever — config
+    # validation already requires it non-empty, this is just belt-and-braces.
+    d = today
+    for _ in range(7):
+        d += timedelta(days=1)
+        if is_active_day(schedule, today=d):
+            break
+    return datetime.combine(d, dt_time(start_h, start_m))
+
+
 def last_run_event_at(conn) -> datetime | None:
     """Local-time timestamp of the most recent run_started/run_completed/
     run_failed event, or None if the runner has never fired at all (a fresh
