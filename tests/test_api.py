@@ -270,6 +270,28 @@ def test_api_reachouts_returns_rows_and_total_count(app, tmp_path):
     assert body["rows"][0]["recipient"] == "a@x.com"
 
 
+def test_api_reachouts_exposes_stage_and_next_shoot(app, tmp_path):
+    # End-to-end through the real route: an active recipient carries its
+    # estimated cadence stage, and a queued (not-yet-sent) recipient gets a
+    # next-drain "next shoot" — which only resolves because the route threads
+    # global_config into reachouts_rows().
+    conn = connect(tmp_path / "test.db")
+    seed_sent_recipient(conn, recipient="active@x.com", campaign="c")   # sent today -> initial
+    append_event(conn, type="queued", recipient="queued@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter"})                          # staged, never sent
+    conn.close()
+
+    rows = {r["recipient"]: r for r in app.test_client().get("/api/reachouts").get_json()["rows"]}
+    assert rows["active@x.com"]["stage_label"] == "initial"
+    assert rows["active@x.com"]["stage_index"] == 0
+    assert rows["queued@x.com"]["status"] == "queued"
+    assert rows["queued@x.com"]["stage_label"] == "initial"
+    # queued -> the runner's next fire window (non-null because the route passed
+    # global_config through). active-sent-today has no follow-up due yet today,
+    # but its next cadence stage is still scheduled -> also non-null.
+    assert rows["queued@x.com"]["next_shoot_at"] is not None
+
+
 def test_api_lifecycle_detail_returns_timeline_for_known_recipient(app, tmp_path):
     conn = connect(tmp_path / "test.db")
     seed_sent_recipient(conn, recipient="a@x.com", campaign="c")
