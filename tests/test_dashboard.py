@@ -2218,9 +2218,98 @@ def test_reachouts_rows_chip_active_done_queued(conn):
     append_event(conn, type="sent", recipient="done@x.com", campaign="c", stage=0, gmass_campaign_id="1",
                  meta={"is_final_stage": True})
     rows = {r["recipient"]: r for r in reachouts_rows(conn)}
-    assert rows["active@x.com"]["chip"] == {"color": None, "label": "Active"}
+    # An active recipient's chip now leads with its estimated cadence stage
+    # (just sent today -> "initial") instead of a generic "Active"; done/queued
+    # keep their plain status word.
+    assert rows["active@x.com"]["chip"] == {"color": None, "label": "initial"}
     assert rows["queued@x.com"]["chip"] == {"color": None, "label": "Queued"}
     assert rows["done@x.com"]["chip"] == {"color": None, "label": "Done"}
+
+
+# --- reachouts_rows: cadence stage + "next shoot" estimate ------------------
+#
+# Both fields are best-effort estimates from first_sent_at + the recipient's
+# recorded cadence vs today (GMass fires follow-ups server-side with no
+# read-back — see slap.stages). first_sent_at is backdated to LOCAL midnight
+# N days ago so _local_date() lands on a tz-stable, exact day offset.
+
+def _sent_days_ago(conn, *, recipient, campaign, persona, cadence, days_ago):
+    ts = datetime.combine(date.today() - timedelta(days=days_ago),
+                          datetime.min.time()).astimezone()
+    append_event(conn, type="queued", recipient=recipient, campaign=campaign, stage=0,
+                 meta={"persona": persona, "cadence": cadence}, timestamp=ts)
+    append_event(conn, type="sent", recipient=recipient, campaign=campaign, stage=0,
+                 gmass_campaign_id="1", timestamp=ts)
+
+
+def test_reachouts_rows_stage_and_next_shoot_mid_sequence(conn):
+    # recruiter-style cadence [2,3,5]: stage1 fires day 2, stage2 day 5, stage3
+    # day 10. Sent 4 days ago -> stage1 fired, stage2 (day 5) still pending.
+    _sent_days_ago(conn, recipient="mid@x.com", campaign="c", persona="recruiter",
+                   cadence=[2, 3, 5], days_ago=4)
+    row = reachouts_rows(conn)[0]
+    assert row["status"] == "active"
+    assert row["stage_index"] == 1
+    assert row["stage_label"] == "stage1"
+    assert row["chip"]["label"] == "stage1"
+    # next follow-up is stage2 at day 5 -> tomorrow (day 4 + 1)
+    assert row["next_shoot_at"].startswith((date.today() + timedelta(days=1)).isoformat())
+
+
+def test_reachouts_rows_stage_initial_before_first_followup(conn):
+    _sent_days_ago(conn, recipient="fresh@x.com", campaign="c", persona="recruiter",
+                   cadence=[2, 3, 5], days_ago=0)
+    row = reachouts_rows(conn)[0]
+    assert row["stage_index"] == 0
+    assert row["stage_label"] == "initial"
+    # stage1 fires in 2 days
+    assert row["next_shoot_at"].startswith((date.today() + timedelta(days=2)).isoformat())
+
+
+def test_reachouts_rows_next_shoot_dash_when_cadence_window_elapsed(conn):
+    # cadence window = 2+3+5 = 10 days; sent 30 days ago -> every stage fired.
+    _sent_days_ago(conn, recipient="spent@x.com", campaign="c", persona="recruiter",
+                   cadence=[2, 3, 5], days_ago=30)
+    row = reachouts_rows(conn)[0]
+    assert row["status"] == "active"       # never marked final -> still active
+    assert row["stage_label"] == "stage3"  # last stage estimated fired
+    assert row["next_shoot_at"] is None    # nothing left to send -> "-"
+
+
+def test_reachouts_rows_terminal_state_has_no_stage_or_next_shoot(conn):
+    _stage_and_send(conn, recipient="replied@x.com", campaign="c", persona="recruiter")
+    append_event(conn, type="reply", recipient="replied@x.com", campaign="c", stage=0)
+    row = reachouts_rows(conn)[0]
+    assert row["status"] == "replied"
+    assert row["stage_index"] is None
+    assert row["stage_label"] is None
+    assert row["next_shoot_at"] is None
+    assert row["chip"]["label"] == "Replied"
+
+
+def test_reachouts_rows_queued_next_shoot_is_next_drain_window(conn):
+    _stage_and_send(conn, recipient="q@x.com", campaign="c", persona="recruiter", send=False)
+    row = reachouts_rows(conn, make_global_config())[0]
+    assert row["status"] == "queued"
+    assert row["stage_label"] == "initial"
+    assert row["next_shoot_at"] is not None  # the runner's next fire window
+
+
+def test_reachouts_rows_queued_next_shoot_none_without_global_config(conn):
+    _stage_and_send(conn, recipient="q@x.com", campaign="c", persona="recruiter", send=False)
+    row = reachouts_rows(conn)[0]
+    assert row["stage_label"] == "initial"
+    assert row["next_shoot_at"] is None  # can't compute the window without config
+
+
+def test_reachouts_rows_ooo_next_shoot_is_resume_date(conn):
+    _stage_and_send(conn, recipient="ooo@x.com", campaign="c", persona="recruiter")
+    tag_reply(conn, "ooo@x.com", "ooo", resume_date=date(2026, 8, 15),
+              api_key="fake", unsubscribe_fn=_fake_unsubscribe)
+    row = reachouts_rows(conn)[0]
+    assert row["status"] == "ooo_requeued"
+    assert row["next_shoot_at"] == "2026-08-15"
+    assert row["stage_index"] is None
 
 
 def test_reachouts_rows_domain_company_and_req_id_present(conn):

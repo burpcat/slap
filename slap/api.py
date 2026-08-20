@@ -371,7 +371,7 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, api
         # theme from one payload without a second request.
         conn = get_conn()
         campaigns = discover_campaigns()
-        rows = dashboard.reachouts_rows(conn)
+        rows = dashboard.reachouts_rows(conn, global_config)
         leads = dashboard.active_leads(conn)
 
         def _slice(name):
@@ -394,7 +394,7 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, api
 
     @app.route("/api/reachouts")
     def api_reachouts():
-        rows = dashboard.reachouts_rows(get_conn())
+        rows = dashboard.reachouts_rows(get_conn(), global_config)
         # Campaign -> {light,dark} color map for row tinting (req 8.2), derived
         # live from the campaign names actually present in the rows — the React
         # table applies it as a CSS custom property, never a hardcoded hex.

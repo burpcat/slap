@@ -51,7 +51,7 @@ from slap.queue import (
     tag_ooo as _tag_ooo,
 )
 from slap.queue import queue_remind as _queue_remind
-from slap.runner import cap_headroom, staleness_warning as _runner_staleness_warning
+from slap.runner import cap_headroom, next_fire_moment, staleness_warning as _runner_staleness_warning
 from slap.tracking import append_event
 
 STATIC_DIST = Path(__file__).parent / "static" / "dist"
@@ -1608,7 +1608,8 @@ def _already_corrected_to(conn) -> dict:
 
 
 def _status_chip(*, status: str, engagement: str, reply_tag, bounce_category, bounce_reason,
-                  ooo_resume_date, num_clicks: int, stopped: bool = False, gated: bool = False) -> dict:
+                  ooo_resume_date, num_clicks: int, stopped: bool = False, gated: bool = False,
+                  stage_label: str = None) -> dict:
     """One computed `{color, label}` per Reach-outs row — folds status,
     engagement, reply_tag, and bounce category/reason into a single display
     value (see the Reach-outs layout redesign) instead of several columns
@@ -1686,7 +1687,16 @@ def _status_chip(*, status: str, engagement: str, reply_tag, bounce_category, bo
     if engagement == "clicked":
         return {"color": "serious", "label": f"Clicked ({num_clicks})" if num_clicks > 1 else "Clicked"}
 
-    if status in ("done", "active", "queued"):
+    # In-flight (active) rows lead with the estimated CADENCE STAGE they're in
+    # (initial / stage1 / stage2 …) rather than a generic "Active" — a
+    # best-effort estimate (GMass fires follow-ups server-side with no
+    # read-back; see slap.stages), surfaced as an estimate in the UI via
+    # tooltip. `stage_label` is precomputed by reachouts_rows(); falls back to
+    # "Active" for any caller that doesn't pass one (e.g. an older cadence-less
+    # row). done/queued keep their plain status word.
+    if status == "active":
+        return {"color": None, "label": stage_label or "Active"}
+    if status in ("done", "queued"):
         return {"color": None, "label": status.capitalize()}
     return {"color": None, "label": status or "—"}
 
@@ -1700,7 +1710,7 @@ def template_failures() -> list:
     return reload.load_failures()
 
 
-def reachouts_rows(conn) -> list:
+def reachouts_rows(conn, global_config=None) -> list:
     """One row per recipient (the `recipients` cache's own natural grain —
     a recipient's single current row already reflects whichever campaign
     they're most recently associated with), spanning every campaign with no
@@ -1808,6 +1818,7 @@ def reachouts_rows(conn) -> list:
     linkedin_replied_at_map = linkedin_replied_at(conn)
     pending_retry = _pending_retry_recipients(conn)
     rows = conn.execute("SELECT * FROM recipients").fetchall()
+    today = date.today()  # local, for the cadence stage/next-shoot estimates below
 
     result = []
     for row in rows:
@@ -1843,6 +1854,65 @@ def reachouts_rows(conn) -> list:
         clicks = click_details.get(recipient, [])
         is_stopped = recipient in stopped_recipients
         is_gated = recipient in gated_recipients
+
+        # Estimated cadence stage ("initial"/"stage1"/…) + next scheduled send
+        # ("next shoot"). Both are BEST-EFFORT estimates: GMass fires
+        # follow-ups server-side with no read-back (see slap.stages /
+        # CONTROL_SHEET.md), so recipients.current_stage stays 0 for a
+        # normally-progressing recipient and we infer the stage from elapsed
+        # calendar days vs the recipient's own recorded cadence. Surfaced only
+        # for in-flight rows; a finished sequence (replied/bounced/stopped/
+        # gated/done/not-interested) leaves both None so the Status chip keeps
+        # its own label and "Next shoot" renders a plain "-". current_stage is
+        # passed as the estimate FLOOR so an OOO-advanced recipient never reads
+        # below the stage the event log already confirms.
+        stage_index = None
+        stage_label = None
+        next_shoot_at = None
+        sequence_over = (
+            is_stopped or is_gated
+            or status in ("replied", "bounced", "done")
+            or tags.get(recipient) == "not_interested"
+        )
+        cadence = None
+        if row["cadence"]:
+            cadence = json.loads(row["cadence"])
+        elif global_config is not None and row["persona"]:
+            cadence = global_config.personas.get(row["persona"])
+
+        if status == "ooo_requeued":
+            # OOO is paused mid-sequence, not finished — the resume date IS the
+            # next scheduled email (already resolved above). No stage estimate:
+            # OOO progression is app-driven, off the original calendar offsets.
+            next_shoot_at = ooo_resume_date
+        elif not sequence_over and status in ("active", "queued", "pending_retry"):
+            if row["first_sent_at"] is None:
+                # Nothing sent yet (queued, or a never-sent pending_retry): the
+                # next send is the INITIAL one, on the runner's next drain window.
+                stage_index = 0
+                if global_config is not None:
+                    next_shoot_at = next_fire_moment(global_config.schedule).isoformat()
+            elif cadence is not None:
+                fs_local = _local_date(row["first_sent_at"])
+                stage_index = stages.estimate_current_stage(
+                    fs_local, cadence, today, floor=row["current_stage"] or 0)
+                if status == "active":
+                    # Next GMass-fired follow-up on the cadence calendar; None
+                    # once the whole window has elapsed (nothing left to send).
+                    nfd = stages.next_fire_date(fs_local, cadence, today, from_stage=stage_index)
+                    if nfd is not None:
+                        next_shoot_at = datetime.combine(nfd, datetime.min.time()).isoformat()
+                elif global_config is not None:
+                    # pending_retry (already sent once): the last attempt failed;
+                    # it retries on the next drain window, not on the cadence date.
+                    next_shoot_at = next_fire_moment(global_config.schedule).isoformat()
+            else:
+                # Sent at least once but no cadence data (a legacy row with a
+                # NULL cadence column and no global_config to fall back on):
+                # can't estimate elapsed stages — floor to the recorded stage,
+                # leave next_shoot None rather than guess.
+                stage_index = row["current_stage"] or 0
+            stage_label = stages.stage_label(stage_index)
 
         result.append({
             "recipient": recipient,
@@ -1885,11 +1955,19 @@ def reachouts_rows(conn) -> list:
             # silently un-mark this row. Drives the chip precedence below and
             # the React table's "gate the 'in' button once gated" state.
             "linkedin_gated": is_gated,
+            # Estimated cadence stage (see the block above). stage_index is the
+            # numeric form (0 = initial) for sorting; stage_label ("initial"/
+            # "stage1"/…) is what the Status chip leads with for an active row.
+            # Both None for a finished/non-in-flight sequence. next_shoot_at is
+            # a local ISO timestamp of the next scheduled send, or None ("-").
+            "stage_index": stage_index,
+            "stage_label": stage_label,
+            "next_shoot_at": next_shoot_at,
             "chip": _status_chip(status=status, engagement=engagement, reply_tag=tags.get(recipient),
                                   bounce_category=bounce_category, bounce_reason=bounce_reason,
                                   ooo_resume_date=ooo_resume_date,
                                   num_clicks=len(clicks) or (1 if engagement == "clicked" else 0),
-                                  stopped=is_stopped, gated=is_gated),
+                                  stopped=is_stopped, gated=is_gated, stage_label=stage_label),
             # Precomputed LOCAL calendar date (YYYY-MM-DD), reusing the same
             # _local_date() conversion todays_runs()/companies_contacted()
             # already use — so the client-side date-range filter (reachouts.
