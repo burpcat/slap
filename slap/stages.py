@@ -8,11 +8,15 @@ due / has it likely fired" question is therefore a best-effort ESTIMATE derived
 from `first_sent_at` + the recipient's own recorded `cadence` (day-deltas
 between consecutive stages) versus the current date.
 
-That estimate used to be recomputed by hand in four places (runner cap
-headroom, dashboard "due today" panel, cleanup window, OOO resend). This module
-centralizes the primitive so those callers — and the Reach-outs stage/next-shoot
-columns — can never disagree on the arithmetic. All functions are pure: they
-take dates + a cadence list and touch neither the DB nor config.
+That estimate used to be recomputed by hand in several places (runner cap
+headroom, dashboard "due today" panel, dashboard lifecycle-timeline inferred
+sends, cleanup window). This module centralizes the primitive so those
+callers — and the Reach-outs stage/next-shoot columns — can't disagree on the
+arithmetic. All functions are pure: they take dates (or datetimes — timedelta
+addition preserves whichever) + a cadence list and touch neither the DB nor
+config. (The OOO-resend write path in runner intentionally computes a single
+inter-stage gap `cadence[next_stage]`, a different quantity, so it's not one of
+these callers.)
 
 Cadence semantics (unchanged from the callers this replaced): `cadence[i]` is
 the day gap from the PREVIOUS stage, so the absolute offset of the Nth

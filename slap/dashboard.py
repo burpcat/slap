@@ -2369,7 +2369,9 @@ def recipient_timeline(conn, recipient: str, *, global_config=None, now: datetim
         for stage in range(1, len(cadence) + 1):
             if stage in real_send_stages:
                 continue  # a real send/requeue already covers this stage
-            est_dt = first_sent_dt + timedelta(days=sum(cadence[:stage]))
+            # stage_fire_date is date-agnostic (datetime + timedelta preserves
+            # the send's time-of-day here, unlike the date-based callers).
+            est_dt = stages.stage_fire_date(first_sent_dt, cadence, stage)
             if terminal_dt is not None and est_dt >= terminal_dt:
                 break  # cadence halted at the terminal event — no later sends
             nodes.append({
