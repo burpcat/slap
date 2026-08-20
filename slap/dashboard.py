@@ -43,7 +43,7 @@ from pathlib import Path
 import requests
 from flask import Flask, abort, g, send_file
 
-from slap import archive, display, domains, gmass, gmass_cache, reload, tracking, ui_state
+from slap import archive, display, domains, gmass, gmass_cache, reload, stages, tracking, ui_state
 from slap.config import discover_campaigns
 from slap.domains import check_recipient
 from slap.queue import (
@@ -687,8 +687,7 @@ def _followups_scheduled(conn, global_config, *, today: date = None) -> dict:
         next_stage = row["current_stage"] + 1
         if next_stage > len(cadence):
             continue
-        cumulative_days = sum(cadence[:next_stage])
-        fire_date = _local_date(row["first_sent_at"]) + timedelta(days=cumulative_days)
+        fire_date = stages.stage_fire_date(_local_date(row["first_sent_at"]), cadence, next_stage)
         entry = {"recipient": row["recipient"], "next_stage": next_stage, "fire_date": fire_date}
         if fire_date == today:
             due_today.append(entry)

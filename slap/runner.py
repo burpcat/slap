@@ -40,7 +40,7 @@ from datetime import time as dt_time
 from datetime import timedelta
 from pathlib import Path
 
-from slap import doctor, gmass
+from slap import doctor, gmass, stages
 from slap.latex import WORKDIR_ROOT, recipient_workdir
 from slap.queue import due_for_ooo_resend, due_for_remind, due_recipients, load_manifest
 from slap.tracking import append_event, latest_open_draft_id
@@ -193,8 +193,8 @@ def _estimate_followups_firing_today(conn, global_config, today: date) -> int:
         next_stage = row["current_stage"] + 1
         if next_stage > len(cadence):
             continue  # sequence already exhausted
-        cumulative_days = sum(cadence[:next_stage])
-        fire_date = datetime.fromisoformat(row["first_sent_at"]).date() + timedelta(days=cumulative_days)
+        fire_date = stages.stage_fire_date(
+            datetime.fromisoformat(row["first_sent_at"]).date(), cadence, next_stage)
         if fire_date == today:
             count += 1
     return count
