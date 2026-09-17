@@ -78,31 +78,23 @@ def _extract_referenced_ids(msg) -> set:
     return ids
 
 
-def poll_replies(imap_config: ImapConfig, sent_message_ids, *,
-                 scan_limit: int = DEFAULT_SCAN_LIMIT,
-                 imap_factory=imaplib.IMAP4_SSL) -> list:
-    """Return inbound replies to any of `sent_message_ids`. Each item is a dict:
-    `{"in_reply_to": <the sent id replied to>, "reply_message_id": <incoming id>,
-      "from": <From header>, "reply_time": <ISO-8601 str or None>}`.
+def _parse_date(date_hdr) -> str | None:
+    """A message's Date header as an ISO-8601 string, or None when absent or
+    unparseable (never raises — a malformed Date must not drop the message)."""
+    if not date_hdr:
+        return None
+    try:
+        return parsedate_to_datetime(date_hdr).isoformat()
+    except (TypeError, ValueError):
+        return None
 
-    `sent_message_ids` is the set of every Message-ID this app has ever sent
-    (initial + follow-ups + OOO resends + reminds). The downstream dedup key is
-    `reply_message_id` (the incoming Message-ID), mirroring how GMass's replyId
-    was deduped in the events log.
 
-    An empty `sent_message_ids` short-circuits with no network connection (there
-    is nothing to match against). `imap_factory` is a dependency-injection seam
-    for tests (an object exposing the `imaplib.IMAP4` interface); production
-    opens a real `imaplib.IMAP4_SSL`.
-
-    Fail-loud: connection/auth/protocol errors raise `ImapError`. The caller
-    (drain / dashboard) decides whether that's fatal or a tolerated transient —
-    same split gmass.get_reports's callers already make."""
-    sent = set(sent_message_ids)
-    if not sent:
-        return []
-
-    replies = []
+def _scan_recent(imap_config: ImapConfig, scan_limit: int, imap_factory):
+    """Connect, yield the most-recent `scan_limit` messages' parsed headers
+    (newest first), then always release the connection. Shared by poll_replies
+    and poll_bounces so both hit the mailbox with one identical, bounded,
+    headers-only sweep. Raises `ImapError` on any connection/auth/protocol
+    failure; `imap_factory` is the test seam (an `imaplib.IMAP4`-shaped object)."""
     try:
         server = imap_factory(imap_config.host, imap_config.port, timeout=imap_config.timeout)
         try:
@@ -118,33 +110,106 @@ def poll_replies(imap_config: ImapConfig, sent_message_ids, *,
                 typ, msg_data = server.fetch(num, "(BODY.PEEK[HEADER])")
                 if typ != "OK" or not msg_data or msg_data[0] is None:
                     continue
-                msg = email.message_from_bytes(msg_data[0][1])
-                hit = _extract_referenced_ids(msg) & sent
-                if not hit:
-                    continue
-                # A reply usually References the whole thread; attribute it to
-                # the most specific parent (its In-Reply-To when that is one of
-                # ours), else any matched id deterministically.
-                irt = (msg.get("In-Reply-To") or "").strip()
-                in_reply_to = irt if irt in sent else sorted(hit)[0]
-                reply_time = None
-                date_hdr = msg.get("Date")
-                if date_hdr:
-                    try:
-                        reply_time = parsedate_to_datetime(date_hdr).isoformat()
-                    except (TypeError, ValueError):
-                        reply_time = None
-                replies.append({
-                    "in_reply_to": in_reply_to,
-                    "reply_message_id": (msg.get("Message-ID") or "").strip() or None,
-                    "from": msg.get("From"),
-                    "reply_time": reply_time,
-                })
+                yield email.message_from_bytes(msg_data[0][1])
         finally:
             try:
                 server.logout()
             except Exception:
                 pass  # a logout failure never masks the real result/error
     except (imaplib.IMAP4.error, OSError) as e:
-        raise ImapError(f"IMAP reply poll failed: {e}") from e
+        raise ImapError(f"IMAP poll failed: {e}") from e
+
+
+def poll_replies(imap_config: ImapConfig, sent_message_ids, *,
+                 scan_limit: int = DEFAULT_SCAN_LIMIT,
+                 imap_factory=imaplib.IMAP4_SSL) -> list:
+    """Return inbound replies to any of `sent_message_ids`. Each item is a dict:
+    `{"in_reply_to": <the sent id replied to>, "reply_message_id": <incoming id>,
+      "from": <From header>, "reply_time": <ISO-8601 str or None>}`.
+
+    `sent_message_ids` is the set of every Message-ID this app has ever sent
+    (initial + follow-ups + OOO resends + reminds). The downstream dedup key is
+    `reply_message_id` (the incoming Message-ID), mirroring how GMass's replyId
+    was deduped in the events log.
+
+    An empty `sent_message_ids` short-circuits with no network connection (there
+    is nothing to match against). Fail-loud: connection/auth/protocol errors
+    raise `ImapError`; the caller decides whether that's fatal or transient."""
+    sent = set(sent_message_ids)
+    if not sent:
+        return []
+
+    replies = []
+    for msg in _scan_recent(imap_config, scan_limit, imap_factory):
+        hit = _extract_referenced_ids(msg) & sent
+        if not hit:
+            continue
+        # A reply usually References the whole thread; attribute it to the most
+        # specific parent (its In-Reply-To when that is one of ours), else any
+        # matched id deterministically.
+        irt = (msg.get("In-Reply-To") or "").strip()
+        in_reply_to = irt if irt in sent else sorted(hit)[0]
+        replies.append({
+            "in_reply_to": in_reply_to,
+            "reply_message_id": (msg.get("Message-ID") or "").strip() or None,
+            "from": msg.get("From"),
+            "reply_time": _parse_date(msg.get("Date")),
+        })
     return replies
+
+
+def _is_dsn(msg) -> bool:
+    """True if a message looks like a delivery-status notification (a bounce):
+    a `multipart/report` container, or a From of mailer-daemon/postmaster. Read
+    from headers alone (no body fetch)."""
+    ctype = (msg.get_content_type() or "").lower()
+    frm = (msg.get("From") or "").lower()
+    return ctype == "multipart/report" or "mailer-daemon" in frm or "postmaster" in frm
+
+
+def poll_bounces(imap_config: ImapConfig, recipients, *,
+                 scan_limit: int = DEFAULT_SCAN_LIMIT,
+                 imap_factory=imaplib.IMAP4_SSL) -> list:
+    """Return bounce (DSN) notifications for any of `recipients`. Each item:
+    `{"recipient": <failed address, lowercased>, "bounce_reason": <subject>,
+      "bounce_message_id": <the DSN's own Message-ID — the dedup key>,
+      "bounce_time": <ISO-8601 str or None>}`.
+
+    This restores the "a hard bounce stops the sequence" behaviour GMass's bounce
+    report provided and which plain SMTP otherwise loses: Gmail accepts a message
+    for an invalid address at submission time and bounces it back asynchronously
+    as a DSN, so without this a dead address keeps receiving every follow-up
+    stage (wasted cap + a real sender-reputation risk). runner.ingest_bounces
+    turns each match into a `bounce` event, flipping the recipient to
+    status='bounced' and out of every active-only query.
+
+    Detection is header-only (fast, no body fetch): a message is a bounce when
+    `_is_dsn` matches AND its `X-Failed-Recipients` header (which Gmail's own
+    mailer-daemon adds) names one of OUR `recipients` — requiring the address to
+    be one we actually contacted keeps an unrelated inbox DSN from ever marking
+    someone bounced. A DSN whose failed address isn't in `recipients`, or that
+    lacks `X-Failed-Recipients` entirely, is skipped (conservative: we never
+    fabricate a bounce). Empty `recipients` short-circuits with no connection."""
+    wanted = {r.strip().lower() for r in recipients if r and r.strip()}
+    if not wanted:
+        return []
+
+    bounces = []
+    for msg in _scan_recent(imap_config, scan_limit, imap_factory):
+        if not _is_dsn(msg):
+            continue
+        failed_raw = msg.get("X-Failed-Recipients")
+        if not failed_raw:
+            continue
+        dsn_id = (msg.get("Message-ID") or "").strip() or None
+        reason = (msg.get("Subject") or "SMTP delivery failure (DSN)").strip()
+        bounce_time = _parse_date(msg.get("Date"))
+        for addr in (a.strip().lower() for a in failed_raw.split(",")):
+            if addr and addr in wanted:
+                bounces.append({
+                    "recipient": addr,
+                    "bounce_reason": reason,
+                    "bounce_message_id": dsn_id,
+                    "bounce_time": bounce_time,
+                })
+    return bounces

@@ -14,8 +14,8 @@ import pytest
 from slap.config import GlobalConfig, ScheduleConfig
 from slap.queue import due_for_ooo_resend, due_recipients, load_manifest, stage_recipient, tag_ooo
 from slap.runner import (
-    DrainResult, cap_headroom, drain, ingest_replies, is_active_day, next_fire_moment,
-    staleness_warning, wait_for_fire_window,
+    DrainResult, cap_headroom, drain, ingest_bounces, ingest_replies, is_active_day,
+    next_fire_moment, staleness_warning, wait_for_fire_window,
     _roll_fire_time,
 )
 from slap.imap import ImapConfig, ImapError
@@ -1330,3 +1330,66 @@ def test_drain_reply_poll_failure_skips_followups_but_sends_initials(conn, tmp_p
         "SELECT stage FROM events WHERE type='sent' AND recipient='bob@acme.com' ORDER BY id")]
     assert jane_stages == [0]   # follow-up skipped because the poll failed
     assert bob_stages == [0]    # initial still sent
+
+
+# --- bounce (DSN) ingestion: stop mailing dead addresses -------------------
+
+def _bounce(recipient, dsn="<dsn-1@mail.gmail.com>"):
+    return {"recipient": recipient, "bounce_reason": "Delivery Status Notification (Failure)",
+            "bounce_message_id": dsn, "bounce_time": None}
+
+
+def _fake_bounce_poll(bounces):
+    def _poll(imap_config, recipients):
+        wanted = {r.lower() for r in recipients}
+        return [b for b in bounces if b["recipient"].lower() in wanted]
+    return _poll
+
+
+def test_ingest_bounces_marks_recipient_bounced_and_dedups(conn, tmp_path):
+    gc = make_global_config(tmp_path)
+    stage_one(conn, tmp_path, cadence=[2, 3, 5])
+    drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+          send_message_fn=fake_smtp()[0])
+
+    poll = _fake_bounce_poll([_bounce("jane@acme.com")])
+    assert ingest_bounces(conn, IMAP, poll_bounces_fn=poll) == 1
+    assert conn.execute(
+        "SELECT status FROM recipients WHERE recipient='jane@acme.com'").fetchone()["status"] == "bounced"
+    # Re-polling the same DSN records nothing (deduped).
+    assert ingest_bounces(conn, IMAP, poll_bounces_fn=poll) == 0
+
+
+def test_drain_bounce_poll_stops_followups_for_a_bounced_recipient(conn, tmp_path):
+    gc = make_global_config(tmp_path)
+    stage_one(conn, tmp_path, cadence=[2, 3, 5])
+    drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+          send_message_fn=fake_smtp(message_id="<init@gmail.com>")[0])
+
+    send_fu, calls = fake_smtp()
+    drain(conn, gc, SMTP, now=date.today() + timedelta(days=2), sleep_fn=lambda s: None,
+          workdir_root=tmp_path / "workdir", send_message_fn=send_fu,
+          imap_config=IMAP, poll_replies_fn=_fake_poll([]),
+          poll_bounces_fn=_fake_bounce_poll([_bounce("jane@acme.com")]))
+    assert calls["send"] == 0  # bounced before the stage-1 follow-up could fire
+    assert conn.execute(
+        "SELECT status FROM recipients WHERE recipient='jane@acme.com'").fetchone()["status"] == "bounced"
+
+
+def test_drain_bounce_poll_failure_is_best_effort_and_does_not_skip_followups(conn, tmp_path):
+    # Unlike a reply-poll failure (which skips follow-ups), a bounce-poll failure
+    # is a best-effort safety net — the follow-up still fires.
+    gc = make_global_config(tmp_path)
+    stage_one(conn, tmp_path, cadence=[2, 3, 5])
+    drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+          send_message_fn=fake_smtp(message_id="<init@gmail.com>")[0])
+
+    def boom(cfg, recipients):
+        raise ImapError("imap down")
+
+    send_fu, calls = fake_smtp()
+    drain(conn, gc, SMTP, now=date.today() + timedelta(days=2), sleep_fn=lambda s: None,
+          workdir_root=tmp_path / "workdir", send_message_fn=send_fu,
+          imap_config=IMAP, poll_replies_fn=_fake_poll([]), poll_bounces_fn=boom,
+          log_fn=lambda m: None)
+    assert calls["send"] == 1

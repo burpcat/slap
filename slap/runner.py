@@ -303,6 +303,63 @@ def ingest_replies(conn, imap_config, *, poll_replies_fn=imap.poll_replies) -> i
     return new
 
 
+def _sent_recipient_campaigns(conn) -> dict:
+    """lowercased recipient -> (original-cased recipient, campaign) for every
+    recipient in the cache, so a matched bounce DSN can be attributed and carry
+    its campaign on the `bounce` event. Lowercased key because a DSN's
+    X-Failed-Recipients casing needn't match how we stored the address."""
+    owners = {}
+    for row in conn.execute("SELECT recipient, campaign FROM recipients WHERE recipient IS NOT NULL"):
+        owners[row["recipient"].lower()] = (row["recipient"], row["campaign"])
+    return owners
+
+
+def ingest_bounces(conn, imap_config, *, poll_bounces_fn=imap.poll_bounces) -> int:
+    """Poll IMAP for delivery-failure DSNs and append a `bounce` event for each
+    new one (which flips the recipient to status='bounced', removing them from
+    every active-only query — no more follow-ups to a dead address). Returns the
+    count of new bounces written.
+
+    This restores the stop-on-bounce behaviour GMass's bounce report gave and
+    that plain SMTP loses: Gmail accepts a message for an invalid address then
+    bounces it back asynchronously, so without this a hard-bounced recipient
+    keeps getting every stage (wasted cap + sender-reputation risk). Deduped so
+    a recipient is marked bounced at most once: by the DSN's own Message-ID when
+    present, and — belt-and-suspenders for a DSN lacking one — by the recipient
+    already having a bounce event. Called from the drain (before follow-ups) so a
+    bounce stops the sequence the same drain it's detected."""
+    owners = _sent_recipient_campaigns(conn)
+    if not owners:
+        return 0
+    bounces = poll_bounces_fn(imap_config, set(owners))
+    seen_dsn = set()
+    already_bounced = set()
+    for row in conn.execute("SELECT recipient, meta FROM events WHERE type = 'bounce'"):
+        if row["recipient"]:
+            already_bounced.add(row["recipient"])
+        meta = json.loads(row["meta"]) if row["meta"] else {}
+        if meta.get("dsn_message_id"):
+            seen_dsn.add(meta["dsn_message_id"])
+    new = 0
+    for b in bounces:
+        owner = owners.get((b.get("recipient") or "").lower())
+        if owner is None:
+            continue
+        recipient, campaign = owner
+        dsn_id = b.get("bounce_message_id")
+        if (dsn_id and dsn_id in seen_dsn) or recipient in already_bounced:
+            continue
+        append_event(conn, type="bounce", recipient=recipient, campaign=campaign,
+                     meta={"bounce_reason": b.get("bounce_reason"),
+                           "bounce_time": b.get("bounce_time"),
+                           "category": "bounce", "dsn_message_id": dsn_id})
+        if dsn_id:
+            seen_dsn.add(dsn_id)
+        already_bounced.add(recipient)
+        new += 1
+    return new
+
+
 def _send_one(conn, smtp_config, row: dict, *, workdir_root: Path = WORKDIR_ROOT,
               send_message_fn=smtp.send_message, sender_name: str = None) -> bool:
     recipient, campaign = row["recipient"], row["campaign"]
@@ -560,7 +617,8 @@ def _send_remind(conn, smtp_config, row: dict, *, workdir_root: Path = WORKDIR_R
 def drain(conn, global_config, smtp_config, *, now: date = None, sleep_fn=time.sleep,
           random_fn=random.uniform, workdir_root: Path = WORKDIR_ROOT,
           send_message_fn=smtp.send_message, imap_config=None,
-          poll_replies_fn=imap.poll_replies, log_fn=print) -> DrainResult:
+          poll_replies_fn=imap.poll_replies, poll_bounces_fn=imap.poll_bounces,
+          log_fn=print) -> DrainResult:
     """Drain whatever's queued and due, right now — no window waiting (that's
     wait_for_fire_window's job). Cap-aware, resilient: a preflight failure
     retries then gives up loud (run_failed, queue untouched); a per-email
@@ -601,6 +659,13 @@ def drain(conn, global_config, smtp_config, *, now: date = None, sleep_fn=time.s
         except imap.ImapError as e:
             followups_enabled = False
             log_fn(f"reply poll failed — skipping follow-ups this drain: {e}")
+        # Bounce detection is a best-effort safety net (stop mailing dead
+        # addresses), not the primary stop signal — a bounce-poll failure is
+        # logged but does NOT skip follow-ups the way a reply-poll failure does.
+        try:
+            ingest_bounces(conn, imap_config, poll_bounces_fn=poll_bounces_fn)
+        except imap.ImapError as e:
+            log_fn(f"bounce poll failed (best-effort, proceeding): {e}")
 
     headroom = cap_headroom(conn, global_config, today=today)
     # OOO resends (§7) share the exact same cap/gap/preflight/exception

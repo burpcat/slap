@@ -3,7 +3,7 @@ import imaplib
 
 import pytest
 
-from slap.imap import ImapConfig, ImapError, poll_replies
+from slap.imap import ImapConfig, ImapError, poll_bounces, poll_replies
 
 CFG = ImapConfig(host="imap.gmail.com", port=993, user="me@gmail.com", password="pw")
 
@@ -114,3 +114,63 @@ def test_poll_replies_missing_date_yields_none_reply_time():
     fake = FakeIMAP([raw])
     out = poll_replies(CFG, {"<init@gmail.com>"}, imap_factory=fake.factory())
     assert out[0]["reply_time"] is None
+
+
+# --- poll_bounces (DSN detection) ------------------------------------------
+
+def _dsn(failed, message_id="<dsn-1@mail.gmail.com>",
+         frm="Mail Delivery Subsystem <mailer-daemon@googlemail.com>",
+         content_type="multipart/report; report-type=delivery-status; boundary=xyz",
+         subject="Delivery Status Notification (Failure)",
+         date="Wed, 17 Sep 2026 11:00:00 -0400", x_failed=True):
+    lines = [f"From: {frm}", f"Message-ID: {message_id}", f"Subject: {subject}",
+             f"Date: {date}", f"Content-Type: {content_type}"]
+    if x_failed:
+        lines.append(f"X-Failed-Recipients: {failed}")
+    return ("\r\n".join(lines) + "\r\n\r\n").encode()
+
+
+def test_poll_bounces_matches_a_dsn_for_our_recipient():
+    fake = FakeIMAP([_dsn("baduser@corp.com")])
+    out = poll_bounces(CFG, {"baduser@corp.com"}, imap_factory=fake.factory())
+    assert out == [{
+        "recipient": "baduser@corp.com",
+        "bounce_reason": "Delivery Status Notification (Failure)",
+        "bounce_message_id": "<dsn-1@mail.gmail.com>",
+        "bounce_time": "2026-09-17T11:00:00-04:00",
+    }]
+
+
+def test_poll_bounces_detects_via_multipart_report_without_mailer_daemon_from():
+    fake = FakeIMAP([_dsn("baduser@corp.com", frm="postmaster@corp.com")])
+    out = poll_bounces(CFG, {"baduser@corp.com"}, imap_factory=fake.factory())
+    assert len(out) == 1 and out[0]["recipient"] == "baduser@corp.com"
+
+
+def test_poll_bounces_is_case_insensitive_on_the_address():
+    fake = FakeIMAP([_dsn("BadUser@Corp.com")])
+    out = poll_bounces(CFG, {"baduser@corp.com"}, imap_factory=fake.factory())
+    assert out and out[0]["recipient"] == "baduser@corp.com"
+
+
+def test_poll_bounces_ignores_dsn_for_an_address_we_never_contacted():
+    fake = FakeIMAP([_dsn("stranger@corp.com")])
+    assert poll_bounces(CFG, {"baduser@corp.com"}, imap_factory=fake.factory()) == []
+
+
+def test_poll_bounces_ignores_non_dsn_messages():
+    fake = FakeIMAP([_raw("<normal@corp.com>", in_reply_to="<init@gmail.com>")])
+    assert poll_bounces(CFG, {"baduser@corp.com"}, imap_factory=fake.factory()) == []
+
+
+def test_poll_bounces_skips_a_dsn_without_x_failed_recipients():
+    # A bounce we can't attribute (no X-Failed-Recipients header) is skipped
+    # rather than guessed at — never fabricate a bounce.
+    fake = FakeIMAP([_dsn("baduser@corp.com", x_failed=False)])
+    assert poll_bounces(CFG, {"baduser@corp.com"}, imap_factory=fake.factory()) == []
+
+
+def test_poll_bounces_empty_recipients_short_circuits_without_connecting():
+    def exploding_factory(*a, **k):
+        raise AssertionError("must not connect when there is nothing to match")
+    assert poll_bounces(CFG, set(), imap_factory=exploding_factory) == []
