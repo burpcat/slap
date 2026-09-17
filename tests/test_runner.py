@@ -14,14 +14,29 @@ import pytest
 from slap.config import GlobalConfig, ScheduleConfig
 from slap.queue import due_for_ooo_resend, due_recipients, load_manifest, stage_recipient, tag_ooo
 from slap.runner import (
-    DrainResult, cap_headroom, drain, is_active_day, next_fire_moment, staleness_warning,
-    wait_for_fire_window,
+    DrainResult, cap_headroom, drain, ingest_replies, is_active_day, next_fire_moment,
+    staleness_warning, wait_for_fire_window,
     _roll_fire_time,
 )
+from slap.imap import ImapConfig, ImapError
 from slap.smtp import SmtpConfig
 from slap.tracking import append_event, connect
 
 SMTP = SmtpConfig(host="smtp.gmail.com", port=587, user="owner@gmail.com", password="pw")
+IMAP = ImapConfig(host="imap.gmail.com", port=993, user="owner@gmail.com", password="pw")
+
+
+def _reply(in_reply_to, reply_message_id="<rep@corp.com>", reply_time=None):
+    return {"in_reply_to": in_reply_to, "reply_message_id": reply_message_id,
+            "from": "jane@acme.com", "reply_time": reply_time}
+
+
+def _fake_poll(replies):
+    """A poll_replies_fn stand-in: returns the canned replies whose in_reply_to
+    is among the sent ids passed in (mirroring the real matcher)."""
+    def _poll(imap_config, sent_ids):
+        return [r for r in replies if r["in_reply_to"] in sent_ids]
+    return _poll
 
 
 def make_global_config(tmp_path, *, daily_cap=500, drain_retries=3, send_delay_min=10,
@@ -1247,3 +1262,68 @@ def test_drain_followup_chains_the_reply_thread(conn, tmp_path):
           workdir_root=tmp_path / "workdir", send_message_fn=send_fu2)
     assert calls2["send"] == 1
     assert calls2["last"]["in_reply_to"] == "<fu1@gmail.com>"  # threads into stage 1, not the initial
+
+
+# --- IMAP reply ingestion + stop-on-reply at fire time (§8/§10 under SMTP) ---
+
+def test_ingest_replies_records_reply_and_flips_status(conn, tmp_path):
+    gc = make_global_config(tmp_path)
+    stage_one(conn, tmp_path, cadence=[2, 3, 5])
+    drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+          send_message_fn=fake_smtp(message_id="<init@gmail.com>")[0])
+
+    poll = _fake_poll([_reply("<init@gmail.com>", reply_time="2026-01-05T10:00:00+00:00")])
+    assert ingest_replies(conn, IMAP, poll_replies_fn=poll) == 1
+    row = conn.execute("SELECT status FROM recipients WHERE recipient='jane@acme.com'").fetchone()
+    assert row["status"] == "replied"
+    # Dedup: re-polling the same inbound reply writes nothing.
+    assert ingest_replies(conn, IMAP, poll_replies_fn=poll) == 0
+
+
+def test_ingest_replies_no_sent_messages_short_circuits(conn, tmp_path):
+    # Nothing sent yet -> no ids to match -> the poll fn is never even called.
+    def exploding(cfg, ids):
+        raise AssertionError("poll must not run with no sent messages")
+    assert ingest_replies(conn, IMAP, poll_replies_fn=exploding) == 0
+
+
+def test_drain_reply_poll_suppresses_followup(conn, tmp_path):
+    # The hard correctness rule: the reply poll runs BEFORE follow-up selection,
+    # so a reply that arrives before the stage-1 fire date stops the follow-up.
+    gc = make_global_config(tmp_path)
+    stage_one(conn, tmp_path, cadence=[2, 3, 5])
+    drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+          send_message_fn=fake_smtp(message_id="<init@gmail.com>")[0])
+
+    poll = _fake_poll([_reply("<init@gmail.com>")])
+    send_fu, calls = fake_smtp()
+    drain(conn, gc, SMTP, now=date.today() + timedelta(days=2), sleep_fn=lambda s: None,
+          workdir_root=tmp_path / "workdir", send_message_fn=send_fu,
+          imap_config=IMAP, poll_replies_fn=poll)
+    assert calls["send"] == 0  # replied first -> no follow-up
+    row = conn.execute("SELECT status FROM recipients WHERE recipient='jane@acme.com'").fetchone()
+    assert row["status"] == "replied"
+
+
+def test_drain_reply_poll_failure_skips_followups_but_sends_initials(conn, tmp_path):
+    # A poll failure must not fire follow-ups (can't confirm nobody replied),
+    # but initial sends — which don't depend on reply state — still go.
+    gc = make_global_config(tmp_path)
+    stage_one(conn, tmp_path, recipient="jane@acme.com", cadence=[2, 3, 5])
+    drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+          send_message_fn=fake_smtp(message_id="<init@gmail.com>")[0])
+    stage_one(conn, tmp_path, recipient="bob@acme.com", cadence=[2, 3, 5])  # freshly staged
+
+    def boom(cfg, ids):
+        raise ImapError("imap down")
+
+    drain(conn, gc, SMTP, now=date.today() + timedelta(days=2), sleep_fn=lambda s: None,
+          workdir_root=tmp_path / "workdir", send_message_fn=fake_smtp()[0],
+          imap_config=IMAP, poll_replies_fn=boom, log_fn=lambda m: None)
+
+    jane_stages = [r["stage"] for r in conn.execute(
+        "SELECT stage FROM events WHERE type='sent' AND recipient='jane@acme.com' ORDER BY id")]
+    bob_stages = [r["stage"] for r in conn.execute(
+        "SELECT stage FROM events WHERE type='sent' AND recipient='bob@acme.com' ORDER BY id")]
+    assert jane_stages == [0]   # follow-up skipped because the poll failed
+    assert bob_stages == [0]    # initial still sent

@@ -25,8 +25,8 @@ from slap.prompts import PASTE_TERMINATOR, read_paste
 from slap.queue import AmbiguousArchiveChoice, QueueError, resend_bounced, stage_recipient
 from slap.templates import fill_template, merge_config_values, parse_drop
 from slap import (
-    archive, dashboard, doctor, domains, followups, gmass, gmass_cache, init, launchd, onboard,
-    reload, runner, smtp, tracking,
+    archive, dashboard, doctor, domains, followups, gmass, gmass_cache, imap, init, launchd,
+    onboard, reload, runner, smtp, tracking,
 )
 
 
@@ -38,6 +38,17 @@ def _smtp_config(global_config):
     old GMASS_API_KEY path deferred its own empty-key check to doctor."""
     return smtp.SmtpConfig(
         host=smtp.DEFAULT_SMTP_HOST, port=smtp.DEFAULT_SMTP_PORT,
+        user=global_config.from_email,
+        password=os.environ.get(smtp.PASSWORD_ENV, "").strip(),
+    )
+
+
+def _imap_config(global_config):
+    """IMAP read credentials for reply detection, from config + env. Same Gmail
+    account + App Password as SMTP (Gmail accepts the app password for IMAP).
+    Passed to runner.drain so stop-on-reply is enforced at fire time."""
+    return imap.ImapConfig(
+        host=imap.DEFAULT_IMAP_HOST, port=imap.DEFAULT_IMAP_PORT,
         user=global_config.from_email,
         password=os.environ.get(smtp.PASSWORD_ENV, "").strip(),
     )
@@ -163,7 +174,8 @@ def cmd_send(args):
 
     if args.now:
         print("\n--now: draining the queue immediately...")
-        result = runner.drain(conn, global_config, _smtp_config(global_config))
+        result = runner.drain(conn, global_config, _smtp_config(global_config),
+                             imap_config=_imap_config(global_config))
         _print_drain_result(result)
 
 
@@ -257,7 +269,8 @@ def cmd_send_unified(args):
 
     if args.now:
         print("\n--now: draining the queue immediately...")
-        result = runner.drain(conn, global_config, _smtp_config(global_config))
+        result = runner.drain(conn, global_config, _smtp_config(global_config),
+                             imap_config=_imap_config(global_config))
         _print_drain_result(result)
 
 
@@ -434,7 +447,8 @@ def cmd_send_custom(args):
 
     if args.now:
         print("\n--now: draining the queue immediately...")
-        result = runner.drain(conn, global_config, _smtp_config(global_config))
+        result = runner.drain(conn, global_config, _smtp_config(global_config),
+                             imap_config=_imap_config(global_config))
         _print_drain_result(result)
 
 
@@ -680,7 +694,8 @@ def cmd_runner(args):
         return
     conn = tracking.connect()
     runner.wait_for_fire_window(global_config.schedule)
-    result = runner.drain(conn, global_config, _smtp_config(global_config))
+    result = runner.drain(conn, global_config, _smtp_config(global_config),
+                             imap_config=_imap_config(global_config))
     _print_drain_result(result)
 
 

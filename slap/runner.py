@@ -40,7 +40,7 @@ from datetime import time as dt_time
 from datetime import timedelta
 from pathlib import Path
 
-from slap import doctor, smtp, stages
+from slap import doctor, imap, smtp, stages
 from slap.latex import WORKDIR_ROOT, recipient_workdir
 from slap.queue import (
     due_for_followup, due_for_ooo_resend, due_for_remind, due_recipients, load_manifest,
@@ -234,6 +234,73 @@ def cap_headroom(conn, global_config, *, today: date = None) -> int:
     today = today or date.today()
     used = todays_sent_count(conn, today) + _estimate_followups_firing_today(conn, global_config, today)
     return max(0, global_config.schedule.daily_cap - used)
+
+
+def _sent_message_id_owners(conn) -> dict:
+    """Map every Message-ID this app has sent -> (recipient, campaign), so a
+    matched inbound reply can be attributed to the recipient it replied to.
+    Covers every event type that records a message_id: initial/follow-up
+    `sent`, OOO `requeued`, and remind `interaction`. A later send's id
+    overwrites an earlier one for the same recipient, which is fine — the map
+    is keyed by the unique per-message id, and all of a recipient's ids resolve
+    back to that same recipient."""
+    owners = {}
+    for row in conn.execute(
+        "SELECT recipient, campaign, message_id FROM events "
+        "WHERE message_id IS NOT NULL AND type IN ('sent', 'requeued', 'interaction')"
+    ):
+        owners[row["message_id"]] = (row["recipient"], row["campaign"])
+    return owners
+
+
+def _existing_reply_ids(conn) -> set:
+    """Every inbound reply Message-ID already recorded (dedup key), read from
+    `reply` events' meta — the same dedup discipline dashboard._sync_replies
+    used with GMass's replyId."""
+    seen = set()
+    for row in conn.execute("SELECT meta FROM events WHERE type = 'reply'"):
+        meta = json.loads(row["meta"]) if row["meta"] else {}
+        rid = meta.get("reply_id")
+        if rid:
+            seen.add(rid)
+    return seen
+
+
+def ingest_replies(conn, imap_config, *, poll_replies_fn=imap.poll_replies) -> int:
+    """Poll IMAP for replies to any of our sent messages and append a `reply`
+    event for each new one (deduped by the inbound Message-ID). Returns the
+    count of new replies written.
+
+    This is the SMTP replacement for GMass's server-side reply reports. It is
+    called at the START of a drain — BEFORE follow-ups are selected — so
+    stop-on-reply is enforced at *fire time*: a recipient whose reply is
+    ingested here flips to status 'replied' (the `reply` cache handler), which
+    removes them from slap.queue.due_for_followup. The dashboard's on-open poll
+    calls it too, so replies also surface there. Raises imap.ImapError on a
+    connection/auth failure (the caller decides whether that's fatal)."""
+    owners = _sent_message_id_owners(conn)
+    if not owners:
+        return 0
+    replies = poll_replies_fn(imap_config, set(owners))
+    seen = _existing_reply_ids(conn)
+    new = 0
+    for r in replies:
+        reply_id = r.get("reply_message_id")
+        if not reply_id or reply_id in seen:
+            continue
+        owner = owners.get(r.get("in_reply_to"))
+        if owner is None:
+            continue
+        recipient, campaign = owner
+        stage_row = conn.execute(
+            "SELECT current_stage FROM recipients WHERE recipient = ?", (recipient,)
+        ).fetchone()
+        stage = stage_row["current_stage"] if stage_row else None
+        append_event(conn, type="reply", recipient=recipient, campaign=campaign, stage=stage,
+                     meta={"reply_id": reply_id, "reply_time": r.get("reply_time")})
+        seen.add(reply_id)
+        new += 1
+    return new
 
 
 def _send_one(conn, smtp_config, row: dict, *, workdir_root: Path = WORKDIR_ROOT,
@@ -492,7 +559,8 @@ def _send_remind(conn, smtp_config, row: dict, *, workdir_root: Path = WORKDIR_R
 
 def drain(conn, global_config, smtp_config, *, now: date = None, sleep_fn=time.sleep,
           random_fn=random.uniform, workdir_root: Path = WORKDIR_ROOT,
-          send_message_fn=smtp.send_message, log_fn=print) -> DrainResult:
+          send_message_fn=smtp.send_message, imap_config=None,
+          poll_replies_fn=imap.poll_replies, log_fn=print) -> DrainResult:
     """Drain whatever's queued and due, right now — no window waiting (that's
     wait_for_fire_window's job). Cap-aware, resilient: a preflight failure
     retries then gives up loud (run_failed, queue untouched); a per-email
@@ -517,6 +585,22 @@ def drain(conn, global_config, smtp_config, *, now: date = None, sleep_fn=time.s
         return DrainResult(ran=False, preflight_error=error)
 
     append_event(conn, type="run_started")
+
+    # Stop-on-reply at FIRE TIME (see slap.imap's module docstring / the hard
+    # correctness rule): poll IMAP for replies and record them BEFORE selecting
+    # follow-ups, so a recipient who replied since the last drain leaves
+    # 'active' status here and is never picked up by due_for_followup below.
+    # imap_config is None only in tests / degraded runs that inject replies
+    # directly. If the poll itself fails, we must NOT fire follow-ups this drain
+    # (we can't confirm nobody replied) — but initial sends and reminds still
+    # go, since those don't depend on reply state.
+    followups_enabled = True
+    if imap_config is not None:
+        try:
+            ingest_replies(conn, imap_config, poll_replies_fn=poll_replies_fn)
+        except imap.ImapError as e:
+            followups_enabled = False
+            log_fn(f"reply poll failed — skipping follow-ups this drain: {e}")
 
     headroom = cap_headroom(conn, global_config, today=today)
     # OOO resends (§7) share the exact same cap/gap/preflight/exception
@@ -544,7 +628,7 @@ def drain(conn, global_config, smtp_config, *, now: date = None, sleep_fn=time.s
     # recipient (owned by the OOO list above on its pause schedule), so the two
     # never fire the same stage — dispatched via _send_followup on this same
     # cap-bounded batch, just like every other send.
-    due_followup = due_for_followup(conn, global_config, today=today)
+    due_followup = due_for_followup(conn, global_config, today=today) if followups_enabled else []
     # Reminds (one-shot manual nudges) fire on the same runner cadence as
     # everything else — just more rows in the same cap-bounded batch, dispatched
     # via _send_remind. A recipient already dispatched this drain (initial/OOO/
