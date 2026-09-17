@@ -4,18 +4,45 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-This repo currently contains only the build brief `SLAP_BUILD_PROMPT.md`. The application
-(`slap.py`) has **not been built yet**. The brief is the authoritative spec — read it in
-full before writing code, and follow its **Build Order** (§14). Build in that order;
-Phase-0 probes come first and gate everything else.
+The application is **built** — `slap.py` plus the `slap/` package, with a full pytest
+suite. `SLAP_BUILD_PROMPT.md` remains the historical spec, but note the transport change
+below: the codebase is the source of truth now, not the brief's GMass sections.
+
+## Transport: local SMTP + IMAP (migrated off GMass) — READ FIRST
+
+The app **no longer uses the GMass API**. It sends directly through Gmail over **SMTP**
+(`slap/smtp.py`, `smtp.gmail.com:587` + a Gmail **App Password**) and detects replies over
+**IMAP** (`slap/imap.py`, `imap.gmail.com:993`). This supersedes every "GMass" claim in the
+sections below and in `SLAP_BUILD_PROMPT.md`. What changed:
+
+- **The app owns the whole follow-up cadence itself.** GMass used to fire stages 1–N
+  server-side; now `slap.queue.due_for_followup` selects the next due stage (via
+  `slap.stages.stage_fire_date`) and `slap.runner._send_followup` sends it, threaded into
+  the recipient's conversation. `stages.py`'s fire-date math is now an actual trigger, not
+  an estimate.
+- **Stop-on-reply is enforced at fire time.** `runner.drain` polls IMAP
+  (`runner.ingest_replies`) BEFORE selecting follow-ups, so a recipient who replied since
+  the last drain flips to `status='replied'` and is never followed up. This is the one hard
+  correctness rule — reply detection must run in the drain, not only on dashboard open.
+- **Send is one atomic call** (`smtp.send_message`), not the GMass two-call
+  draft→campaign dance. A failed send stays queued and is safely retried. Threading uses
+  RFC822 `In-Reply-To`/`References` headers keyed on the recipient's stored `message_id`
+  (the `events.message_id` / `recipients.message_id` column that replaced
+  `gmass_campaign_id`/`gmass_draft_id`).
+- **Credentials:** one Gmail App Password in `.env` as `GMAIL_APP_PASSWORD` (covers both
+  SMTP + IMAP), replacing `GMASS_API_KEY`. No `gmass:` config block is needed anymore.
+- **Accepted losses:** click tracking and bounce ingestion (no free SMTP equivalent — the
+  `click`/`bounce` event types and their dashboard widgets remain for historical data, but
+  nothing new is ingested), and GMass's server-side auto-responder filtering (the manual
+  OOO-tagging in the dashboard is the safety net). Still capped at Gmail's ~500/day.
 
 ## What this is
 
-`slap.py` — a personal cold job-outreach CLI over the **GMass API** (Python). It fills an
-email template from a pasted "drop" (line-by-line `key : value`), optionally compiles a
-pasted LaTeX résumé and attaches it, then sends via GMass (which relays through the owner's
-Gmail and runs follow-ups on GMass's own servers). Everything sent is tracked in local
-SQLite; a localhost dashboard shows status and lets the owner tag replies.
+`slap.py` — a personal cold job-outreach CLI that sends through the owner's Gmail over SMTP
+(Python). It fills an email template from a pasted "drop" (line-by-line `key : value`),
+optionally compiles a pasted LaTeX résumé and attaches it, then sends and runs its own
+follow-up cadence, detecting replies over IMAP to stop them. Everything sent is tracked in
+local SQLite; a localhost dashboard shows status and lets the owner tag replies.
 
 ## Design philosophy ("iron") — governs every decision
 
