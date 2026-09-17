@@ -31,10 +31,17 @@ sections below and in `SLAP_BUILD_PROMPT.md`. What changed:
   `gmass_campaign_id`/`gmass_draft_id`).
 - **Credentials:** one Gmail App Password in `.env` as `GMAIL_APP_PASSWORD` (covers both
   SMTP + IMAP), replacing `GMASS_API_KEY`. No `gmass:` config block is needed anymore.
-- **Accepted losses:** click tracking and bounce ingestion (no free SMTP equivalent — the
-  `click`/`bounce` event types and their dashboard widgets remain for historical data, but
-  nothing new is ingested), and GMass's server-side auto-responder filtering (the manual
-  OOO-tagging in the dashboard is the safety net). Still capped at Gmail's ~500/day.
+- **Bounce detection kept (via IMAP).** Click tracking is dropped (no free SMTP
+  equivalent), but hard bounces are still caught: `imap.poll_bounces` +
+  `runner.ingest_bounces` read Gmail's delivery-failure DSNs and write a `bounce` event, so
+  a dead address still stops the sequence. Also lost: GMass's server-side auto-responder
+  filtering (an auto-reply now conservatively *stops* the sequence — corrected via the
+  dashboard's OOO-tagging). Still capped at Gmail's ~500/day.
+- **Routes/dashboard:** `POST /api/gmass/refresh` was renamed to **`POST /api/refresh`**
+  (it now escalates an IMAP reply poll). The write actions `tag_reply`/`stop_outreach`/
+  `gate_linkedin` no longer fire a GMass unsubscribe (the local event alone halts the
+  app-owned cadence) and can no longer 502. Full changelog + route table: `CHANGELOG.md`.
+  The GMass-stable version is preserved on the `old/gmass` branch.
 
 ## What this is
 
