@@ -512,18 +512,18 @@ def queue_remind(conn, recipient: str, body: str, *, followup: str = None,
     OOO-resend model (app-initiated reply-in-thread on the normal drain), the
     only sanctioned way this app sends after the initial: no scheduler.
 
-    Fail loud on an unknown recipient, or one with no prior GMass campaign to
-    reply into (they were never actually sent — nothing to thread onto), same
-    "must be a real, resend-able recipient" guard as resend_bounced()."""
+    Fail loud on an unknown recipient, or one with no prior send to reply into
+    (they were never actually sent — nothing to thread onto), same "must be a
+    real, resend-able recipient" guard as resend_bounced()."""
     row = conn.execute(
-        "SELECT campaign, last_gmass_campaign_id FROM recipients WHERE recipient = ?", (recipient,)
+        "SELECT campaign, message_id FROM recipients WHERE recipient = ?", (recipient,)
     ).fetchone()
     if row is None:
         raise QueueError(f"unknown recipient {recipient!r} — never staged/contacted")
-    reply_to = row["last_gmass_campaign_id"]
+    reply_to = row["message_id"]
     if not reply_to:
         raise QueueError(
-            f"{recipient} has no prior GMass send to reply into — a Remind is a threaded "
+            f"{recipient} has no prior send to reply into — a Remind is a threaded "
             f"follow-up, so it can only go to someone already contacted"
         )
     # Snapshot the original subject from the staged manifest when available, so
@@ -538,7 +538,7 @@ def queue_remind(conn, recipient: str, body: str, *, followup: str = None,
         subject_ref = ""
     append_event(conn, type="interaction", recipient=recipient, campaign=row["campaign"],
                  meta={"channel": "remind_queued", "followup": followup, "body": body,
-                       "campaign_id_to_reply_to": reply_to, "subject_ref": subject_ref})
+                       "reply_to_message_id": reply_to, "subject_ref": subject_ref})
 
 
 def due_for_remind(conn) -> list:

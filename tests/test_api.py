@@ -649,7 +649,8 @@ def test_api_followed_up_unknown_recipient_404(app):
 def _seed_real_lead_api(conn, recipient="a@acme.com", campaign="c"):
     append_event(conn, type="queued", recipient=recipient, campaign=campaign, stage=0,
                  meta={"persona": "recruiter", "cadence": []})
-    append_event(conn, type="sent", recipient=recipient, campaign=campaign, stage=0, gmass_campaign_id="555")
+    append_event(conn, type="sent", recipient=recipient, campaign=campaign, stage=0,
+                 message_id="<sent-555@gmail.com>")
     append_event(conn, type="reply", recipient=recipient, campaign=campaign)
     append_event(conn, type="reply_reviewed", recipient=recipient, campaign=campaign, meta={"tag": "real"})
 

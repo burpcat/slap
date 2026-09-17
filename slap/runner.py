@@ -40,10 +40,10 @@ from datetime import time as dt_time
 from datetime import timedelta
 from pathlib import Path
 
-from slap import doctor, gmass, stages
+from slap import doctor, smtp, stages
 from slap.latex import WORKDIR_ROOT, recipient_workdir
 from slap.queue import due_for_ooo_resend, due_for_remind, due_recipients, load_manifest
-from slap.tracking import append_event, latest_open_draft_id
+from slap.tracking import append_event
 
 
 class RunnerError(Exception):
@@ -234,35 +234,27 @@ def cap_headroom(conn, global_config, *, today: date = None) -> int:
     return max(0, global_config.schedule.daily_cap - used)
 
 
-def _send_one(conn, api_key: str, row: dict, *, workdir_root: Path = WORKDIR_ROOT,
-              create_draft_fn=gmass.create_draft, send_campaign_fn=gmass.send_campaign,
-              gmass_allowed_days: list = None, gmass_skip_holidays: bool = None) -> bool:
+def _send_one(conn, smtp_config, row: dict, *, workdir_root: Path = WORKDIR_ROOT,
+              send_message_fn=smtp.send_message, sender_name: str = None) -> bool:
     recipient, campaign = row["recipient"], row["campaign"]
     workdir = recipient_workdir(campaign, recipient, root=workdir_root)
 
     # Everything that reads/parses staged data (manifest JSON, its keys, the
-    # attachment bytes, the cadence-derived campaign_settings) is one
-    # exception boundary: a corrupted or partial staged.json — e.g. from a
-    # crash mid-write during a prior `send` — must degrade to send_failed for
-    # THIS recipient only, never propagate into drain()'s loop and abort
-    # every other recipient in the batch (one-recipient blast radius).
+    # attachment bytes) is one exception boundary: a corrupted or partial
+    # staged.json — e.g. from a crash mid-write during a prior `send` — must
+    # degrade to send_failed for THIS recipient only, never propagate into
+    # drain()'s loop and abort every other recipient in the batch
+    # (one-recipient blast radius).
     try:
         manifest = load_manifest(workdir)
         attachment_name = manifest["attachment_name"]
+        # cadence is read only to mark the sequence final when it's empty; the
+        # follow-up STAGES are no longer configured on this send (GMass fired
+        # them server-side from stageNDays; the app now fires them itself via
+        # slap.queue.due_for_followup / runner._send_followup). subject/body
+        # are read fresh at drain time, so `slap.py template-reload` still
+        # picks up a rewritten manifest with zero changes needed here.
         cadence = manifest["cadence"]
-        # cadence/stage_bodies/subject/body are ALL read fresh from
-        # staged.json right here, at drain time — never cached from an
-        # earlier point in this function's own lifetime. This is precisely
-        # what makes `slap.py template-reload` (post-launch, slap/reload.py)
-        # effective at all: if it overwrites a recipient's staged subject/
-        # body/stage_bodies BEFORE this drain runs, this read picks up the
-        # new content with zero changes needed here. It's also exactly why
-        # that feature refuses to touch a recipient with an OPEN draft (see
-        # slap.tracking.latest_open_draft_id) — this same manifest is read
-        # again on retry, but the actual DRAFT (created below) is NOT
-        # recreated on a retry, so only stage_bodies/cadence would pick up a
-        # local edit while the initial subject/body would not.
-        stage_bodies = manifest["stage_bodies"]
         subject = manifest["subject"]
         body = manifest["body"]
         # attachment_source (static/latex-disabled campaigns): the shared
@@ -272,76 +264,60 @@ def _send_one(conn, api_key: str, row: dict, *, workdir_root: Path = WORKDIR_ROO
         # before this field existed): read the per-recipient compiled PDF
         # already sitting in this recipient's own workdir, as before.
         # attachment_name is None (no sentinel file) for a no-attachment
-        # `send custom` (mode 4) — send with no attachment at all. Otherwise
-        # resolve bytes as before (attachment_source for static campaigns, or
-        # the per-recipient workdir file for latex).
+        # `send custom` (mode 4) — send with no attachment at all.
         if attachment_name is None:
             attachment_arg = None
         else:
             attachment_source = manifest.get("attachment_source")
             attachment_path = Path(attachment_source) if attachment_source else workdir / attachment_name
             attachment_arg = (attachment_name, attachment_path.read_bytes(), "application/pdf")
-        campaign_settings = gmass.build_campaign_settings(
-            cadence, stage_bodies, allowed_days=gmass_allowed_days, skip_holidays=gmass_skip_holidays,
-        )
     except Exception as e:
         append_event(conn, type="send_failed", recipient=recipient, campaign=campaign,
                      meta={"stage": "load_staged_data", "error": str(e)})
         return False
 
-    draft_id = latest_open_draft_id(conn, recipient)
-    if draft_id is None:
-        try:
-            draft = create_draft_fn(
-                api_key, recipient=recipient, subject=subject, message=body,
-                attachment=attachment_arg,
-            )
-        except Exception as e:
-            append_event(conn, type="send_failed", recipient=recipient, campaign=campaign,
-                         meta={"stage": "create_draft", "error": str(e)})
-            return False
-        draft_id = draft["draft_id"]
-        # Recorded the instant create_draft returns, BEFORE send_campaign is
-        # attempted (§3 idempotency) — a crash/failure past this point is
-        # retryable via latest_open_draft_id, never an orphan/double-create.
-        append_event(conn, type="draft_created", recipient=recipient, campaign=campaign,
-                     stage=0, gmass_draft_id=draft_id)
-
+    # One atomic SMTP send — no draft/campaign two-call, so no draft_created
+    # idempotency marker: the GMass draft-reuse dance is gone. A send that
+    # raises did so BEFORE the message reached Gmail (auth/connection/RCPT
+    # errors are all pre-transmission), so a send_failed is always safe to
+    # retry on the next drain — the recipient stays `queued` and due. The
+    # returned Message-ID is recorded on the `sent` event as the threading +
+    # reply-match key (see slap.smtp / slap.tracking).
     try:
-        sent = send_campaign_fn(api_key, draft_id, campaign_settings=campaign_settings)
+        sent = send_message_fn(
+            smtp_config, sender=smtp_config.user, sender_name=sender_name,
+            recipient=recipient, subject=subject, body=body, attachment=attachment_arg,
+        )
     except Exception as e:
         append_event(conn, type="send_failed", recipient=recipient, campaign=campaign,
-                     gmass_draft_id=draft_id, meta={"stage": "send_campaign", "error": str(e)})
+                     meta={"stage": "send_message", "error": str(e)})
         return False
 
     append_event(conn, type="sent", recipient=recipient, campaign=campaign, stage=0,
-                 gmass_campaign_id=sent["campaign_id"], gmass_draft_id=draft_id,
-                 meta={"is_final_stage": len(cadence) == 0})
+                 message_id=sent["message_id"], meta={"is_final_stage": len(cadence) == 0})
     return True
 
 
-def _send_ooo_resend(conn, api_key: str, row: dict, *, workdir_root: Path = WORKDIR_ROOT,
-                      create_draft_fn=gmass.create_draft, send_campaign_fn=gmass.send_campaign,
+def _send_ooo_resend(conn, smtp_config, row: dict, *, workdir_root: Path = WORKDIR_ROOT,
+                      send_message_fn=smtp.send_message, sender_name: str = None,
                       today: date = None) -> bool:
     """The OOO counterpart to _send_one (§7, step 10): resends the
     recipient's next stage as a reply threaded into their original
-    conversation. Reuses the stage body already sitting in the staged
-    manifest from the original send — no new drop/template data needed, and
-    no attachment (a threaded follow-up doesn't re-attach the résumé).
+    conversation (In-Reply-To the recipient's stored message_id). Reuses the
+    stage body already sitting in the staged manifest from the original send —
+    no new drop/template data needed, and no attachment (a threaded follow-up
+    doesn't re-attach the résumé).
 
-    Manual OOO-pause continuation (post-launch): GMass's native follow-up
-    timer for this recipient is BELIEVED suppressed from the moment they were
-    first marked OOO (account-wide unsubscribe — see slap.gmass.
-    unsubscribe_recipient's docstring for exactly what's verified vs. still
-    an unconfirmed assumption there) — SLAP proceeds as though nothing else
-    will ever fire their remaining stages regardless, so if the persona's
-    cadence still has one left after this send, THIS function schedules it:
-    records `next_resume_date` in this same `requeued` event's own meta (one
-    atomic write, no second event needed — see slap.queue.
-    due_for_ooo_resend/_pending_ooo_resume_date for how that's read back),
-    anchored to `today` (the date this stage actually fired) plus the
-    persona's own inter-stage gap for the next transition — a continuation
-    of the existing sequence, never a restart from stage 1.
+    Manual OOO-pause continuation (post-launch): under SMTP the app owns the
+    ENTIRE follow-up cadence itself (there is no external GMass timer to
+    suppress or race — that whole concern, and the account-wide unsubscribe
+    lever it needed, is gone), so if the cadence still has a stage left after
+    this send, THIS function schedules it: records `next_resume_date` in this
+    same `requeued` event's own meta (one atomic write, no second event needed
+    — see slap.queue.due_for_ooo_resend/_pending_ooo_resume_date for how that's
+    read back), anchored to `today` (the date this stage actually fired) plus
+    the persona's own inter-stage gap — a continuation of the existing
+    sequence, never a restart from stage 1.
 
     A cadence-exhausted recipient (no next stage at all) is a TERMINAL
     condition, not a transient one — retrying can never succeed, since a
@@ -376,33 +352,24 @@ def _send_ooo_resend(conn, api_key: str, row: dict, *, workdir_root: Path = WORK
 
     try:
         stage_body = stage_bodies[next_stage - 1]
-        reply_to_campaign_id = row["last_gmass_campaign_id"]
-        if not reply_to_campaign_id:
-            raise RunnerError("no prior gmass_campaign_id to reply into")
+        reply_to_message_id = row["message_id"]
+        if not reply_to_message_id:
+            raise RunnerError("no prior message_id to thread the OOO resend into")
         subject = f"Re: {manifest['subject']}"
-        reply_settings = gmass.build_reply_settings(reply_to_campaign_id)
     except Exception as e:
         append_event(conn, type="send_failed", recipient=recipient, campaign=campaign,
                      meta={"stage": "load_staged_data_ooo", "error": str(e)})
         return False
 
-    draft_id = latest_open_draft_id(conn, recipient)
-    if draft_id is None:
-        try:
-            draft = create_draft_fn(api_key, recipient=recipient, subject=subject, message=stage_body)
-        except Exception as e:
-            append_event(conn, type="send_failed", recipient=recipient, campaign=campaign,
-                         meta={"stage": "create_draft_ooo", "error": str(e)})
-            return False
-        draft_id = draft["draft_id"]
-        append_event(conn, type="draft_created", recipient=recipient, campaign=campaign,
-                     stage=next_stage, gmass_draft_id=draft_id)
-
     try:
-        sent = send_campaign_fn(api_key, draft_id, campaign_settings=reply_settings)
+        sent = send_message_fn(
+            smtp_config, sender=smtp_config.user, sender_name=sender_name,
+            recipient=recipient, subject=subject, body=stage_body,
+            in_reply_to=reply_to_message_id,
+        )
     except Exception as e:
         append_event(conn, type="send_failed", recipient=recipient, campaign=campaign,
-                     gmass_draft_id=draft_id, meta={"stage": "send_campaign_ooo", "error": str(e)})
+                     meta={"stage": "send_message_ooo", "error": str(e)})
         return False
 
     next_resume_date = None
@@ -410,13 +377,13 @@ def _send_ooo_resend(conn, api_key: str, row: dict, *, workdir_root: Path = WORK
         next_resume_date = (today or date.today()) + timedelta(days=cadence[next_stage])
 
     append_event(conn, type="requeued", recipient=recipient, campaign=campaign, stage=next_stage,
-                 gmass_campaign_id=sent["campaign_id"], gmass_draft_id=draft_id,
+                 message_id=sent["message_id"],
                  meta={"next_resume_date": next_resume_date.isoformat()} if next_resume_date else None)
     return True
 
 
-def _send_remind(conn, api_key: str, row: dict, *, workdir_root: Path = WORKDIR_ROOT,
-                 create_draft_fn=gmass.create_draft, send_campaign_fn=gmass.send_campaign) -> bool:
+def _send_remind(conn, smtp_config, row: dict, *, workdir_root: Path = WORKDIR_ROOT,
+                 send_message_fn=smtp.send_message, sender_name: str = None) -> bool:
     """Fire a one-shot Remind (Engagement/reach-out Remind action) as a reply
     threaded into the recipient's original conversation — the same app-initiated
     reply-in-thread shape as _send_ooo_resend, but using the externally-authored
@@ -425,57 +392,44 @@ def _send_remind(conn, api_key: str, row: dict, *, workdir_root: Path = WORKDIR_
     status (a Remind is a nudge, not a sequence transition). No attachment
     (a threaded follow-up doesn't re-attach the résumé, same as OOO).
 
-    Idempotent like every other send path: the draft is created and its id
-    recorded (draft_created) before send_campaign fires, so a send failure is
-    retried via latest_open_draft_id without orphaning/double-creating. The
-    completion marker is a `remind_sent` interaction carrying the sent draft id
-    in gmass_draft_id — which is exactly what closes this Remind's open draft in
-    latest_open_draft_id (see that function's own comment) so a later send never
-    reuses a stale Remind draft, and what removes this recipient from
-    due_for_remind() so the same Remind can never fire twice."""
+    One atomic SMTP send (no draft two-call): a send that raises did so before
+    the message reached Gmail, so it's safe to retry on the next drain. The
+    completion marker is a `remind_sent` interaction carrying the sent
+    Message-ID — which removes this recipient from due_for_remind() so the same
+    Remind can never fire twice."""
     recipient, campaign = row["recipient"], row["campaign"]
     try:
         body = row["body"]
-        reply_to_campaign_id = row.get("campaign_id_to_reply_to")
-        if not reply_to_campaign_id:
-            raise RunnerError("no prior gmass_campaign_id to reply into for remind")
+        reply_to_message_id = row.get("reply_to_message_id")
+        if not reply_to_message_id:
+            raise RunnerError("no prior message_id to thread the remind into")
         subject_ref = (row.get("subject_ref") or "").strip()
         subject = f"Re: {subject_ref}" if subject_ref else "Re: following up"
-        reply_settings = gmass.build_reply_settings(reply_to_campaign_id)
     except Exception as e:
         append_event(conn, type="send_failed", recipient=recipient, campaign=campaign,
                      meta={"stage": "load_remind_data", "error": str(e)})
         return False
 
-    draft_id = latest_open_draft_id(conn, recipient)
-    if draft_id is None:
-        try:
-            draft = create_draft_fn(api_key, recipient=recipient, subject=subject, message=body)
-        except Exception as e:
-            append_event(conn, type="send_failed", recipient=recipient, campaign=campaign,
-                         meta={"stage": "create_draft_remind", "error": str(e)})
-            return False
-        draft_id = draft["draft_id"]
-        append_event(conn, type="draft_created", recipient=recipient, campaign=campaign,
-                     gmass_draft_id=draft_id)
-
     try:
-        sent = send_campaign_fn(api_key, draft_id, campaign_settings=reply_settings)
+        sent = send_message_fn(
+            smtp_config, sender=smtp_config.user, sender_name=sender_name,
+            recipient=recipient, subject=subject, body=body,
+            in_reply_to=reply_to_message_id,
+        )
     except Exception as e:
         append_event(conn, type="send_failed", recipient=recipient, campaign=campaign,
-                     gmass_draft_id=draft_id, meta={"stage": "send_campaign_remind", "error": str(e)})
+                     meta={"stage": "send_message_remind", "error": str(e)})
         return False
 
     append_event(conn, type="interaction", recipient=recipient, campaign=campaign,
-                 gmass_draft_id=draft_id, gmass_campaign_id=sent["campaign_id"],
+                 message_id=sent["message_id"],
                  meta={"channel": "remind_sent", "followup": row.get("followup")})
     return True
 
 
-def drain(conn, global_config, api_key: str, *, now: date = None, sleep_fn=time.sleep,
+def drain(conn, global_config, smtp_config, *, now: date = None, sleep_fn=time.sleep,
           random_fn=random.uniform, workdir_root: Path = WORKDIR_ROOT,
-          create_draft_fn=gmass.create_draft, send_campaign_fn=gmass.send_campaign,
-          log_fn=print) -> DrainResult:
+          send_message_fn=smtp.send_message, log_fn=print) -> DrainResult:
     """Drain whatever's queued and due, right now — no window waiting (that's
     wait_for_fire_window's job). Cap-aware, resilient: a preflight failure
     retries then gives up loud (run_failed, queue untouched); a per-email
@@ -539,21 +493,17 @@ def drain(conn, global_config, api_key: str, *, now: date = None, sleep_fn=time.
     for i, (row, send_fn) in enumerate(to_send):
         if i > 0:
             sleep_fn(random_fn(global_config.schedule.send_delay_min, global_config.schedule.send_delay_max))
-        kwargs = {"workdir_root": workdir_root, "create_draft_fn": create_draft_fn,
-                  "send_campaign_fn": send_campaign_fn}
+        kwargs = {"workdir_root": workdir_root, "send_message_fn": send_message_fn,
+                  "sender_name": global_config.from_name}
         if send_fn is _send_ooo_resend:
             kwargs["today"] = today
-        elif send_fn is _send_one:
-            # Not threaded through to _send_ooo_resend/_send_remind: a threaded
-            # reply has no stage cadence of its own to restrict
-            # (build_reply_settings() never sets stageNDays at all) — the day
-            # restriction only means anything where there's a follow-up
-            # sequence for it to apply to.
-            kwargs["gmass_allowed_days"] = global_config.gmass_allowed_days
-            kwargs["gmass_skip_holidays"] = global_config.gmass_skip_holidays
-        # _send_remind takes no extra kwargs (single one-shot reply-in-thread).
+        # _send_one/_send_remind take no extra kwargs beyond the common ones.
+        # (The old gmass_allowed_days/skip_holidays that configured GMass's
+        # server-side follow-up firing are gone — the app now owns follow-up
+        # scheduling itself in slap.queue.due_for_followup, which is where any
+        # send-window restriction now belongs.)
         try:
-            ok = send_fn(conn, api_key, row, **kwargs)
+            ok = send_fn(conn, smtp_config, row, **kwargs)
         except Exception as e:
             # Defense in depth: _send_one/_send_ooo_resend already convert
             # their own known failure modes to send_failed, but no bug in

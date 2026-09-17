@@ -6,9 +6,11 @@ from pathlib import Path
 
 from slap.queue import stage_recipient
 from slap.runner import _send_one
+from slap.smtp import SmtpConfig
 from slap.tracking import connect
 
 SLAP_PY = Path(__file__).resolve().parent.parent / "slap.py"
+SMTP = SmtpConfig(host="smtp.gmail.com", port=587, user="owner@gmail.com", password="pw")
 
 
 # --- the net-new no-attachment send path (mode 4) ---------------------------
@@ -24,16 +26,14 @@ def test_no_attachment_send_omits_the_attachment(tmp_path):
     )
     captured = {}
 
-    def fake_create_draft(api_key, *, recipient, subject, message, attachment=None):
+    def fake_send_message(smtp_config, *, sender, recipient, subject, body,
+                          sender_name=None, attachment=None, in_reply_to=None, references=None):
         captured["attachment"] = attachment
-        return {"draft_id": "d1"}
-
-    def fake_send_campaign(api_key, draft_id, *, campaign_settings):
-        return {"campaign_id": "c1"}
+        return {"message_id": "<m1@gmail.com>", "raw": {}}
 
     ok = _send_one(
-        conn, "key", {"recipient": "a@x.com", "campaign": "__custom__"},
-        workdir_root=workdir_root, create_draft_fn=fake_create_draft, send_campaign_fn=fake_send_campaign,
+        conn, SMTP, {"recipient": "a@x.com", "campaign": "__custom__"},
+        workdir_root=workdir_root, send_message_fn=fake_send_message,
     )
     assert ok is True
     assert captured["attachment"] is None  # no attachment sent

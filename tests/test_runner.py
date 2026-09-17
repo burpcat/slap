@@ -1,8 +1,9 @@
 """Runner tests (Build Order step 9), per SLAP_BUILD_PROMPT.md §13 B:
 runner drains; random fire-time lands in the window; 10-15s gap enforced;
 cap-aware leaves overflow queued; --now flushes; drain resilience (preflight
-failure -> retries -> run_failed, queue intact); idempotency (draft ID
-recorded before send, retry-after-draft doesn't double-create).
+failure -> retries -> run_failed, queue intact); idempotency (a failed SMTP
+send never partially transmits, so a retry after send_failed sends exactly
+once, never double-sends).
 """
 import json
 import os
@@ -17,7 +18,10 @@ from slap.runner import (
     wait_for_fire_window,
     _roll_fire_time,
 )
-from slap.tracking import append_event, connect, latest_open_draft_id
+from slap.smtp import SmtpConfig
+from slap.tracking import append_event, connect
+
+SMTP = SmtpConfig(host="smtp.gmail.com", port=587, user="owner@gmail.com", password="pw")
 
 
 def make_global_config(tmp_path, *, daily_cap=500, drain_retries=3, send_delay_min=10,
@@ -57,39 +61,37 @@ def stage_one(conn, tmp_path, recipient="jane@acme.com", persona="recruiter", ca
     )
 
 
-def fake_gmass(draft_id="r-fake", campaign_id=999, create_fails=False, send_fails=False):
-    calls = {"create": 0, "send": 0, "last_campaign_settings": None}
+def fake_smtp(message_id="<m-fake@gmail.com>", fails=False):
+    calls = {"send": 0, "last": None}
 
-    def create_draft_fn(api_key, *, recipient, subject, message, attachment=None):
-        calls["create"] += 1
-        if create_fails:
-            raise RuntimeError("simulated create_draft failure")
-        return {"draft_id": draft_id, "raw": {}}
-
-    def send_campaign_fn(api_key, draft_id_arg, *, campaign_settings):
+    def send_message_fn(smtp_config, *, sender, recipient, subject, body, sender_name=None,
+                        attachment=None, in_reply_to=None, references=None):
         calls["send"] += 1
-        calls["last_campaign_settings"] = campaign_settings
-        if send_fails:
-            raise RuntimeError("simulated send_campaign failure")
-        return {"campaign_id": campaign_id, "raw": {}}
+        calls["last"] = {"sender": sender, "sender_name": sender_name, "recipient": recipient,
+                         "subject": subject, "body": body, "attachment": attachment,
+                         "in_reply_to": in_reply_to, "references": references}
+        if fails:
+            raise RuntimeError("simulated smtp send failure")
+        return {"message_id": message_id, "raw": {}}
 
-    return create_draft_fn, send_campaign_fn, calls
+    return send_message_fn, calls
 
 
 def send_reply_and_tag_ooo(conn, tmp_path, recipient="jane@acme.com", cadence=None, resume_date=None):
     """Sets up the precondition for an OOO resend test: stage -> real drain
-    (so first_sent_at/last_gmass_campaign_id are genuinely populated, not
-    hand-inserted) -> reply -> tag_ooo. resume_date defaults to today (due
-    immediately), matching this helper's pre-date-gating behavior. Returns
-    the sent campaign_id."""
+    (so first_sent_at/message_id are genuinely populated, not hand-inserted)
+    -> reply -> tag_ooo. resume_date defaults to today (due immediately),
+    matching this helper's pre-date-gating behavior. Returns the initial
+    send's message_id so callers can assert OOO resend threading against it."""
     stage_one(conn, tmp_path, recipient=recipient, cadence=cadence)
-    create_fn, send_fn, _ = fake_gmass(campaign_id=555)
+    initial_message_id = "<initial-555@gmail.com>"
+    send_fn, _ = fake_smtp(message_id=initial_message_id)
     gc = make_global_config(tmp_path)
-    drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-          create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+          send_message_fn=send_fn)
     append_event(conn, type="reply", recipient=recipient, campaign="c")
     tag_ooo(conn, recipient, resume_date or date.today())
-    return 555
+    return initial_message_id
 
 
 @pytest.fixture
@@ -107,13 +109,13 @@ def api_key_env(monkeypatch):
 def test_drain_sends_a_staged_recipient(conn, tmp_path):
     gc = make_global_config(tmp_path)
     stage_one(conn, tmp_path)
-    create_fn, send_fn, calls = fake_gmass()
+    send_fn, calls = fake_smtp()
 
-    result = drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-                    create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    result = drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+                    send_message_fn=send_fn)
 
     assert result == DrainResult(ran=True, sent=1, failed=0, remaining_queued=0, preflight_error=None)
-    assert calls["create"] == 1 and calls["send"] == 1
+    assert calls["send"] == 1
     assert due_recipients(conn) == []
 
 
@@ -125,11 +127,11 @@ def test_drain_calls_log_fn_once_per_send_attempt(conn, tmp_path):
     gc = make_global_config(tmp_path)
     stage_one(conn, tmp_path, recipient="bob@acme.com")
     stage_one(conn, tmp_path, recipient="jane@acme.com")
-    create_fn, send_fn, calls = fake_gmass()
+    send_fn, calls = fake_smtp()
     logs = []
 
-    result = drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-                    create_draft_fn=create_fn, send_campaign_fn=send_fn, log_fn=logs.append)
+    result = drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+                    send_message_fn=send_fn, log_fn=logs.append)
 
     assert result.sent == 2
     assert len(logs) == 2  # one line per attempted send, not per API call
@@ -141,11 +143,11 @@ def test_drain_calls_log_fn_once_per_send_attempt(conn, tmp_path):
 def test_drain_log_fn_reports_failed_sends_too(conn, tmp_path):
     gc = make_global_config(tmp_path)
     stage_one(conn, tmp_path, recipient="jane@acme.com")
-    create_fn, send_fn, calls = fake_gmass(create_fails=True)
+    send_fn, calls = fake_smtp(fails=True)
     logs = []
 
-    drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-          create_draft_fn=create_fn, send_campaign_fn=send_fn, log_fn=logs.append)
+    drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+          send_message_fn=send_fn, log_fn=logs.append)
 
     assert logs == ["[1/1] jane@acme.com (c) -> FAILED"]
 
@@ -154,53 +156,15 @@ def test_drain_default_log_fn_is_print(conn, tmp_path, capsys):
     # No log_fn given -> real output via the builtin print, not silence.
     gc = make_global_config(tmp_path)
     stage_one(conn, tmp_path)
-    create_fn, send_fn, calls = fake_gmass()
+    send_fn, calls = fake_smtp()
 
-    drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-          create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+          send_message_fn=send_fn)
 
     assert "jane@acme.com (c) -> sent" in capsys.readouterr().out
 
 
-# --- gmass_allowed_days / gmass_skip_holidays (Investigation 1) ------------
-
-def test_drain_initial_send_threads_gmass_allowed_days_and_skip_holidays_through(conn, tmp_path):
-    gc = make_global_config(tmp_path, gmass_allowed_days=["mon", "wed", "fri"], gmass_skip_holidays=True)
-    stage_one(conn, tmp_path)
-    create_fn, send_fn, calls = fake_gmass()
-
-    drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-          create_draft_fn=create_fn, send_campaign_fn=send_fn)
-
-    assert calls["last_campaign_settings"]["allowedDays"] == "Monday,Wednesday,Friday"
-    assert calls["last_campaign_settings"]["skipHolidays"] is True
-
-
-def test_drain_initial_send_threads_explicit_skip_holidays_false_through(conn, tmp_path):
-    # Tri-state end-to-end: an owner explicitly opting OUT of GMass's own
-    # skip-holidays-by-default server behavior must see that False actually
-    # sent, not silently dropped the way "unset" is.
-    gc = make_global_config(tmp_path, gmass_skip_holidays=False)
-    stage_one(conn, tmp_path)
-    create_fn, send_fn, calls = fake_gmass()
-
-    drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-          create_draft_fn=create_fn, send_campaign_fn=send_fn)
-
-    assert calls["last_campaign_settings"]["skipHolidays"] is False
-
-
-def test_drain_initial_send_omits_fields_when_gmass_config_unset(conn, tmp_path):
-    gc = make_global_config(tmp_path)  # gmass_allowed_days=None, gmass_skip_holidays=None (defaults)
-    stage_one(conn, tmp_path)
-    create_fn, send_fn, calls = fake_gmass()
-
-    drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-          create_draft_fn=create_fn, send_campaign_fn=send_fn)
-
-    assert "allowedDays" not in calls["last_campaign_settings"]
-    assert "skipHolidays" not in calls["last_campaign_settings"]
-
+# --- static campaign attachments ---------------------------------------
 
 def test_drain_static_campaign_attaches_from_shared_source_not_a_workdir_copy(conn, tmp_path):
     # Static (latex_enabled=False) campaigns never get a per-recipient PDF
@@ -213,15 +177,13 @@ def test_drain_static_campaign_attaches_from_shared_source_not_a_workdir_copy(co
 
     captured = {}
 
-    def create_fn(api_key, *, recipient, subject, message, attachment=None):
+    def send_fn(smtp_config, *, sender, recipient, subject, body, sender_name=None,
+                attachment=None, in_reply_to=None, references=None):
         captured["attachment"] = attachment
-        return {"draft_id": "d1", "raw": {}}
+        return {"message_id": "<m1@gmail.com>", "raw": {}}
 
-    def send_fn(api_key, draft_id_arg, *, campaign_settings):
-        return {"campaign_id": 42, "raw": {}}
-
-    result = drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-                    create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    result = drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+                    send_message_fn=send_fn)
 
     assert result.sent == 1
     name, data, ctype = captured["attachment"]
@@ -244,12 +206,12 @@ def test_drain_falls_back_to_workdir_copy_when_attachment_source_is_absent(conn,
     del manifest["attachment_source"]  # simulate a pre-existing, older manifest
     manifest_path.write_text(json.dumps(manifest))
 
-    create_fn, send_fn, calls = fake_gmass()
-    result = drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-                    create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    send_fn, calls = fake_smtp()
+    result = drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+                    send_message_fn=send_fn)
 
     assert result.sent == 1
-    assert calls["create"] == 1 and calls["send"] == 1
+    assert calls["send"] == 1
 
 
 def test_drain_static_campaign_missing_shared_source_fails_only_that_recipient(conn, tmp_path):
@@ -263,9 +225,9 @@ def test_drain_static_campaign_missing_shared_source_fails_only_that_recipient(c
     stage_one(conn, tmp_path, recipient="fine@acme.com", latex_enabled=True)
     shared_resume.unlink()  # the shared source vanishes before drain
 
-    create_fn, send_fn, calls = fake_gmass()
-    result = drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-                    create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    send_fn, calls = fake_smtp()
+    result = drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+                    send_message_fn=send_fn)
 
     assert result.sent == 1
     assert result.failed == 1
@@ -296,29 +258,29 @@ def test_drain_sends_a_recipient_already_contacted_in_an_earlier_campaign(conn, 
                  gmass_campaign_id="111")
 
     stage_one(conn, tmp_path, recipient=recipient)  # re-staged for a new campaign ("c")
-    create_fn, send_fn, calls = fake_gmass()
+    send_fn, calls = fake_smtp()
 
-    result = drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-                    create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    result = drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+                    send_message_fn=send_fn)
 
     assert result == DrainResult(ran=True, sent=1, failed=0, remaining_queued=0, preflight_error=None)
-    assert calls["create"] == 1 and calls["send"] == 1
+    assert calls["send"] == 1
 
 
 def test_drain_writes_run_started_and_run_completed(conn, tmp_path):
     gc = make_global_config(tmp_path)
     stage_one(conn, tmp_path)
-    create_fn, send_fn, _ = fake_gmass()
-    drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-          create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    send_fn, _ = fake_smtp()
+    drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+          send_message_fn=send_fn)
 
     types = [dict(r)["type"] for r in conn.execute("SELECT type FROM events ORDER BY id")]
-    assert types == ["queued", "run_started", "draft_created", "sent", "run_completed"]
+    assert types == ["queued", "run_started", "sent", "run_completed"]
 
 
 def test_drain_no_due_recipients_still_completes(conn, tmp_path):
     gc = make_global_config(tmp_path)
-    result = drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir")
+    result = drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir")
     assert result.ran is True
     assert result.sent == 0
 
@@ -328,10 +290,10 @@ def test_drain_no_due_recipients_still_completes(conn, tmp_path):
 def test_per_email_failure_writes_send_failed_and_stays_queued(conn, tmp_path):
     gc = make_global_config(tmp_path)
     stage_one(conn, tmp_path)
-    create_fn, send_fn, _ = fake_gmass(send_fails=True)
+    send_fn, _ = fake_smtp(fails=True)
 
-    result = drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-                    create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    result = drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+                    send_message_fn=send_fn)
 
     assert result.sent == 0
     assert result.failed == 1
@@ -346,16 +308,14 @@ def test_per_email_failure_does_not_abort_the_whole_drain(conn, tmp_path):
     stage_one(conn, tmp_path, recipient="fails@acme.com")
     stage_one(conn, tmp_path, recipient="succeeds@acme.com")
 
-    def create_draft_fn(api_key, *, recipient, subject, message, attachment=None):
+    def send_fn(smtp_config, *, sender, recipient, subject, body, sender_name=None,
+                attachment=None, in_reply_to=None, references=None):
         if recipient == "fails@acme.com":
             raise RuntimeError("boom")
-        return {"draft_id": "r-1", "raw": {}}
+        return {"message_id": "<m1@gmail.com>", "raw": {}}
 
-    def send_campaign_fn(api_key, draft_id, *, campaign_settings):
-        return {"campaign_id": 1, "raw": {}}
-
-    result = drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-                    create_draft_fn=create_draft_fn, send_campaign_fn=send_campaign_fn)
+    result = drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+                    send_message_fn=send_fn)
     assert result.sent == 1
     assert result.failed == 1
 
@@ -369,13 +329,13 @@ def test_corrupt_manifest_json_does_not_abort_the_whole_drain(conn, tmp_path):
     (tmp_path / "workdir" / "c" / "corrupt@acme.com" / "staged.json").write_text("{not valid json")
 
     gc = make_global_config(tmp_path)
-    create_fn, send_fn, calls = fake_gmass()
-    result = drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-                    create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    send_fn, calls = fake_smtp()
+    result = drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+                    send_message_fn=send_fn)
 
     assert result.sent == 1
     assert result.failed == 1
-    assert calls["create"] == 1  # only for the fine recipient
+    assert calls["send"] == 1  # only for the fine recipient
     # The corrupt recipient stays queued for a human to fix, not lost.
     assert "corrupt@acme.com" in {r["recipient"] for r in due_recipients(conn)}
 
@@ -384,35 +344,14 @@ def test_manifest_missing_key_does_not_abort_the_whole_drain(conn, tmp_path):
     stage_one(conn, tmp_path, recipient="missingkey@acme.com")
     stage_one(conn, tmp_path, recipient="fine@acme.com")
     manifest_path = tmp_path / "workdir" / "c" / "missingkey@acme.com" / "staged.json"
-    import json
     manifest = json.loads(manifest_path.read_text())
-    del manifest["stage_bodies"]
+    del manifest["subject"]  # a key _send_one actually reads (stage_bodies no longer is)
     manifest_path.write_text(json.dumps(manifest))
 
     gc = make_global_config(tmp_path)
-    create_fn, send_fn, _ = fake_gmass()
-    result = drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-                    create_draft_fn=create_fn, send_campaign_fn=send_fn)
-
-    assert result.sent == 1
-    assert result.failed == 1
-
-
-def test_mismatched_cadence_and_stage_bodies_does_not_abort_the_whole_drain(conn, tmp_path):
-    # gmass.build_campaign_settings raises GMassError on a length mismatch —
-    # confirm that's caught too, not just load_manifest's own exceptions.
-    stage_one(conn, tmp_path, recipient="mismatched@acme.com")
-    stage_one(conn, tmp_path, recipient="fine@acme.com")
-    manifest_path = tmp_path / "workdir" / "c" / "mismatched@acme.com" / "staged.json"
-    import json
-    manifest = json.loads(manifest_path.read_text())
-    manifest["stage_bodies"] = manifest["stage_bodies"][:1]  # cadence has 3, bodies now has 1
-    manifest_path.write_text(json.dumps(manifest))
-
-    gc = make_global_config(tmp_path)
-    create_fn, send_fn, _ = fake_gmass()
-    result = drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-                    create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    send_fn, _ = fake_smtp()
+    result = drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+                    send_message_fn=send_fn)
 
     assert result.sent == 1
     assert result.failed == 1
@@ -424,9 +363,9 @@ def test_missing_attachment_file_does_not_abort_the_whole_drain(conn, tmp_path):
     (tmp_path / "workdir" / "c" / "noattachment@acme.com" / "r.pdf").unlink()
 
     gc = make_global_config(tmp_path)
-    create_fn, send_fn, _ = fake_gmass()
-    result = drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-                    create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    send_fn, _ = fake_smtp()
+    result = drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+                    send_message_fn=send_fn)
 
     assert result.sent == 1
     assert result.failed == 1
@@ -445,18 +384,18 @@ def test_loop_level_safety_net_survives_a_bug_inside_send_one(conn, tmp_path, mo
     real_send_one = runner_module._send_one
     calls = []
 
-    def flaky_send_one(conn_arg, api_key, row, **kwargs):
+    def flaky_send_one(conn_arg, smtp_config, row, **kwargs):
         calls.append(row["recipient"])
         if row["recipient"] == "a@acme.com":
             raise RuntimeError("simulated bug escaping _send_one's own handlers")
-        return real_send_one(conn_arg, api_key, row, **kwargs)
+        return real_send_one(conn_arg, smtp_config, row, **kwargs)
 
     monkeypatch.setattr(runner_module, "_send_one", flaky_send_one)
     gc = make_global_config(tmp_path)
-    create_fn, send_fn, _ = fake_gmass()
+    send_fn, _ = fake_smtp()
 
-    result = drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-                    create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    result = drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+                    send_message_fn=send_fn)
 
     assert calls == ["a@acme.com", "b@acme.com"]  # loop continued past the bug
     assert result.sent == 1
@@ -465,37 +404,28 @@ def test_loop_level_safety_net_survives_a_bug_inside_send_one(conn, tmp_path, mo
     assert types[-1] == "run_completed"  # drain still finished cleanly
 
 
-# --- idempotency: draft recorded before send, retry doesn't double-create --
+# --- idempotency: retry after a failed send never double-sends ------------
 
-def test_draft_created_recorded_before_send_campaign_is_even_called(conn, tmp_path):
+def test_retry_after_send_failure_sends_exactly_once(conn, tmp_path):
     gc = make_global_config(tmp_path)
     stage_one(conn, tmp_path)
-    create_fn, send_fn, _ = fake_gmass(send_fails=True)  # succeeds at create, fails at send
-
-    drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-          create_draft_fn=create_fn, send_campaign_fn=send_fn)
-
-    # The draft_id must be recorded even though send_campaign failed after it.
-    assert latest_open_draft_id(conn, "jane@acme.com") == "r-fake"
-
-
-def test_retry_after_draft_created_does_not_double_create(conn, tmp_path):
-    gc = make_global_config(tmp_path)
-    stage_one(conn, tmp_path)
-    create_fn, send_fn, calls = fake_gmass(send_fails=True)
-    drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-          create_draft_fn=create_fn, send_campaign_fn=send_fn)
-    assert calls["create"] == 1
+    send_fn, calls = fake_smtp(fails=True)
+    drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+          send_message_fn=send_fn)
+    assert calls["send"] == 1
 
     # Second drain attempt (e.g. tomorrow, or a manual --now retry): the
     # recipient is still due (send_failed doesn't remove it from the queue).
-    create_fn2, send_fn2, calls2 = fake_gmass()  # this time send succeeds
-    result = drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-                    create_draft_fn=create_fn2, send_campaign_fn=send_fn2)
+    send_fn2, calls2 = fake_smtp()  # this time send succeeds
+    result = drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+                    send_message_fn=send_fn2)
 
     assert result.sent == 1
-    assert calls2["create"] == 0  # reused the existing open draft, never re-created
     assert calls2["send"] == 1
+    event_types = [dict(r)["type"] for r in conn.execute("SELECT type FROM events ORDER BY id")]
+    assert event_types.count("sent") == 1  # never double-sent by the retry
+    row = conn.execute("SELECT status FROM recipients WHERE recipient = ?", ("jane@acme.com",)).fetchone()
+    assert row["status"] in ("active", "done")
 
 
 # --- cap-aware headroom ------------------------------------------------
@@ -575,14 +505,14 @@ def test_drain_leaves_overflow_queued_beyond_cap(conn, tmp_path):
     gc = make_global_config(tmp_path, daily_cap=1)
     stage_one(conn, tmp_path, recipient="a@acme.com")
     stage_one(conn, tmp_path, recipient="b@acme.com")
-    create_fn, send_fn, calls = fake_gmass()
+    send_fn, calls = fake_smtp()
 
-    result = drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-                    create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    result = drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+                    send_message_fn=send_fn)
 
     assert result.sent == 1
     assert result.remaining_queued == 1  # the other one waits for tomorrow
-    assert calls["create"] == 1
+    assert calls["send"] == 1
 
 
 # --- 10-15s random gap between sends ----------------------------------
@@ -591,11 +521,11 @@ def test_gap_delay_applied_between_sends_not_before_the_first(conn, tmp_path):
     gc = make_global_config(tmp_path, send_delay_min=10, send_delay_max=15)
     stage_one(conn, tmp_path, recipient="a@acme.com")
     stage_one(conn, tmp_path, recipient="b@acme.com")
-    create_fn, send_fn, _ = fake_gmass()
+    send_fn, _ = fake_smtp()
 
     sleeps = []
-    drain(conn, gc, "fake-key", sleep_fn=lambda s: sleeps.append(s), workdir_root=tmp_path / "workdir",
-          create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    drain(conn, gc, SMTP, sleep_fn=lambda s: sleeps.append(s), workdir_root=tmp_path / "workdir",
+          send_message_fn=send_fn)
 
     assert len(sleeps) == 1  # 2 recipients -> exactly 1 gap
     assert 10 <= sleeps[0] <= 15
@@ -604,10 +534,10 @@ def test_gap_delay_applied_between_sends_not_before_the_first(conn, tmp_path):
 def test_no_gap_delay_for_a_single_send(conn, tmp_path):
     gc = make_global_config(tmp_path)
     stage_one(conn, tmp_path)
-    create_fn, send_fn, _ = fake_gmass()
+    send_fn, _ = fake_smtp()
     sleeps = []
-    drain(conn, gc, "fake-key", sleep_fn=lambda s: sleeps.append(s), workdir_root=tmp_path / "workdir",
-          create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    drain(conn, gc, SMTP, sleep_fn=lambda s: sleeps.append(s), workdir_root=tmp_path / "workdir",
+          send_message_fn=send_fn)
     assert sleeps == []
 
 
@@ -619,7 +549,7 @@ def test_preflight_failure_retries_then_writes_run_failed(conn, tmp_path, monkey
     stage_one(conn, tmp_path)
 
     sleeps = []
-    result = drain(conn, gc, "", sleep_fn=lambda s: sleeps.append(s), workdir_root=tmp_path / "workdir")
+    result = drain(conn, gc, SMTP, sleep_fn=lambda s: sleeps.append(s), workdir_root=tmp_path / "workdir")
 
     assert result.ran is False
     assert result.preflight_error is not None
@@ -632,7 +562,7 @@ def test_preflight_failure_leaves_queue_completely_intact(conn, tmp_path, monkey
     monkeypatch.delenv("GMASS_API_KEY", raising=False)
     gc = make_global_config(tmp_path, drain_retries=1)
     stage_one(conn, tmp_path)
-    drain(conn, gc, "", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir")
+    drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir")
     assert len(due_recipients(conn)) == 1
 
 
@@ -652,9 +582,9 @@ def test_preflight_recovers_within_retries_and_drain_proceeds(conn, tmp_path, mo
         if attempts["n"] == 1:
             os.environ["GMASS_API_KEY"] = "fake-key"
 
-    create_fn, send_fn, _ = fake_gmass()
-    result = drain(conn, gc, "fake-key", sleep_fn=flaky_sleep, workdir_root=tmp_path / "workdir",
-                    create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    send_fn, _ = fake_smtp()
+    result = drain(conn, gc, SMTP, sleep_fn=flaky_sleep, workdir_root=tmp_path / "workdir",
+                    send_message_fn=send_fn)
     assert result.ran is True
     assert result.sent == 1
 
@@ -669,7 +599,7 @@ def test_preflight_survives_an_unexpected_exception_and_writes_run_failed(conn, 
     gc.consumer_domains_file = str(tmp_path / "missing_dir" / "consumer_domains.txt")
     stage_one(conn, tmp_path)
 
-    result = drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir")
+    result = drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir")
 
     assert result.ran is False
     assert "unexpected preflight error" in result.preflight_error
@@ -856,10 +786,10 @@ def test_drain_processes_ooo_resend_via_combined_due_list(conn, tmp_path):
     reply_to_id = send_reply_and_tag_ooo(conn, tmp_path)
     assert due_for_ooo_resend(conn) != []
 
-    create_fn, send_fn, calls = fake_gmass(draft_id="r-resend", campaign_id=777)
+    send_fn, calls = fake_smtp(message_id="<resend-777@gmail.com>")
     gc = make_global_config(tmp_path)
-    result = drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-                    create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    result = drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+                    send_message_fn=send_fn)
 
     assert result.sent == 1
     assert due_for_ooo_resend(conn) == []  # resolved, no longer due
@@ -867,79 +797,54 @@ def test_drain_processes_ooo_resend_via_combined_due_list(conn, tmp_path):
     # they're naturally excluded by this per-recipient filter.
     types = [dict(r)["type"] for r in conn.execute(
         "SELECT type FROM events WHERE recipient = 'jane@acme.com' ORDER BY id")]
-    assert types == ["queued", "draft_created", "sent", "reply", "ooo_tagged", "draft_created", "requeued"]
+    assert types == ["queued", "sent", "reply", "ooo_tagged", "requeued"]
 
 
 def test_ooo_resend_reuses_staged_stage_body_and_replies_to_original_campaign(conn, tmp_path):
     reply_to_id = send_reply_and_tag_ooo(conn, tmp_path)
 
-    captured = {}
-
-    def create_draft_fn(api_key, *, recipient, subject, message, attachment=None):
-        captured["message"] = message
-        captured["subject"] = subject
-        captured["attachment"] = attachment
-        return {"draft_id": "r-resend", "raw": {}}
-
-    def send_campaign_fn(api_key, draft_id, *, campaign_settings):
-        captured["campaign_settings"] = campaign_settings
-        return {"campaign_id": 777, "raw": {}}
-
+    send_fn, calls = fake_smtp(message_id="<resend-777@gmail.com>")
     gc = make_global_config(tmp_path)
-    drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-          create_draft_fn=create_draft_fn, send_campaign_fn=send_campaign_fn)
+    drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+          send_message_fn=send_fn)
 
     manifest = load_manifest(tmp_path / "workdir" / "c" / "jane@acme.com")
-    assert captured["message"] == manifest["stage_bodies"][0]  # next stage (1) = index 0
-    assert captured["attachment"] is None  # no re-attaching the résumé on a threaded reply
-    assert captured["campaign_settings"]["sendAsReply"] is True
-    assert captured["campaign_settings"]["campaignIdToReplyTo"] == reply_to_id
-
-
-def test_ooo_resend_never_receives_gmass_allowed_days_or_skip_holidays(conn, tmp_path):
-    # An OOO resend has no stage cadence of its own to restrict —
-    # build_reply_settings() never sets stageNDays at all — so the day
-    # restriction must never be threaded through to it, even when the
-    # owner's config sets it for initial sends.
-    send_reply_and_tag_ooo(conn, tmp_path)
-    create_fn, send_fn, calls = fake_gmass(draft_id="r-resend", campaign_id=777)
-    gc = make_global_config(tmp_path, gmass_allowed_days=["mon", "wed", "fri"], gmass_skip_holidays=True)
-
-    drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-          create_draft_fn=create_fn, send_campaign_fn=send_fn)
-
-    assert "allowedDays" not in calls["last_campaign_settings"]
-    assert "skipHolidays" not in calls["last_campaign_settings"]
+    assert calls["last"]["body"] == manifest["stage_bodies"][0]  # next stage (1) = index 0
+    assert calls["last"]["attachment"] is None  # no re-attaching the résumé on a threaded reply
+    assert calls["last"]["in_reply_to"] == reply_to_id
+    assert calls["last"]["subject"] == f"Re: {manifest['subject']}"
 
 
 def test_ooo_resend_advances_current_stage_and_status(conn, tmp_path):
     send_reply_and_tag_ooo(conn, tmp_path)
-    create_fn, send_fn, _ = fake_gmass(campaign_id=777)
+    send_fn, _ = fake_smtp(message_id="<resend-777@gmail.com>")
     gc = make_global_config(tmp_path)
-    drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-          create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+          send_message_fn=send_fn)
 
     row = conn.execute("SELECT * FROM recipients WHERE recipient = ?", ("jane@acme.com",)).fetchone()
     assert row["status"] == "active"
     assert row["current_stage"] == 1
-    assert row["last_gmass_campaign_id"] == "777"
+    assert row["message_id"] == "<resend-777@gmail.com>"
 
 
-def test_ooo_resend_retry_reuses_open_draft_no_double_create(conn, tmp_path):
+def test_ooo_resend_retry_after_send_failure_sends_exactly_once(conn, tmp_path):
     send_reply_and_tag_ooo(conn, tmp_path)
-    create_fn, send_fn, calls = fake_gmass(draft_id="r-resend", send_fails=True)
+    send_fn, calls = fake_smtp(fails=True)
     gc = make_global_config(tmp_path)
-    drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-          create_draft_fn=create_fn, send_campaign_fn=send_fn)
-    assert calls["create"] == 1
+    drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+          send_message_fn=send_fn)
+    assert calls["send"] == 1
     assert due_for_ooo_resend(conn) != []  # still due — resend failed
 
-    create_fn2, send_fn2, calls2 = fake_gmass(campaign_id=777)  # this time it succeeds
-    result = drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-                    create_draft_fn=create_fn2, send_campaign_fn=send_fn2)
+    send_fn2, calls2 = fake_smtp(message_id="<resend-777@gmail.com>")  # this time it succeeds
+    result = drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+                    send_message_fn=send_fn2)
     assert result.sent == 1
-    assert calls2["create"] == 0  # reused the existing open draft
     assert calls2["send"] == 1
+    requeued_events = [dict(r) for r in conn.execute(
+        "SELECT * FROM events WHERE recipient = 'jane@acme.com' AND type = 'requeued'")]
+    assert len(requeued_events) == 1  # never double-recorded by the retry
 
 
 def test_ooo_resend_exhausted_cadence_does_not_crash_drain(conn, tmp_path):
@@ -951,19 +856,19 @@ def test_ooo_resend_exhausted_cadence_does_not_crash_drain(conn, tmp_path):
     # prior OOO resend cycle up to the last stage; simulated directly here.)
     stage_one(conn, tmp_path, recipient="exhausted@acme.com", cadence=[2])
     append_event(conn, type="sent", recipient="exhausted@acme.com", campaign="c",
-                 stage=0, gmass_campaign_id="1")
+                 stage=0, message_id="<initial@gmail.com>")
     append_event(conn, type="reply", recipient="exhausted@acme.com", campaign="c")
     append_event(conn, type="ooo_tagged", recipient="exhausted@acme.com", campaign="c")
     append_event(conn, type="requeued", recipient="exhausted@acme.com", campaign="c",
-                 stage=1, gmass_campaign_id="1")  # current_stage now 1 == len(cadence)
+                 stage=1, message_id="<resend1@gmail.com>")  # current_stage now 1 == len(cadence)
     append_event(conn, type="reply", recipient="exhausted@acme.com", campaign="c")
     tag_ooo(conn, "exhausted@acme.com", date.today())  # tagged again — but nothing left to resend
 
     stage_one(conn, tmp_path, recipient="fine@acme.com")  # a normal recipient in the same batch
     gc = make_global_config(tmp_path)
-    create_fn2, send_fn2, _ = fake_gmass()
-    result = drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-                    create_draft_fn=create_fn2, send_campaign_fn=send_fn2)
+    send_fn2, _ = fake_smtp()
+    result = drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+                    send_message_fn=send_fn2)
 
     assert result.sent == 1  # fine@acme.com
     assert result.failed == 1  # exhausted@acme.com
@@ -972,17 +877,23 @@ def test_ooo_resend_exhausted_cadence_does_not_crash_drain(conn, tmp_path):
     assert event_types[-1] == "send_failed"
 
 
-def test_ooo_resend_missing_campaign_id_does_not_crash_drain(conn, tmp_path):
-    # Robustness: an ooo_tagged recipient with no last_gmass_campaign_id
-    # (shouldn't happen via the normal flow, but must not crash if it does).
+def test_ooo_resend_missing_message_id_does_not_crash_drain(conn, tmp_path):
+    # Robustness: an ooo_tagged recipient with no message_id (shouldn't
+    # happen via the normal flow — it means this recipient was never
+    # actually sent to — but must not crash if it does).
     stage_one(conn, tmp_path, recipient="a@acme.com")
     append_event(conn, type="ooo_tagged", recipient="a@acme.com", campaign="c")
 
     gc = make_global_config(tmp_path)
-    create_fn, send_fn, _ = fake_gmass()
-    result = drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-                    create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    send_fn, _ = fake_smtp()
+    result = drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+                    send_message_fn=send_fn)
     assert result.failed == 1
+    row = conn.execute(
+        "SELECT meta FROM events WHERE recipient = 'a@acme.com' AND type = 'send_failed' "
+        "ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert json.loads(row["meta"])["stage"] == "load_staged_data_ooo"
 
 
 def test_ooo_and_initial_sends_share_the_same_gap_and_cap(conn, tmp_path):
@@ -990,11 +901,11 @@ def test_ooo_and_initial_sends_share_the_same_gap_and_cap(conn, tmp_path):
     stage_one(conn, tmp_path, recipient="initial@acme.com")
 
     gc = make_global_config(tmp_path, daily_cap=500)
-    create_fn, send_fn, _ = fake_gmass(campaign_id=777)
+    send_fn, _ = fake_smtp(message_id="<resend-777@gmail.com>")
     sleeps = []
-    result = drain(conn, gc, "fake-key", sleep_fn=lambda s: sleeps.append(s),
+    result = drain(conn, gc, SMTP, sleep_fn=lambda s: sleeps.append(s),
                     workdir_root=tmp_path / "workdir",
-                    create_draft_fn=create_fn, send_campaign_fn=send_fn)
+                    send_message_fn=send_fn)
 
     assert result.sent == 2  # both the OOO resend and the initial send went out
     assert len(sleeps) == 1  # 2 items in the combined batch -> exactly 1 gap
@@ -1005,34 +916,26 @@ def test_due_for_ooo_resend_repeats_across_multiple_ooo_cycles(conn, tmp_path):
     # each cycle should correctly target the NEXT stage after the last one
     # actually sent, not always stage 1.
     send_reply_and_tag_ooo(conn, tmp_path)  # sent stage 0, now due for stage 1 resend
-    create_fn, send_fn, _ = fake_gmass(campaign_id=777)
+    send_fn, _ = fake_smtp(message_id="<resend-1@gmail.com>")
     gc = make_global_config(tmp_path)
-    drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-          create_draft_fn=create_fn, send_campaign_fn=send_fn)  # resolves stage 1 resend
+    drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+          send_message_fn=send_fn)  # resolves stage 1 resend
 
     # Reply again, tag OOO again — should now target stage 2.
     append_event(conn, type="reply", recipient="jane@acme.com", campaign="c")
     tag_ooo(conn, "jane@acme.com", date.today())
 
-    captured = {}
+    send_fn2, calls2 = fake_smtp(message_id="<resend-2@gmail.com>")
 
-    def create_draft_fn2(api_key, *, recipient, subject, message, attachment=None):
-        captured["message"] = message
-        return {"draft_id": "r-resend-2", "raw": {}}
-
-    def send_campaign_fn2(api_key, draft_id, *, campaign_settings):
-        captured["campaign_settings"] = campaign_settings
-        return {"campaign_id": 888, "raw": {}}
-
-    drain(conn, gc, "fake-key", sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
-          create_draft_fn=create_draft_fn2, send_campaign_fn=send_campaign_fn2)
+    drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+          send_message_fn=send_fn2)
 
     manifest = load_manifest(tmp_path / "workdir" / "c" / "jane@acme.com")
-    assert captured["message"] == manifest["stage_bodies"][1]  # stage 2 = index 1
+    assert calls2["last"]["body"] == manifest["stage_bodies"][1]  # stage 2 = index 1
     # Deterministic threading (§7): cycle 2 must reply into cycle 1's resend
-    # campaign (777, the MOST RECENT), not the original initial send (555) —
-    # these coincide on cycle 1, so only a second cycle can distinguish them.
-    assert captured["campaign_settings"]["campaignIdToReplyTo"] == 777
+    # message (the MOST RECENT), not the original initial send — these
+    # coincide on cycle 1, so only a second cycle can distinguish them.
+    assert calls2["last"]["in_reply_to"] == "<resend-1@gmail.com>"
     row = conn.execute("SELECT * FROM recipients WHERE recipient = ?", ("jane@acme.com",)).fetchone()
     assert row["current_stage"] == 2
 
@@ -1050,10 +953,10 @@ def test_send_ooo_resend_schedules_next_resume_date_when_stages_remain(conn, tmp
     # recruiter cadence [2, 3, 5] — resending stage 1 (index 0) leaves stages
     # 2 and 3 remaining, so the next resend must be scheduled.
     send_reply_and_tag_ooo(conn, tmp_path, resume_date=date(2026, 8, 1))
-    create_fn, send_fn, _ = fake_gmass(campaign_id=777)
+    send_fn, _ = fake_smtp(message_id="<resend-777@gmail.com>")
     gc = make_global_config(tmp_path)
-    drain(conn, gc, "fake-key", now=date(2026, 8, 1), sleep_fn=lambda s: None,
-          workdir_root=tmp_path / "workdir", create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    drain(conn, gc, SMTP, now=date(2026, 8, 1), sleep_fn=lambda s: None,
+          workdir_root=tmp_path / "workdir", send_message_fn=send_fn)
 
     row = conn.execute(
         "SELECT meta FROM events WHERE recipient = 'jane@acme.com' AND type = 'requeued' "
@@ -1068,10 +971,10 @@ def test_send_ooo_resend_schedules_next_resume_date_when_stages_remain(conn, tmp
 def test_send_ooo_resend_no_next_resume_date_on_final_stage(conn, tmp_path):
     # A single-stage persona — the one resend IS the final stage.
     send_reply_and_tag_ooo(conn, tmp_path, cadence=[2], resume_date=date(2026, 8, 1))
-    create_fn, send_fn, _ = fake_gmass(campaign_id=777)
+    send_fn, _ = fake_smtp(message_id="<resend-777@gmail.com>")
     gc = make_global_config(tmp_path)
-    drain(conn, gc, "fake-key", now=date(2026, 8, 1), sleep_fn=lambda s: None,
-          workdir_root=tmp_path / "workdir", create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    drain(conn, gc, SMTP, now=date(2026, 8, 1), sleep_fn=lambda s: None,
+          workdir_root=tmp_path / "workdir", send_message_fn=send_fn)
 
     row = conn.execute(
         "SELECT meta FROM events WHERE recipient = 'jane@acme.com' AND type = 'requeued' "
@@ -1086,12 +989,11 @@ def test_drain_skips_ooo_paused_recipient_before_resume_date(conn, tmp_path):
     # inside the pause window and confirm nothing fires — not just that a
     # flag/query looks right in isolation.
     send_reply_and_tag_ooo(conn, tmp_path, resume_date=date(2026, 8, 10))
-    create_fn, send_fn, calls = fake_gmass(campaign_id=777)
+    send_fn, calls = fake_smtp(message_id="<resend-777@gmail.com>")
     gc = make_global_config(tmp_path)
-    result = drain(conn, gc, "fake-key", now=date(2026, 8, 5), sleep_fn=lambda s: None,
-                    workdir_root=tmp_path / "workdir", create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    result = drain(conn, gc, SMTP, now=date(2026, 8, 5), sleep_fn=lambda s: None,
+                    workdir_root=tmp_path / "workdir", send_message_fn=send_fn)
 
-    assert calls["create"] == 0
     assert calls["send"] == 0
     assert result.sent == 0
     types = [dict(r)["type"] for r in conn.execute(
@@ -1101,10 +1003,10 @@ def test_drain_skips_ooo_paused_recipient_before_resume_date(conn, tmp_path):
 
 def test_drain_fires_ooo_paused_recipient_exactly_on_resume_date(conn, tmp_path):
     send_reply_and_tag_ooo(conn, tmp_path, resume_date=date(2026, 8, 10))
-    create_fn, send_fn, calls = fake_gmass(campaign_id=777)
+    send_fn, calls = fake_smtp(message_id="<resend-777@gmail.com>")
     gc = make_global_config(tmp_path)
-    result = drain(conn, gc, "fake-key", now=date(2026, 8, 10), sleep_fn=lambda s: None,
-                    workdir_root=tmp_path / "workdir", create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    result = drain(conn, gc, SMTP, now=date(2026, 8, 10), sleep_fn=lambda s: None,
+                    workdir_root=tmp_path / "workdir", send_message_fn=send_fn)
 
     assert calls["send"] == 1
     assert result.sent == 1
@@ -1118,32 +1020,24 @@ def test_drain_dispatches_active_status_continuation_recipient_to_ooo_resend(con
     # being due for an OOO resend, not a fresh initial send. Dispatch must
     # be tagged by which due-list a row came from instead.
     send_reply_and_tag_ooo(conn, tmp_path, resume_date=date(2026, 8, 1))
-    create_fn1, send_fn1, _ = fake_gmass(campaign_id=777)
+    send_fn1, _ = fake_smtp(message_id="<resend-1@gmail.com>")
     gc = make_global_config(tmp_path)
-    drain(conn, gc, "fake-key", now=date(2026, 8, 1), sleep_fn=lambda s: None,
-          workdir_root=tmp_path / "workdir", create_draft_fn=create_fn1, send_campaign_fn=send_fn1)
+    drain(conn, gc, SMTP, now=date(2026, 8, 1), sleep_fn=lambda s: None,
+          workdir_root=tmp_path / "workdir", send_message_fn=send_fn1)
     row = conn.execute("SELECT status FROM recipients WHERE recipient = ?", ("jane@acme.com",)).fetchone()
     assert row["status"] == "active"  # confirms we're testing the vulnerable state
 
-    captured = {}
-
-    def create_draft_fn2(api_key, *, recipient, subject, message, attachment=None):
-        captured["attachment"] = attachment
-        return {"draft_id": "r-2", "raw": {}}
-
-    def send_campaign_fn2(api_key, draft_id, *, campaign_settings):
-        captured["campaign_settings"] = campaign_settings
-        return {"campaign_id": 888, "raw": {}}
+    send_fn2, calls2 = fake_smtp(message_id="<resend-2@gmail.com>")
 
     # Second stage due 2026-08-04 (cadence[1] = 3 days after the first resend).
-    drain(conn, gc, "fake-key", now=date(2026, 8, 4), sleep_fn=lambda s: None,
-          workdir_root=tmp_path / "workdir", create_draft_fn=create_draft_fn2, send_campaign_fn=send_campaign_fn2)
+    drain(conn, gc, SMTP, now=date(2026, 8, 4), sleep_fn=lambda s: None,
+          workdir_root=tmp_path / "workdir", send_message_fn=send_fn2)
 
     # Proof it went through _send_ooo_resend, not _send_one: a threaded
-    # reply (sendAsReply, no attachment) — _send_one would attach the résumé
-    # and never set sendAsReply at all.
-    assert captured["attachment"] is None
-    assert captured["campaign_settings"]["sendAsReply"] is True
+    # reply (in_reply_to set, no attachment) — _send_one would attach the
+    # résumé and never set in_reply_to at all.
+    assert calls2["last"]["attachment"] is None
+    assert calls2["last"]["in_reply_to"] == "<resend-1@gmail.com>"
     types = [dict(r)["type"] for r in conn.execute(
         "SELECT type FROM events WHERE recipient = 'jane@acme.com' ORDER BY id")]
     assert types.count("requeued") == 2
@@ -1160,21 +1054,21 @@ def test_multi_stage_ooo_pause_fires_on_correct_dates_across_full_persona_cadenc
     send_reply_and_tag_ooo(conn, tmp_path, resume_date=date(2026, 8, 1))
     gc = make_global_config(tmp_path)
 
-    def drain_on(d, campaign_id):
-        create_fn, send_fn, calls = fake_gmass(campaign_id=campaign_id)
-        result = drain(conn, gc, "fake-key", now=d, sleep_fn=lambda s: None,
-                        workdir_root=tmp_path / "workdir", create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    def drain_on(d, message_id):
+        send_fn, calls = fake_smtp(message_id=message_id)
+        result = drain(conn, gc, SMTP, now=d, sleep_fn=lambda s: None,
+                        workdir_root=tmp_path / "workdir", send_message_fn=send_fn)
         return result.sent
 
-    assert drain_on(date(2026, 7, 31), 701) == 0   # before resume_date
-    assert drain_on(date(2026, 8, 1), 702) == 1    # stage 1 fires
-    assert drain_on(date(2026, 8, 2), 703) == 0    # mid-continuation gap
-    assert drain_on(date(2026, 8, 3), 704) == 0    # still not due (due Aug 4)
-    assert drain_on(date(2026, 8, 4), 705) == 1    # stage 2 fires
-    assert drain_on(date(2026, 8, 5), 706) == 0    # mid-continuation gap
-    assert drain_on(date(2026, 8, 8), 707) == 0    # still not due (due Aug 9)
-    assert drain_on(date(2026, 8, 9), 708) == 1    # stage 3 fires — final stage
-    assert drain_on(date(2026, 8, 20), 709) == 0   # cadence exhausted, never fires again
+    assert drain_on(date(2026, 7, 31), "<m701@gmail.com>") == 0   # before resume_date
+    assert drain_on(date(2026, 8, 1), "<m702@gmail.com>") == 1    # stage 1 fires
+    assert drain_on(date(2026, 8, 2), "<m703@gmail.com>") == 0    # mid-continuation gap
+    assert drain_on(date(2026, 8, 3), "<m704@gmail.com>") == 0    # still not due (due Aug 4)
+    assert drain_on(date(2026, 8, 4), "<m705@gmail.com>") == 1    # stage 2 fires
+    assert drain_on(date(2026, 8, 5), "<m706@gmail.com>") == 0    # mid-continuation gap
+    assert drain_on(date(2026, 8, 8), "<m707@gmail.com>") == 0    # still not due (due Aug 9)
+    assert drain_on(date(2026, 8, 9), "<m708@gmail.com>") == 1    # stage 3 fires — final stage
+    assert drain_on(date(2026, 8, 20), "<m709@gmail.com>") == 0   # cadence exhausted, never fires again
 
     row = conn.execute("SELECT * FROM recipients WHERE recipient = ?", ("jane@acme.com",)).fetchone()
     assert row["current_stage"] == 3
@@ -1192,10 +1086,10 @@ def test_drain_does_not_double_send_a_recipient_restaged_into_a_new_campaign_mid
     # ONE email (the new campaign's initial) — never both, and never the
     # new campaign's body threaded into the old campaign's conversation.
     send_reply_and_tag_ooo(conn, tmp_path, resume_date=date(2026, 8, 1))
-    create_fn1, send_fn1, _ = fake_gmass(campaign_id=701)
+    send_fn1, _ = fake_smtp(message_id="<resend-701@gmail.com>")
     gc = make_global_config(tmp_path)
-    drain(conn, gc, "fake-key", now=date(2026, 8, 1), sleep_fn=lambda s: None,
-          workdir_root=tmp_path / "workdir", create_draft_fn=create_fn1, send_campaign_fn=send_fn1)
+    drain(conn, gc, SMTP, now=date(2026, 8, 1), sleep_fn=lambda s: None,
+          workdir_root=tmp_path / "workdir", send_message_fn=send_fn1)
     # Stage 2 now pending for campaign "c" on 2026-08-04.
     assert due_for_ooo_resend(conn, today=date(2026, 8, 4)) != []
 
@@ -1209,16 +1103,13 @@ def test_drain_does_not_double_send_a_recipient_restaged_into_a_new_campaign_mid
 
     captured = []
 
-    def create_draft_fn2(api_key, *, recipient, subject, message, attachment=None):
-        captured.append({"subject": subject, "message": message})
-        return {"draft_id": f"r-{len(captured)}", "raw": {}}
+    def send_fn2(smtp_config, *, sender, recipient, subject, body, sender_name=None,
+                 attachment=None, in_reply_to=None, references=None):
+        captured.append({"subject": subject, "body": body})
+        return {"message_id": f"<m-{len(captured)}@gmail.com>", "raw": {}}
 
-    def send_campaign_fn2(api_key, draft_id, *, campaign_settings):
-        return {"campaign_id": 999, "raw": {}}
-
-    result = drain(conn, gc, "fake-key", now=date(2026, 8, 4), sleep_fn=lambda s: None,
-                    workdir_root=tmp_path / "workdir", create_draft_fn=create_draft_fn2,
-                    send_campaign_fn=send_campaign_fn2)
+    result = drain(conn, gc, SMTP, now=date(2026, 8, 4), sleep_fn=lambda s: None,
+                    workdir_root=tmp_path / "workdir", send_message_fn=send_fn2)
 
     # Exactly one send — the new campaign's initial — never the dangling
     # old-campaign OOO continuation, and never both.
@@ -1231,16 +1122,16 @@ def test_drain_does_not_double_send_a_recipient_restaged_into_a_new_campaign_mid
 
 def test_send_ooo_resend_writes_terminal_marker_when_cadence_exhausted(conn, tmp_path):
     send_reply_and_tag_ooo(conn, tmp_path, cadence=[2], resume_date=date(2026, 8, 1))
-    create_fn, send_fn, _ = fake_gmass(campaign_id=777)
+    send_fn, _ = fake_smtp(message_id="<resend-777@gmail.com>")
     gc = make_global_config(tmp_path)
     # First resend fires the ONLY stage.
-    drain(conn, gc, "fake-key", now=date(2026, 8, 1), sleep_fn=lambda s: None,
-          workdir_root=tmp_path / "workdir", create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    drain(conn, gc, SMTP, now=date(2026, 8, 1), sleep_fn=lambda s: None,
+          workdir_root=tmp_path / "workdir", send_message_fn=send_fn)
 
     # Mark OOO again — nothing left to resend.
     tag_ooo(conn, "jane@acme.com", date(2026, 8, 5))
-    result = drain(conn, gc, "fake-key", now=date(2026, 8, 5), sleep_fn=lambda s: None,
-                    workdir_root=tmp_path / "workdir", create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    result = drain(conn, gc, SMTP, now=date(2026, 8, 5), sleep_fn=lambda s: None,
+                    workdir_root=tmp_path / "workdir", send_message_fn=send_fn)
     assert result.failed == 1
     row = conn.execute(
         "SELECT meta FROM events WHERE recipient = 'jane@acme.com' AND type = 'send_failed' "
@@ -1254,18 +1145,18 @@ def test_ooo_cadence_exhausted_recipient_does_not_retry_forever(conn, tmp_path):
     # recipient would generate a fresh send_failed on every single future
     # drain, forever.
     send_reply_and_tag_ooo(conn, tmp_path, cadence=[2], resume_date=date(2026, 8, 1))
-    create_fn, send_fn, _ = fake_gmass(campaign_id=777)
+    send_fn, _ = fake_smtp(message_id="<resend-777@gmail.com>")
     gc = make_global_config(tmp_path)
-    drain(conn, gc, "fake-key", now=date(2026, 8, 1), sleep_fn=lambda s: None,
-          workdir_root=tmp_path / "workdir", create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    drain(conn, gc, SMTP, now=date(2026, 8, 1), sleep_fn=lambda s: None,
+          workdir_root=tmp_path / "workdir", send_message_fn=send_fn)
     tag_ooo(conn, "jane@acme.com", date(2026, 8, 5))
-    drain(conn, gc, "fake-key", now=date(2026, 8, 5), sleep_fn=lambda s: None,
-          workdir_root=tmp_path / "workdir", create_draft_fn=create_fn, send_campaign_fn=send_fn)
+    drain(conn, gc, SMTP, now=date(2026, 8, 5), sleep_fn=lambda s: None,
+          workdir_root=tmp_path / "workdir", send_message_fn=send_fn)
 
     # Every later drain must be a genuine no-op for this recipient.
     for d in (date(2026, 8, 6), date(2026, 8, 30), date(2027, 1, 1)):
-        result = drain(conn, gc, "fake-key", now=d, sleep_fn=lambda s: None,
-                        workdir_root=tmp_path / "workdir", create_draft_fn=create_fn, send_campaign_fn=send_fn)
+        result = drain(conn, gc, SMTP, now=d, sleep_fn=lambda s: None,
+                        workdir_root=tmp_path / "workdir", send_message_fn=send_fn)
         assert result.sent == 0
         assert result.failed == 0
     failed_count = conn.execute(

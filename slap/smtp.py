@@ -39,6 +39,12 @@ from email.utils import formataddr, formatdate, make_msgid
 DEFAULT_SMTP_HOST = "smtp.gmail.com"
 DEFAULT_SMTP_PORT = 587
 
+# The .env var holding the Gmail App Password (loaded into os.environ by
+# python-dotenv). Replaces GMASS_API_KEY. A module constant (not a config knob
+# yet) so slap.py and doctor.py agree on the name during the GMass->SMTP
+# migration; config.yaml may later override it (step 7).
+PASSWORD_ENV = "GMAIL_APP_PASSWORD"
+
 # Every real network call this module makes is bounded by this timeout, the
 # same discipline gmass.DEFAULT_TIMEOUT enforced for the HTTP client: an
 # unbounded smtplib connect/login could otherwise hang a whole drain (an

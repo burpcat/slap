@@ -26,8 +26,21 @@ from slap.queue import AmbiguousArchiveChoice, QueueError, resend_bounced, stage
 from slap.templates import fill_template, merge_config_values, parse_drop
 from slap import (
     archive, dashboard, doctor, domains, followups, gmass, gmass_cache, init, launchd, onboard,
-    reload, runner, tracking,
+    reload, runner, smtp, tracking,
 )
+
+
+def _smtp_config(global_config):
+    """SMTP transport credentials for a drain, built from config + env. The
+    Gmail App Password is loaded from .env into os.environ by load_dotenv();
+    the SMTP login/sender is the configured from_email. An empty password is
+    left to fail loud at send time (SmtpError) / preflight, mirroring how the
+    old GMASS_API_KEY path deferred its own empty-key check to doctor."""
+    return smtp.SmtpConfig(
+        host=smtp.DEFAULT_SMTP_HOST, port=smtp.DEFAULT_SMTP_PORT,
+        user=global_config.from_email,
+        password=os.environ.get(smtp.PASSWORD_ENV, "").strip(),
+    )
 
 
 def cmd_list(args):
@@ -150,7 +163,7 @@ def cmd_send(args):
 
     if args.now:
         print("\n--now: draining the queue immediately...")
-        result = runner.drain(conn, global_config, os.environ.get(global_config.api_key_env, ""))
+        result = runner.drain(conn, global_config, _smtp_config(global_config))
         _print_drain_result(result)
 
 
@@ -244,7 +257,7 @@ def cmd_send_unified(args):
 
     if args.now:
         print("\n--now: draining the queue immediately...")
-        result = runner.drain(conn, global_config, os.environ.get(global_config.api_key_env, ""))
+        result = runner.drain(conn, global_config, _smtp_config(global_config))
         _print_drain_result(result)
 
 
@@ -421,7 +434,7 @@ def cmd_send_custom(args):
 
     if args.now:
         print("\n--now: draining the queue immediately...")
-        result = runner.drain(conn, global_config, os.environ.get(global_config.api_key_env, ""))
+        result = runner.drain(conn, global_config, _smtp_config(global_config))
         _print_drain_result(result)
 
 
@@ -667,7 +680,7 @@ def cmd_runner(args):
         return
     conn = tracking.connect()
     runner.wait_for_fire_window(global_config.schedule)
-    result = runner.drain(conn, global_config, os.environ.get(global_config.api_key_env, ""))
+    result = runner.drain(conn, global_config, _smtp_config(global_config))
     _print_drain_result(result)
 
 
