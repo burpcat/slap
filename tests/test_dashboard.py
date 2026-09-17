@@ -132,251 +132,27 @@ def seed_sent_recipient(conn, recipient="jane@acme.com", campaign="c", campaign_
                  gmass_campaign_id=campaign_id)
 
 
-# --- sync_reports: dedup + resilience --------------------------------------
+# --- sync_reports: IMAP reply poll -----------------------------------------
 
-def test_sync_reports_writes_new_reply_event(conn):
-    seed_sent_recipient(conn)
-    with patch("slap.dashboard.gmass.get_reports") as mock_get:
-        def side_effect(api_key, cid, report_type):
-            if report_type == "replies":
-                return [{"emailAddress": "jane@acme.com", "replyId": "r1", "replyTime": "t1"}]
-            return []
-        mock_get.side_effect = side_effect
-        result = sync_reports(conn, "fake-key")
-
-    assert result["new_replies"] == 1
-    events = [dict(r) for r in conn.execute("SELECT * FROM events WHERE type = 'reply'")]
-    assert len(events) == 1
+def test_sync_reports_clicks_and_bounces_are_always_zero(conn):
+    with patch("slap.dashboard.ingest_replies", return_value=0):
+        result = sync_reports(conn, "cfg")
+    assert result["new_clicks"] == 0
+    assert result["new_bounces"] == 0
 
 
-def test_sync_reports_does_not_reinsert_already_recorded_reply(conn):
-    seed_sent_recipient(conn)
-    append_event(conn, type="reply", recipient="jane@acme.com", campaign="c",
-                 meta={"reply_id": "r1", "reply_time": "t1"})
-    with patch("slap.dashboard.gmass.get_reports") as mock_get:
-        def side_effect(api_key, cid, report_type):
-            if report_type == "replies":
-                return [{"emailAddress": "jane@acme.com", "replyId": "r1", "replyTime": "t1"}]
-            return []
-        mock_get.side_effect = side_effect
-        result = sync_reports(conn, "fake-key")
+def test_sync_reports_reply_flows_through(conn):
+    with patch("slap.dashboard.ingest_replies", return_value=2):
+        result = sync_reports(conn, "cfg")
+    assert result["new_replies"] == 2
 
+
+def test_sync_reports_imap_failure_is_surfaced_not_raised(conn):
+    from slap.imap import ImapError
+    with patch("slap.dashboard.ingest_replies", side_effect=ImapError("down")):
+        result = sync_reports(conn, "cfg")
+    assert result["errors"]
     assert result["new_replies"] == 0
-    events = [dict(r) for r in conn.execute("SELECT * FROM events WHERE type = 'reply'")]
-    assert len(events) == 1  # still just the one, not duplicated
-
-
-def test_sync_reports_dedupes_clicks_by_url_and_time(conn):
-    seed_sent_recipient(conn)
-    with patch("slap.dashboard.gmass.get_reports") as mock_get:
-        def side_effect(api_key, cid, report_type):
-            if report_type == "clicks":
-                return [{"emailAddress": "jane@acme.com", "url": "https://x.com", "clickTime": "t1"}]
-            return []
-        mock_get.side_effect = side_effect
-        r1 = sync_reports(conn, "fake-key")
-        r2 = sync_reports(conn, "fake-key")  # same click reported again on next poll
-
-    assert r1["new_clicks"] == 1
-    assert r2["new_clicks"] == 0
-    events = [dict(r) for r in conn.execute("SELECT * FROM events WHERE type = 'click'")]
-    assert len(events) == 1
-
-
-def test_sync_reports_dedupes_bounces_by_reason_and_time(conn):
-    seed_sent_recipient(conn)
-    with patch("slap.dashboard.gmass.get_reports") as mock_get:
-        def side_effect(api_key, cid, report_type):
-            if report_type == "bounces":
-                return [{"emailAddress": "jane@acme.com", "bounceReason": "mailbox full", "bounceTime": "t1"}]
-            return []
-        mock_get.side_effect = side_effect
-        r1 = sync_reports(conn, "fake-key")
-        r2 = sync_reports(conn, "fake-key")
-
-    assert r1["new_bounces"] == 1
-    assert r2["new_bounces"] == 0
-
-
-def test_sync_reports_records_a_block_that_bounces_alone_would_miss(conn):
-    # Reproduces the actual reported bug: GMass classifies a delivery
-    # failure as a BLOCK (a separate report category/endpoint from
-    # bounces, with its own blockReason/blockTime fields), and the owner
-    # saw it as a real failure but the dashboard never recorded it — because
-    # sync_reports() used to poll only /bounces, never /blocks. If this test
-    # only mocked "bounces" and left "blocks" returning [], it would pass
-    # even with the bug still present — it must return a REAL item for
-    # "blocks" and nothing for "bounces" to actually exercise the gap.
-    seed_sent_recipient(conn, recipient="blocked@acme.com")
-    with patch("slap.dashboard.gmass.get_reports") as mock_get:
-        def side_effect(api_key, cid, report_type):
-            if report_type == "blocks":
-                return [{"emailAddress": "blocked@acme.com", "blockReason": "554 rejected", "blockTime": "t1"}]
-            return []  # bounces (and everything else) genuinely empty for this recipient
-        mock_get.side_effect = side_effect
-        result = sync_reports(conn, "fake-key")
-
-    assert result["new_bounces"] == 1  # combined bounce+block counter — see sync_reports()'s docstring
-    events = [dict(r) for r in conn.execute("SELECT * FROM events WHERE type = 'bounce'")]
-    assert len(events) == 1
-    meta = json.loads(events[0]["meta"])
-    assert meta["category"] == "block"
-    assert meta["bounce_reason"] == "554 rejected"
-
-
-def test_sync_reports_dedupes_blocks_by_reason_and_time(conn):
-    seed_sent_recipient(conn)
-    with patch("slap.dashboard.gmass.get_reports") as mock_get:
-        def side_effect(api_key, cid, report_type):
-            if report_type == "blocks":
-                return [{"emailAddress": "jane@acme.com", "blockReason": "security policy", "blockTime": "t1"}]
-            return []
-        mock_get.side_effect = side_effect
-        r1 = sync_reports(conn, "fake-key")
-        r2 = sync_reports(conn, "fake-key")
-
-    assert r1["new_bounces"] == 1
-    assert r2["new_bounces"] == 0
-
-
-def test_sync_reports_records_both_a_bounce_and_a_block_for_different_recipients(conn):
-    seed_sent_recipient(conn, recipient="bounced@x.com", campaign_id="1")
-    seed_sent_recipient(conn, recipient="blocked@x.com", campaign_id="2")
-    with patch("slap.dashboard.gmass.get_reports") as mock_get:
-        def side_effect(api_key, cid, report_type):
-            if cid == "1" and report_type == "bounces":
-                return [{"emailAddress": "bounced@x.com", "bounceReason": "mailbox full", "bounceTime": "t1"}]
-            if cid == "2" and report_type == "blocks":
-                return [{"emailAddress": "blocked@x.com", "blockReason": "spam policy", "blockTime": "t2"}]
-            return []
-        mock_get.side_effect = side_effect
-        result = sync_reports(conn, "fake-key")
-
-    assert result["new_bounces"] == 2
-    events = {r["recipient"]: json.loads(r["meta"])["category"]
-              for r in conn.execute("SELECT recipient, meta FROM events WHERE type = 'bounce'")}
-    assert events == {"bounced@x.com": "bounce", "blocked@x.com": "block"}
-
-
-def test_sync_reports_distinguishes_different_clicks(conn):
-    seed_sent_recipient(conn)
-    calls = {"n": 0}
-    with patch("slap.dashboard.gmass.get_reports") as mock_get:
-        def side_effect(api_key, cid, report_type):
-            if report_type == "clicks":
-                calls["n"] += 1
-                if calls["n"] == 1:
-                    return [{"emailAddress": "jane@acme.com", "url": "https://x.com", "clickTime": "t1"}]
-                return [{"emailAddress": "jane@acme.com", "url": "https://x.com", "clickTime": "t2"}]
-            return []
-        mock_get.side_effect = side_effect
-        r1 = sync_reports(conn, "fake-key")
-        r2 = sync_reports(conn, "fake-key")  # a genuinely later click on the same link
-
-    assert r1["new_clicks"] == 1
-    assert r2["new_clicks"] == 1
-    events = [dict(r) for r in conn.execute("SELECT * FROM events WHERE type = 'click'")]
-    assert len(events) == 2
-
-
-def test_sync_reports_dedupes_within_a_single_batch_too(conn):
-    # If one GMass response somehow contains the same item twice, it must
-    # not be inserted as two events (the dedup set is updated as we go, not
-    # just checked once against pre-existing events).
-    seed_sent_recipient(conn)
-    with patch("slap.dashboard.gmass.get_reports") as mock_get:
-        def side_effect(api_key, cid, report_type):
-            if report_type == "clicks":
-                item = {"emailAddress": "jane@acme.com", "url": "https://x.com", "clickTime": "t1"}
-                return [item, item]  # duplicate within the same batch
-            return []
-        mock_get.side_effect = side_effect
-        result = sync_reports(conn, "fake-key")
-
-    assert result["new_clicks"] == 1
-    events = [dict(r) for r in conn.execute("SELECT * FROM events WHERE type = 'click'")]
-    assert len(events) == 1
-
-
-def test_sync_reports_records_recipients_current_stage_on_reply_and_click(conn):
-    seed_sent_recipient(conn)
-    append_event(conn, type="sent", recipient="jane@acme.com", campaign="c", stage=1,
-                 gmass_campaign_id="555")  # advance current_stage to 1 (e.g. a later OOO resend)
-    with patch("slap.dashboard.gmass.get_reports") as mock_get:
-        def side_effect(api_key, cid, report_type):
-            if report_type == "replies":
-                return [{"emailAddress": "jane@acme.com", "replyId": "r1", "replyTime": "t1"}]
-            if report_type == "clicks":
-                return [{"emailAddress": "jane@acme.com", "url": "https://x.com", "clickTime": "t1"}]
-            return []
-        mock_get.side_effect = side_effect
-        sync_reports(conn, "fake-key")
-
-    reply = dict(conn.execute("SELECT * FROM events WHERE type = 'reply'").fetchone())
-    click = dict(conn.execute("SELECT * FROM events WHERE type = 'click'").fetchone())
-    assert reply["stage"] == 1
-    assert click["stage"] == 1
-
-
-def test_sync_reports_no_known_campaigns_is_a_noop(conn):
-    result = sync_reports(conn, "fake-key")
-    assert result == {"synced_at": result["synced_at"], "new_replies": 0, "new_clicks": 0,
-                       "new_bounces": 0, "errors": []}
-
-
-def test_sync_reports_one_campaigns_transient_network_error_does_not_block_others(conn):
-    # A transient network failure (timeout, connection refused) is tolerated
-    # silently — one campaign's poll failing must not block syncing the
-    # rest, and it's not a real problem worth surfacing (the next poll
-    # retries it automatically).
-    import requests
-
-    seed_sent_recipient(conn, recipient="fails@acme.com", campaign_id="1")
-    seed_sent_recipient(conn, recipient="fine@acme.com", campaign_id="2")
-
-    with patch("slap.dashboard.gmass.get_reports") as mock_get:
-        def side_effect(api_key, cid, report_type):
-            if cid == "1":
-                raise requests.exceptions.ConnectionError("simulated network error")
-            if report_type == "replies":
-                return [{"emailAddress": "fine@acme.com", "replyId": "r1", "replyTime": "t1"}]
-            return []
-        mock_get.side_effect = side_effect
-        result = sync_reports(conn, "fake-key")
-
-    assert result["new_replies"] == 1  # fine@acme.com's reply still got recorded
-    assert result["errors"] == []  # transient failures aren't surfaced as errors
-
-
-def test_sync_reports_surfaces_gmass_api_errors_without_crashing(conn):
-    # A real API-level problem (bad/expired key, GMass schema drift) must
-    # NOT be silently swallowed the way a transient network error is —
-    # otherwise an invalid API key looks identical to "nothing new" forever.
-    # It still must not crash the whole sync or block other campaigns.
-    from slap.gmass import GMassError
-
-    seed_sent_recipient(conn, recipient="fails@acme.com", campaign_id="1")
-    seed_sent_recipient(conn, recipient="fine@acme.com", campaign_id="2")
-
-    with patch("slap.dashboard.gmass.get_reports") as mock_get:
-        def side_effect(api_key, cid, report_type):
-            if cid == "1":
-                raise GMassError("GMass reports/replies returned HTTP 401: unauthorized")
-            if report_type == "replies":
-                return [{"emailAddress": "fine@acme.com", "replyId": "r1", "replyTime": "t1"}]
-            return []
-        mock_get.side_effect = side_effect
-        result = sync_reports(conn, "fake-key")
-
-    assert result["new_replies"] == 1  # fine@acme.com's reply still got recorded
-    assert len(result["errors"]) == 4  # one per report type (replies/clicks/bounces/blocks) polled for cid=1
-    assert any("401" in e for e in result["errors"])
-
-
-def test_sync_reports_returns_utc_synced_at(conn):
-    result = sync_reports(conn, "fake-key")
-    assert result["synced_at"].tzinfo is not None
-    assert result["synced_at"].utcoffset().total_seconds() == 0
 
 
 def _ts(day_offset, hour=10):
@@ -395,7 +171,8 @@ def _ts(day_offset, hour=10):
 def test_compute_gmass_dependent_data_matches_individual_widget_functions(conn):
     seed_sent_recipient(conn)
     append_event(conn, type="reply", recipient="jane@acme.com", campaign="c")
-    result = compute_gmass_dependent_data(conn, "fake-key", consumer_domains=set())
+    with patch("slap.dashboard.ingest_replies", return_value=0):
+        result = compute_gmass_dependent_data(conn, "fake-key", consumer_domains=set())
 
     assert result["engagement"] == engagement_intelligence(conn)
     assert result["warm_but_silent"] == warm_but_silent(conn)
@@ -411,10 +188,11 @@ def test_compute_gmass_dependent_data_runs_the_real_sync_and_writes_events(conn)
     # on-open trigger would have" — proves this isn't a rewrite of
     # sync_reports(), just a different trigger for the exact same function.
     seed_sent_recipient(conn)
-    with patch("slap.dashboard.gmass.get_reports") as mock_get:
-        mock_get.side_effect = lambda api_key, cid, report_type: (
-            [{"replyId": "r1", "replyTime": "2026-01-01T00:00:00"}] if report_type == "replies" else []
-        )
+    def fake_ingest_replies(conn_, imap_config):
+        append_event(conn_, type="reply", recipient="jane@acme.com", campaign="c",
+                     meta={"reply_id": "r1"})
+        return 1
+    with patch("slap.dashboard.ingest_replies", side_effect=fake_ingest_replies):
         compute_gmass_dependent_data(conn, "fake-key", consumer_domains=set())
     events = [dict(r) for r in conn.execute("SELECT * FROM events WHERE type = 'reply'")]
     assert len(events) == 1
@@ -424,7 +202,8 @@ def test_compute_gmass_dependent_data_runs_the_real_sync_and_writes_events(conn)
 def test_compute_gmass_dependent_data_is_json_serializable(conn):
     seed_sent_recipient(conn)
     append_event(conn, type="reply", recipient="jane@acme.com", campaign="c")
-    result = compute_gmass_dependent_data(conn, "fake-key", consumer_domains=set())
+    with patch("slap.dashboard.ingest_replies", return_value=0):
+        result = compute_gmass_dependent_data(conn, "fake-key", consumer_domains=set())
     json.dumps(result)  # must not raise
 
 
@@ -442,7 +221,8 @@ def test_engagement_reply_by_stage_survives_a_real_json_round_trip(conn):
     append_event(conn, type="reply", recipient="a@acme.com", campaign="c", stage=0)
     append_event(conn, type="click", recipient="a@acme.com", campaign="c", stage=0)
 
-    result = compute_gmass_dependent_data(conn, "fake-key", consumer_domains=set())
+    with patch("slap.dashboard.ingest_replies", return_value=0):
+        result = compute_gmass_dependent_data(conn, "fake-key", consumer_domains=set())
     client = FakeRedis()
     gmass_cache.write_cache(client, result)
     round_tripped = gmass_cache.read_cache(client)
@@ -462,8 +242,9 @@ def test_flushing_cache_and_recomputing_produces_identical_results(conn):
     # results, since SQLite's events table is the only real source.
     seed_sent_recipient(conn)
     append_event(conn, type="reply", recipient="jane@acme.com", campaign="c")
-    first = compute_gmass_dependent_data(conn, "fake-key", consumer_domains=set())
-    second = compute_gmass_dependent_data(conn, "fake-key", consumer_domains=set())
+    with patch("slap.dashboard.ingest_replies", return_value=0):
+        first = compute_gmass_dependent_data(conn, "fake-key", consumer_domains=set())
+        second = compute_gmass_dependent_data(conn, "fake-key", consumer_domains=set())
     # cached_at/synced_at legitimately differ (each call stamps its own
     # "now") — every other field must be byte-identical.
     first.pop("cached_at"), second.pop("cached_at")
@@ -494,9 +275,9 @@ def test_get_gmass_dependent_data_fresh_cache_makes_zero_gmass_calls(conn, db_pa
                                                                     "reply_rate_by_campaign": {},
                                                                     "reply_by_stage": {}, "click_by_stage": {},
                                                                     "time_to_first_reply": {}}))
-    with patch("slap.dashboard.gmass.get_reports") as mock_get:
+    with patch("slap.dashboard.ingest_replies") as mock_ingest:
         result = get_gmass_dependent_data("fake-key", set(), client, db_path)
-    mock_get.assert_not_called()
+    mock_ingest.assert_not_called()
     assert result["cache_status"] == "fresh"
     assert result["engagement"]["has_data"] is True
 
@@ -508,9 +289,9 @@ def test_get_gmass_dependent_data_stale_cache_spawns_background_refresh(conn, db
     stale["cached_at"] = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
     gmass_cache.write_cache(client, stale)
 
-    with patch("slap.dashboard.gmass.get_reports", return_value=[]) as mock_get:
+    with patch("slap.dashboard.ingest_replies", return_value=0) as mock_ingest:
         result = get_gmass_dependent_data("fake-key", set(), client, db_path)
-    mock_get.assert_called()  # the SAME refresh path the hourly job uses, run on a (synchronous, in this test) thread
+    mock_ingest.assert_called()  # the SAME refresh path the hourly job uses, run on a (synchronous, in this test) thread
     assert result["cache_status"] == "stale_refreshing"
     assert result["bounces"] == []  # returned the STALE snapshot immediately — never waits on the refresh
     assert gmass_cache.is_fresh(gmass_cache.read_cache(client))  # but the background refresh already wrote fresh data
@@ -519,9 +300,9 @@ def test_get_gmass_dependent_data_stale_cache_spawns_background_refresh(conn, db
 def test_get_gmass_dependent_data_missing_cache_spawns_background_refresh(conn, db_path, sync_background_thread):
     seed_sent_recipient(conn)
     client = FakeRedis()
-    with patch("slap.dashboard.gmass.get_reports", return_value=[]) as mock_get:
+    with patch("slap.dashboard.ingest_replies", return_value=0) as mock_ingest:
         result = get_gmass_dependent_data("fake-key", set(), client, db_path)
-    mock_get.assert_called()
+    mock_ingest.assert_called()
     assert result["cache_status"] == "stale_refreshing"
     assert gmass_cache.is_fresh(gmass_cache.read_cache(client))
 
@@ -533,9 +314,9 @@ def test_get_gmass_dependent_data_redis_unavailable_never_auto_refreshes(conn, d
     # requests during a Redis outage fire multiple unlocked, simultaneous
     # GMass sweeps. Must render the honest empty state and do nothing else.
     seed_sent_recipient(conn)
-    with patch("slap.dashboard.gmass.get_reports", return_value=[]) as mock_get:
+    with patch("slap.dashboard.ingest_replies") as mock_ingest:
         result = get_gmass_dependent_data("fake-key", set(), FakeRedisDown(), db_path)
-    mock_get.assert_not_called()
+    mock_ingest.assert_not_called()
     assert result["cache_status"] == "redis_unavailable"
     assert result["engagement"]["has_data"] is False
     assert result["bounces"] == []
@@ -550,9 +331,9 @@ def test_get_gmass_dependent_data_lock_held_uses_stale_cached_data_without_a_sec
     gmass_cache.write_cache(client, stale)
     gmass_cache.acquire_lock(client)  # simulates the hourly job already mid-refresh
 
-    with patch("slap.dashboard.gmass.get_reports") as mock_get:
+    with patch("slap.dashboard.ingest_replies") as mock_ingest:
         result = get_gmass_dependent_data("fake-key", set(), client, db_path)
-    mock_get.assert_not_called()  # never a second, concurrent refresh
+    mock_ingest.assert_not_called()  # never a second, concurrent refresh
     assert result["cache_status"] == "stale_refreshing"
     assert result["bounces"] == [{"recipient": "stale@x.com"}]  # served the last known data
 
@@ -563,9 +344,9 @@ def test_get_gmass_dependent_data_lock_held_with_no_cache_yet_renders_honest_emp
     client = FakeRedis()
     gmass_cache.acquire_lock(client)  # e.g. the very first sync ever, racing a dashboard open
 
-    with patch("slap.dashboard.gmass.get_reports") as mock_get:
+    with patch("slap.dashboard.ingest_replies") as mock_ingest:
         result = get_gmass_dependent_data("fake-key", set(), client, db_path)
-    mock_get.assert_not_called()
+    mock_ingest.assert_not_called()
     assert result["cache_status"] == "stale_refreshing"
     assert result["engagement"]["has_data"] is False
     assert result["warm_but_silent"] == []
@@ -862,15 +643,10 @@ def test_actionable_replies_includes_domain_context(conn):
     assert replies[0]["dedup_context"].hard_warning is not None  # already-contacted context
 
 
-def _fake_unsubscribe(api_key, email):
-    return {"emailAddress": email, "unsubscribeTime": "2026-01-01T00:00:00", "sender": None}
-
-
 def test_tag_reply_ooo_calls_the_real_requeue_mechanism(conn):
     append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
     append_event(conn, type="reply", recipient="a@x.com", campaign="c")
-    tag_reply(conn, "a@x.com", "ooo", resume_date=date.today(), api_key="fake-key",
-              unsubscribe_fn=_fake_unsubscribe)
+    tag_reply(conn, "a@x.com", "ooo", resume_date=date.today())
     row = conn.execute("SELECT status FROM recipients WHERE recipient = ?", ("a@x.com",)).fetchone()
     assert row["status"] == "ooo_requeued"
     assert needs_triage(conn) == []  # resolved
@@ -880,7 +656,7 @@ def test_tag_reply_ooo_requires_resume_date(conn):
     append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
     append_event(conn, type="reply", recipient="a@x.com", campaign="c")
     with pytest.raises(ValueError, match="resume_date"):
-        tag_reply(conn, "a@x.com", "ooo", api_key="fake-key", unsubscribe_fn=_fake_unsubscribe)
+        tag_reply(conn, "a@x.com", "ooo")
 
 
 def test_tag_reply_ooo_available_with_no_prior_reply_or_engagement_at_all(conn):
@@ -889,41 +665,9 @@ def test_tag_reply_ooo_available_with_no_prior_reply_or_engagement_at_all(conn):
     # OOO notice arriving somewhere SLAP/GMass never saw.
     append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
     append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=0, gmass_campaign_id="1")
-    tag_reply(conn, "a@x.com", "ooo", resume_date=date(2026, 8, 1), api_key="fake-key",
-              unsubscribe_fn=_fake_unsubscribe)
+    tag_reply(conn, "a@x.com", "ooo", resume_date=date(2026, 8, 1))
     row = conn.execute("SELECT status FROM recipients WHERE recipient = ?", ("a@x.com",)).fetchone()
     assert row["status"] == "ooo_requeued"
-
-
-def test_tag_reply_ooo_calls_unsubscribe_before_recording_anything_locally(conn):
-    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
-
-    def failing_unsubscribe(api_key, email):
-        raise RuntimeError("simulated GMass failure")
-
-    with pytest.raises(RuntimeError, match="simulated GMass failure"):
-        tag_reply(conn, "a@x.com", "ooo", resume_date=date(2026, 8, 1), api_key="fake-key",
-                  unsubscribe_fn=failing_unsubscribe)
-    # Nothing was recorded locally — a local-only pause with no working
-    # GMass-side suppression would be worse than not marking OOO at all
-    # (false confidence the double-send risk was handled).
-    assert conn.execute("SELECT * FROM events WHERE type = 'ooo_tagged'").fetchone() is None
-    row = conn.execute("SELECT status FROM recipients WHERE recipient = ?", ("a@x.com",)).fetchone()
-    assert row["status"] == "active"  # unchanged from the queued event
-
-
-def test_tag_reply_ooo_calls_unsubscribe_with_the_recipient_and_api_key(conn):
-    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
-    captured = {}
-
-    def capturing_unsubscribe(api_key, email):
-        captured["api_key"] = api_key
-        captured["email"] = email
-        return _fake_unsubscribe(api_key, email)
-
-    tag_reply(conn, "a@x.com", "ooo", resume_date=date(2026, 8, 1), api_key="the-real-key",
-              unsubscribe_fn=capturing_unsubscribe)
-    assert captured == {"api_key": "the-real-key", "email": "a@x.com"}
 
 
 def test_tag_reply_real_writes_reply_reviewed(conn):
@@ -938,36 +682,10 @@ def test_tag_reply_real_writes_reply_reviewed(conn):
 def test_tag_reply_not_interested_writes_reply_reviewed(conn):
     append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
     append_event(conn, type="reply", recipient="a@x.com", campaign="c")
-    tag_reply(conn, "a@x.com", "not_interested", api_key="fake-key", unsubscribe_fn=_fake_unsubscribe)
+    tag_reply(conn, "a@x.com", "not_interested")
     events = [dict(r) for r in conn.execute("SELECT * FROM events WHERE type = 'reply_reviewed'")]
     assert len(events) == 1
     assert needs_triage(conn) == []
-
-
-def test_tag_reply_not_interested_calls_unsubscribe_same_as_ooo(conn):
-    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
-    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
-    captured = {}
-
-    def capturing_unsubscribe(api_key, email):
-        captured["api_key"] = api_key
-        captured["email"] = email
-        return _fake_unsubscribe(api_key, email)
-
-    tag_reply(conn, "a@x.com", "not_interested", api_key="the-real-key", unsubscribe_fn=capturing_unsubscribe)
-    assert captured == {"api_key": "the-real-key", "email": "a@x.com"}
-
-
-def test_tag_reply_not_interested_calls_unsubscribe_before_recording_anything_locally(conn):
-    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
-    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
-
-    def failing_unsubscribe(api_key, email):
-        raise RuntimeError("simulated GMass failure")
-
-    with pytest.raises(RuntimeError, match="simulated GMass failure"):
-        tag_reply(conn, "a@x.com", "not_interested", api_key="fake-key", unsubscribe_fn=failing_unsubscribe)
-    assert conn.execute("SELECT * FROM events WHERE type = 'reply_reviewed'").fetchone() is None
 
 
 def test_tag_reply_rejects_unknown_tag(conn):
@@ -1295,7 +1013,7 @@ def test_stopped_outreach_roster_empty_when_none(conn):
 def test_stopped_outreach_roster_lists_a_stopped_recipient(conn):
     append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0,
                  meta={"persona": "recruiter", "company": "Acme"})
-    stop_outreach(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    stop_outreach(conn, "a@x.com")
     result = stopped_outreach_roster(conn)
     assert len(result) == 1
     assert result[0]["recipient"] == "a@x.com"
@@ -1314,7 +1032,7 @@ def test_stopped_outreach_roster_survives_a_later_bounce_overwriting_status(conn
     # (_stopped_recipients()), not the mutable status column.
     append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0,
                  meta={"persona": "recruiter"})
-    stop_outreach(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    stop_outreach(conn, "a@x.com")
     append_event(conn, type="bounce", recipient="a@x.com", campaign="c",
                  meta={"bounce_reason": "mailbox full", "bounce_time": "t1", "category": "bounce"})
 
@@ -1409,7 +1127,7 @@ def app(tmp_path, monkeypatch):
     monkeypatch.setattr("slap.dashboard.threading.Thread", _ImmediateThread)
     db_path = tmp_path / "test.db"
     connect(db_path).close()
-    return create_app(db_path, make_global_config(), consumer_domains=set(), api_key="fake-key",
+    return create_app(db_path, make_global_config(), consumer_domains=set(), imap_config="fake-imap",
                        redis_client=FakeRedis())
 
 
@@ -1596,10 +1314,7 @@ def test_tag_reply_unreal_writes_reply_reviewed_and_never_calls_unsubscribe(conn
     append_event(conn, type="reply", recipient="a@x.com", campaign="c")
     tag_reply(conn, "a@x.com", "real")
 
-    def boom(api_key, email):
-        raise AssertionError("unreal must never call GMass")
-
-    tag_reply(conn, "a@x.com", "unreal", unsubscribe_fn=boom)
+    tag_reply(conn, "a@x.com", "unreal")
     assert reply_tags(conn) == {"a@x.com": "unreal"}
 
 
@@ -1634,7 +1349,7 @@ def test_active_leads_excludes_untagged_and_not_interested(conn):
 
     _stage_and_send(conn, recipient="not_interested@x.com", campaign="c", persona="recruiter")
     append_event(conn, type="reply", recipient="not_interested@x.com", campaign="c")
-    tag_reply(conn, "not_interested@x.com", "not_interested", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    tag_reply(conn, "not_interested@x.com", "not_interested")
 
     assert active_leads(conn) == []
 
@@ -1657,7 +1372,7 @@ def test_active_leads_excludes_stopped_recipient_even_though_still_tagged_real(c
     tag_reply(conn, "a@x.com", "real")
     assert len(active_leads(conn)) == 1
 
-    stop_outreach(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    stop_outreach(conn, "a@x.com")
     assert active_leads(conn) == []
     assert reply_tags(conn)["a@x.com"] == "real"  # the tag itself is untouched
 
@@ -1672,7 +1387,7 @@ def test_active_leads_stays_excluded_after_a_later_bounce_overwrites_status(conn
     _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
     append_event(conn, type="reply", recipient="a@x.com", campaign="c")
     tag_reply(conn, "a@x.com", "real")
-    stop_outreach(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    stop_outreach(conn, "a@x.com")
     assert active_leads(conn) == []
 
     append_event(conn, type="bounce", recipient="a@x.com", campaign="c",
@@ -1734,7 +1449,7 @@ def test_follow_up_reminders_excludes_stopped(conn):
     _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
     append_event(conn, type="reply", recipient="a@x.com", campaign="c")
     tag_reply(conn, "a@x.com", "real")
-    stop_outreach(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    stop_outreach(conn, "a@x.com")
     assert follow_up_reminders(conn) == []
 
 
@@ -1788,7 +1503,7 @@ def test_follow_up_aging_excludes_stopped(conn):
     _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
     append_event(conn, type="reply", recipient="a@x.com", campaign="c")
     tag_reply(conn, "a@x.com", "real")
-    stop_outreach(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    stop_outreach(conn, "a@x.com")
     assert follow_up_aging(conn) == []
 
 
@@ -1839,7 +1554,7 @@ def test_linkedin_replied_at_absent_when_toggled_off(conn):
 
 def test_stop_outreach_writes_stopped_event_and_sets_status(conn):
     _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
-    stop_outreach(conn, "a@x.com", api_key="fake-key", unsubscribe_fn=_fake_unsubscribe)
+    stop_outreach(conn, "a@x.com")
     row = conn.execute("SELECT status FROM recipients WHERE recipient = ?", ("a@x.com",)).fetchone()
     assert row["status"] == "stopped"
     events = [dict(r) for r in conn.execute("SELECT * FROM events WHERE type = 'stopped'")]
@@ -1847,44 +1562,18 @@ def test_stop_outreach_writes_stopped_event_and_sets_status(conn):
     assert json.loads(events[0]["meta"]) == {"scope": "recipient"}
 
 
-def test_stop_outreach_calls_unsubscribe_before_recording_anything_locally(conn):
-    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
-
-    def failing_unsubscribe(api_key, email):
-        raise RuntimeError("simulated GMass failure")
-
-    with pytest.raises(RuntimeError, match="simulated GMass failure"):
-        stop_outreach(conn, "a@x.com", api_key="fake-key", unsubscribe_fn=failing_unsubscribe)
-    assert conn.execute("SELECT * FROM events WHERE type = 'stopped'").fetchone() is None
-    row = conn.execute("SELECT status FROM recipients WHERE recipient = ?", ("a@x.com",)).fetchone()
-    assert row["status"] == "active"
-
-
-def test_stop_outreach_calls_unsubscribe_with_recipient_and_api_key(conn):
-    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
-    captured = {}
-
-    def capturing_unsubscribe(api_key, email):
-        captured["api_key"] = api_key
-        captured["email"] = email
-        return _fake_unsubscribe(api_key, email)
-
-    stop_outreach(conn, "a@x.com", api_key="the-real-key", unsubscribe_fn=capturing_unsubscribe)
-    assert captured == {"api_key": "the-real-key", "email": "a@x.com"}
-
-
 def test_stop_outreach_removes_recipient_from_due_recipients(conn):
     from slap.queue import due_recipients
     _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter", send=False)
     assert len(due_recipients(conn)) == 1
-    stop_outreach(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    stop_outreach(conn, "a@x.com")
     assert due_recipients(conn) == []
 
 
 def test_stop_outreach_does_not_affect_pipeline_for_other_recipients(conn):
     _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
     _stage_and_send(conn, recipient="b@x.com", campaign="c", persona="recruiter")
-    stop_outreach(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    stop_outreach(conn, "a@x.com")
     result = pipeline(conn, make_global_config())
     all_active = [r for stage_list in result["mid_sequence_by_stage"].values() for r in stage_list]
     assert "a@x.com" not in all_active
@@ -1895,7 +1584,7 @@ def test_stop_outreach_does_not_affect_pipeline_for_other_recipients(conn):
 
 def test_reachouts_rows_chip_stopped(conn):
     _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
-    stop_outreach(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    stop_outreach(conn, "a@x.com")
     rows = reachouts_rows(conn)
     row = next(r for r in rows if r["recipient"] == "a@x.com")
     assert row["chip"] == {"color": "critical", "label": "Stopped"}
@@ -1904,7 +1593,7 @@ def test_reachouts_rows_chip_stopped(conn):
 def test_reachouts_rows_chip_stopped_takes_priority_over_replied(conn):
     _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
     append_event(conn, type="reply", recipient="a@x.com", campaign="c")
-    stop_outreach(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    stop_outreach(conn, "a@x.com")
     rows = reachouts_rows(conn)
     row = next(r for r in rows if r["recipient"] == "a@x.com")
     assert row["chip"]["label"] == "Stopped"
@@ -1918,7 +1607,7 @@ def test_reachouts_rows_chip_stays_stopped_after_a_later_bounce_overwrites_statu
     # the row's own `stopped` field (which reachouts.html gates the "Stop
     # outreach" button on) must still be True.
     _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
-    stop_outreach(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    stop_outreach(conn, "a@x.com")
     append_event(conn, type="bounce", recipient="a@x.com", campaign="c",
                  meta={"bounce_reason": "mailbox full", "bounce_time": "t1", "category": "bounce"})
 
@@ -1935,7 +1624,7 @@ def test_reachouts_rows_chip_stays_stopped_after_a_later_bounce_overwrites_statu
 
 def test_gate_linkedin_writes_events_and_sets_status(conn):
     _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
-    gate_linkedin(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    gate_linkedin(conn, "a@x.com")
     row = conn.execute("SELECT status FROM recipients WHERE recipient = ?", ("a@x.com",)).fetchone()
     assert row["status"] == "linkedin-gate"
     # Both events written: the interaction (keeps linkedin_replied True) and the gate.
@@ -1946,49 +1635,29 @@ def test_gate_linkedin_writes_events_and_sets_status(conn):
     assert json.loads(inter["meta"]) == {"channel": "linkedin_reply", "state": True}
 
 
-def test_gate_linkedin_calls_unsubscribe_before_recording_anything(conn):
-    _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
-
-    def failing(api_key, email):
-        raise RuntimeError("simulated GMass failure")
-
-    with pytest.raises(RuntimeError, match="simulated GMass failure"):
-        gate_linkedin(conn, "a@x.com", api_key="k", unsubscribe_fn=failing)
-    assert conn.execute("SELECT * FROM events WHERE type = 'linkedin_gate'").fetchone() is None
-    row = conn.execute("SELECT status FROM recipients WHERE recipient = ?", ("a@x.com",)).fetchone()
-    assert row["status"] == "active"  # unchanged — nothing recorded
-
-
 def test_gate_linkedin_is_idempotent(conn):
     _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
-    calls = []
-
-    def counting(api_key, email):
-        calls.append(email)
-        return _fake_unsubscribe(api_key, email)
-
-    gate_linkedin(conn, "a@x.com", api_key="k", unsubscribe_fn=counting)
-    gate_linkedin(conn, "a@x.com", api_key="k", unsubscribe_fn=counting)  # already gated → no-op
-    assert calls == ["a@x.com"]  # GMass hit exactly once
+    gate_linkedin(conn, "a@x.com")
+    gate_linkedin(conn, "a@x.com")  # already gated → no-op
     assert conn.execute("SELECT COUNT(*) FROM events WHERE type = 'linkedin_gate'").fetchone()[0] == 1
 
 
 def test_gate_linkedin_unknown_recipient_fails_loud(conn):
     with pytest.raises(ValueError, match="unknown recipient"):
-        gate_linkedin(conn, "ghost@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+        gate_linkedin(conn, "ghost@x.com")
 
 
 def test_gate_linkedin_removes_recipient_from_due_recipients(conn):
     from slap.queue import due_recipients
     _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter", send=False)
     assert len(due_recipients(conn)) == 1
-    gate_linkedin(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    gate_linkedin(conn, "a@x.com")
     assert due_recipients(conn) == []
 
 
 def test_reachouts_rows_chip_linkedin_gate(conn):
     _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
-    gate_linkedin(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    gate_linkedin(conn, "a@x.com")
     row = next(r for r in reachouts_rows(conn) if r["recipient"] == "a@x.com")
     assert row["chip"] == {"color": "good", "label": "LinkedIn"}
     assert row["linkedin_gated"] is True
@@ -2000,7 +1669,7 @@ def test_reachouts_rows_chip_stays_linkedin_gate_after_a_later_bounce(conn):
     # Same durability as stopped: a later bounce flips recipients.status, but the
     # gate chip reads the append-only linkedin_gate event, so it holds.
     _stage_and_send(conn, recipient="a@x.com", campaign="c", persona="recruiter")
-    gate_linkedin(conn, "a@x.com", api_key="k", unsubscribe_fn=_fake_unsubscribe)
+    gate_linkedin(conn, "a@x.com")
     append_event(conn, type="bounce", recipient="a@x.com", campaign="c",
                  meta={"bounce_reason": "mailbox full", "bounce_time": "t1", "category": "bounce"})
     assert conn.execute("SELECT status FROM recipients WHERE recipient = ?",
@@ -2304,8 +1973,7 @@ def test_reachouts_rows_queued_next_shoot_none_without_global_config(conn):
 
 def test_reachouts_rows_ooo_next_shoot_is_resume_date(conn):
     _stage_and_send(conn, recipient="ooo@x.com", campaign="c", persona="recruiter")
-    tag_reply(conn, "ooo@x.com", "ooo", resume_date=date(2026, 8, 15),
-              api_key="fake", unsubscribe_fn=_fake_unsubscribe)
+    tag_reply(conn, "ooo@x.com", "ooo", resume_date=date(2026, 8, 15))
     row = reachouts_rows(conn)[0]
     assert row["status"] == "ooo_requeued"
     assert row["next_shoot_at"] == "2026-08-15"
@@ -2397,15 +2065,12 @@ def test_reachouts_rows_reply_tag_none_when_never_replied(conn):
 # ooo_tagged handler and reply_tags()'s resolution rule key off the
 # ooo_tagged event itself, never a prior reply. The real, confirmed gap was
 # that the actual resume date was never surfaced on the row at all.
-# Reuses the module's existing _fake_unsubscribe() helper (defined above,
-# near tag_reply's other tests) rather than a second, redundant fake.
 
 def test_reachouts_rows_ooo_with_zero_prior_reply_shows_status_and_resume_date(conn):
     # The exact case the task calls out as possibly falling through a gap:
     # marking OOO with no prior reply/engagement whatsoever.
     _stage_and_send(conn, recipient="cold@company.com", campaign="c", persona="recruiter")
-    tag_reply(conn, "cold@company.com", "ooo", resume_date=date(2026, 8, 15),
-              api_key="fake", unsubscribe_fn=_fake_unsubscribe)
+    tag_reply(conn, "cold@company.com", "ooo", resume_date=date(2026, 8, 15))
 
     row = reachouts_rows(conn)[0]
     assert row["status"] == "ooo_requeued"
@@ -2454,8 +2119,7 @@ def test_reachouts_rows_status_and_resume_date_revert_after_resume_fires(conn):
     # behavior (requeued's _apply_event_to_cache handler flips status back),
     # pinned here as a regression test.
     _stage_and_send(conn, recipient="cold@company.com", campaign="c", persona="recruiter")
-    tag_reply(conn, "cold@company.com", "ooo", resume_date=date(2026, 7, 1),
-              api_key="fake", unsubscribe_fn=_fake_unsubscribe)
+    tag_reply(conn, "cold@company.com", "ooo", resume_date=date(2026, 7, 1))
     assert reachouts_rows(conn)[0]["status"] == "ooo_requeued"
 
     # Simulate the runner's OOO resend actually firing (cadence exhausted --
@@ -2478,8 +2142,7 @@ def test_reachouts_rows_ooo_resume_date_none_mid_multi_stage_continuation(conn):
     # 'active' between resends) is just the persona's normal inter-stage gap
     # -- not "still OOO" -- so it must not render an OOO resume date either.
     _stage_and_send(conn, recipient="cold@company.com", campaign="c", persona="recruiter")
-    tag_reply(conn, "cold@company.com", "ooo", resume_date=date(2026, 7, 1),
-              api_key="fake", unsubscribe_fn=_fake_unsubscribe)
+    tag_reply(conn, "cold@company.com", "ooo", resume_date=date(2026, 7, 1))
     append_event(conn, type="requeued", recipient="cold@company.com", campaign="c", stage=1,
                  gmass_campaign_id="2", gmass_draft_id="d2",
                  meta={"next_resume_date": "2026-07-10"})
@@ -2503,13 +2166,11 @@ def test_reachouts_rows_ooo_via_widget_and_via_reachouts_render_identically(conn
     ts = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
     _stage_and_send(conn, recipient="widget@x.com", campaign="c", persona="recruiter", timestamp=ts)
     append_event(conn, type="reply", recipient="widget@x.com", campaign="c", timestamp=ts)
-    tag_reply(conn, "widget@x.com", "ooo", resume_date=date(2026, 8, 15),
-              api_key="fake", unsubscribe_fn=_fake_unsubscribe)
+    tag_reply(conn, "widget@x.com", "ooo", resume_date=date(2026, 8, 15))
 
     _stage_and_send(conn, recipient="direct@x.com", campaign="c", persona="recruiter", timestamp=ts)
     append_event(conn, type="reply", recipient="direct@x.com", campaign="c", timestamp=ts)
-    tag_reply(conn, "direct@x.com", "ooo", resume_date=date(2026, 8, 15),
-              api_key="fake", unsubscribe_fn=_fake_unsubscribe)
+    tag_reply(conn, "direct@x.com", "ooo", resume_date=date(2026, 8, 15))
 
     rows = {r["recipient"]: r for r in reachouts_rows(conn)}
     widget_row = {k: v for k, v in rows["widget@x.com"].items() if k != "recipient"}

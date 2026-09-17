@@ -548,9 +548,10 @@ def test_sync_fails_loud_without_config(tmp_path):
     assert not (tmp_path / "slap.db").exists()
 
 
-def test_sync_fails_loud_without_api_key(tmp_path):
+def test_sync_fails_loud_without_app_password(tmp_path):
     # config.yaml + consumer_domains.txt both present so the ONLY missing
-    # thing is the API key (mirrors test_dashboard_fails_loud_without_api_key).
+    # thing is the Gmail App Password (mirrors
+    # test_dashboard_fails_loud_without_app_password).
     (tmp_path / "config.yaml").write_text(
         (Path(__file__).resolve().parent.parent / "config.yaml.example")
         .read_text()
@@ -559,14 +560,14 @@ def test_sync_fails_loud_without_api_key(tmp_path):
     (tmp_path / "consumer_domains.txt").write_text(
         (Path(__file__).resolve().parent.parent / "consumer_domains.txt").read_text()
     )
-    # Explicitly blank, not deleted — see test_dashboard_fails_loud_without_api_key's
+    # Explicitly blank, not deleted — see test_dashboard_fails_loud_without_app_password's
     # own comment: load_dotenv()'s override=False would silently repopulate a
     # deleted key from the real repo-root .env, but never overwrites a key
     # that's already present, even as an empty string.
-    env = {**os.environ, "GMASS_API_KEY": ""}
+    env = {**os.environ, "GMAIL_APP_PASSWORD": ""}
     result = run("sync", cwd=tmp_path, env=env)
     assert result.returncode != 0
-    assert "GMASS_API_KEY" in result.stderr
+    assert "GMAIL_APP_PASSWORD" in result.stderr
 
 
 def test_sync_fails_loud_when_redis_unreachable(tmp_path):
@@ -585,7 +586,9 @@ def test_sync_fails_loud_when_redis_unreachable(tmp_path):
     (tmp_path / "consumer_domains.txt").write_text(
         (Path(__file__).resolve().parent.parent / "consumer_domains.txt").read_text()
     )
-    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    # App password present so the run gets PAST the creds check and reaches the
+    # Redis connect (which is the actual thing under test here).
+    env = {**os.environ, "GMAIL_APP_PASSWORD": "fake-app-password"}
     result = run("sync", cwd=tmp_path, env=env)
     assert result.returncode != 0
     assert "Redis unreachable" in result.stderr
@@ -644,9 +647,9 @@ def test_dashboard_fails_loud_without_config(tmp_path):
     assert not (tmp_path / "slap.db").exists()
 
 
-def test_dashboard_fails_loud_without_api_key(tmp_path):
+def test_dashboard_fails_loud_without_app_password(tmp_path):
     # config.yaml + consumer_domains.txt both present so the ONLY missing
-    # thing is the API key — must fail loud before ever reaching
+    # thing is the Gmail App Password — must fail loud before ever reaching
     # tracking.connect()/create_app()/app.run().
     (tmp_path / "config.yaml").write_text(
         (Path(__file__).resolve().parent.parent / "config.yaml.example")
@@ -661,10 +664,10 @@ def test_dashboard_fails_loud_without_api_key(tmp_path):
     # not the subprocess cwd) and, with its default override=False, would
     # silently repopulate a *deleted* key from that real file — but never
     # overwrites a key that's already present, even as an empty string.
-    env_without_key = {**os.environ, "GMASS_API_KEY": ""}
+    env_without_key = {**os.environ, "GMAIL_APP_PASSWORD": ""}
     result = run("dashboard", cwd=tmp_path, env=env_without_key)
     assert result.returncode != 0
-    assert "GMASS_API_KEY" in result.stderr
+    assert "GMAIL_APP_PASSWORD" in result.stderr
     assert "Traceback" not in result.stderr
     assert not (tmp_path / "slap.db").exists()
 

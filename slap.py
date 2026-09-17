@@ -715,17 +715,17 @@ def cmd_sync(args):
         display.fail(f"slap: {e}")
         sys.exit(1)
 
-    api_key = os.environ.get(global_config.api_key_env, "").strip()
-    if not api_key:
-        display.fail(f"slap: {global_config.api_key_env} is not set — sync needs it to poll GMass. "
-                     f"See .env.example.")
+    if not os.environ.get(smtp.PASSWORD_ENV, "").strip():
+        display.fail(f"slap: {smtp.PASSWORD_ENV} is not set — sync needs it to poll IMAP for "
+                     f"replies. See .env.example.")
         sys.exit(1)
+    imap_config = _imap_config(global_config)
 
     conn = tracking.connect()
     redis_client = gmass_cache.redis_client_from_url(global_config.redis_url)
 
     def do_refresh():
-        return dashboard.compute_gmass_dependent_data(conn, api_key, consumer_domains)
+        return dashboard.compute_gmass_dependent_data(conn, imap_config, consumer_domains)
 
     try:
         result = gmass_cache.refresh_with_lock(redis_client, do_refresh)
@@ -777,11 +777,11 @@ def cmd_dashboard(args):
         display.fail(f"slap: {e}")
         sys.exit(1)
 
-    api_key = os.environ.get(global_config.api_key_env, "").strip()
-    if not api_key:
-        display.fail(f"slap: {global_config.api_key_env} is not set — the dashboard's on-open "
-                     f"GMass poll (replies/clicks/bounces) needs it. See .env.example.")
+    if not os.environ.get(smtp.PASSWORD_ENV, "").strip():
+        display.fail(f"slap: {smtp.PASSWORD_ENV} is not set — the dashboard's on-open "
+                     f"IMAP reply poll needs it. See .env.example.")
         sys.exit(1)
+    imap_config = _imap_config(global_config)
 
     # The dashboard is now a React SPA served from a built bundle (slap/static/
     # dist/). Fail loud with the exact build command if it's missing, same "run
@@ -793,7 +793,7 @@ def cmd_dashboard(args):
         sys.exit(1)
 
     tracking.connect().close()  # ensure the DB file + schema exist before serving
-    app = dashboard.create_app(tracking.DB_PATH, global_config, consumer_domains, api_key)
+    app = dashboard.create_app(tracking.DB_PATH, global_config, consumer_domains, imap_config)
     # Not 5000: macOS's AirPlay Receiver (Control Center) listens there by
     # default on every Mac since Monterey and silently intercepts requests
     # with its own 403 page, making the dashboard look broken when it's
@@ -903,21 +903,16 @@ def cmd_interaction(args):
     conn = tracking.connect()
     try:
         if args.channel == "linkedin-reply":
-            # Marking LinkedIn-replied now HALTS GMass outreach (status
-            # 'linkedin-gate'), so it fires a real GMass unsubscribe and needs
-            # the api key. One-way, like Stop — --off can't clear it.
+            # Marking LinkedIn-replied HALTS outreach (status 'linkedin-gate').
+            # Under SMTP the app owns the cadence, so the gate event alone stops
+            # it — no external suppression call needed. One-way, like Stop —
+            # --off can't clear it.
             if args.off:
                 display.error("linkedin-reply is a one-way gate (like Stop) — --off can't clear it.")
                 return 1
-            global_config = load_global_config()
-            api_key = os.environ.get(global_config.api_key_env, "").strip()
-            if not api_key:
-                display.error(f"{global_config.api_key_env} is not set — the LinkedIn gate halts "
-                              f"GMass outreach and needs it. See .env.example.")
-                return 1
-            dashboard.gate_linkedin(conn, args.recipient, api_key=api_key)
+            dashboard.gate_linkedin(conn, args.recipient)
             display.success(
-                f"Marked {args.recipient} LinkedIn-replied — GMass outreach halted (status linkedin-gate)."
+                f"Marked {args.recipient} LinkedIn-replied — outreach halted (status linkedin-gate)."
             )
         else:  # followed-up
             dashboard.mark_followed_up(conn, args.recipient)
