@@ -2,13 +2,14 @@
 send stages without firing. Also covers OOO re-queue tagging (step 10, §7).
 """
 import json
-from datetime import date
+from datetime import date, datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
 from slap.queue import (
-    QueueError, _pending_ooo_resume_date, due_for_ooo_resend, due_recipients, load_manifest,
-    resend_bounced, stage_recipient, tag_ooo,
+    QueueError, _pending_ooo_resume_date, due_for_followup, due_for_ooo_resend, due_recipients,
+    load_manifest, resend_bounced, stage_recipient, tag_ooo,
 )
 from slap.tracking import append_event, connect
 
@@ -777,3 +778,92 @@ def test_stage_recipient_archive_dir_missing_still_succeeds_with_warning(tmp_pat
     events = [dict(r) for r in conn.execute("SELECT * FROM events")]
     assert len(events) == 1 and events[0]["type"] == "queued"
     assert "skipping archive symlink" in capsys.readouterr().out
+
+
+# --- due_for_followup (app-side follow-up firing, GMass replacement) --------
+
+def _gc(personas=None):
+    return SimpleNamespace(personas=personas or {"recruiter": [2, 3, 5]})
+
+
+def _seed_initial_sent(conn, recipient="a@x.com", campaign="c", persona="recruiter",
+                       cadence=None, day=1, message_id="<init@gmail.com>"):
+    """Seed a recipient with a real initial send on 2026-01-<day>. cadence, when
+    given, is recorded on the queued event (per-recipient override)."""
+    sent_at = datetime(2026, 1, day, 9, tzinfo=timezone.utc)
+    meta = {"persona": persona}
+    if cadence is not None:
+        meta["cadence"] = cadence
+    append_event(conn, type="queued", recipient=recipient, campaign=campaign, stage=0,
+                 meta=meta, timestamp=sent_at)
+    append_event(conn, type="sent", recipient=recipient, campaign=campaign, stage=0,
+                 message_id=message_id, timestamp=sent_at)
+
+
+def test_due_for_followup_empty_before_first_fire_date(tmp_path):
+    conn = connect(tmp_path / "t.db")
+    _seed_initial_sent(conn, cadence=[2, 3, 5], day=1)  # stage1 fires 2026-01-03
+    assert due_for_followup(conn, _gc(), today=date(2026, 1, 2)) == []
+
+
+def test_due_for_followup_includes_recipient_on_stage1_fire_date(tmp_path):
+    conn = connect(tmp_path / "t.db")
+    _seed_initial_sent(conn, cadence=[2, 3, 5], day=1)
+    due = due_for_followup(conn, _gc(), today=date(2026, 1, 3))  # day 0 + 2 = stage 1
+    assert [r["recipient"] for r in due] == ["a@x.com"]
+    assert due[0]["current_stage"] == 0  # next stage to fire is current_stage + 1 = 1
+
+
+def test_due_for_followup_advances_with_current_stage(tmp_path):
+    conn = connect(tmp_path / "t.db")
+    _seed_initial_sent(conn, cadence=[2, 3, 5], day=1)
+    # stage 1 already fired on day 2 -> current_stage=1; stage 2 fires day 0+2+3=5.
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=1,
+                 message_id="<s1@gmail.com>", timestamp=datetime(2026, 1, 3, 9, tzinfo=timezone.utc))
+    assert due_for_followup(conn, _gc(), today=date(2026, 1, 3)) == []  # stage2 not due yet
+    assert [r["recipient"] for r in due_for_followup(conn, _gc(), today=date(2026, 1, 6))] == ["a@x.com"]
+
+
+def test_due_for_followup_excludes_exhausted_cadence(tmp_path):
+    conn = connect(tmp_path / "t.db")
+    _seed_initial_sent(conn, cadence=[2], day=1)  # single follow-up
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=1,
+                 message_id="<s1@gmail.com>", meta={"is_final_stage": True},
+                 timestamp=datetime(2026, 1, 3, 9, tzinfo=timezone.utc))
+    assert due_for_followup(conn, _gc(), today=date(2026, 2, 1)) == []
+
+
+def test_due_for_followup_excludes_replied_recipient(tmp_path):
+    conn = connect(tmp_path / "t.db")
+    _seed_initial_sent(conn, cadence=[2, 3, 5], day=1)
+    append_event(conn, type="reply", recipient="a@x.com", campaign="c")  # -> status 'replied'
+    assert due_for_followup(conn, _gc(), today=date(2026, 1, 3)) == []
+
+
+def test_due_for_followup_excludes_ooo_managed_recipient(tmp_path):
+    conn = connect(tmp_path / "t.db")
+    _seed_initial_sent(conn, cadence=[2, 3, 5], day=1)
+    # OOO'd then resumed back to active — the OOO resend path owns this
+    # recipient's remaining cadence, so the normal follow-up path must skip it.
+    append_event(conn, type="ooo_tagged", recipient="a@x.com", campaign="c",
+                 meta={"resume_date": "2026-01-02"})
+    append_event(conn, type="requeued", recipient="a@x.com", campaign="c", stage=1,
+                 message_id="<r1@gmail.com>")
+    assert due_for_followup(conn, _gc(), today=date(2026, 6, 1)) == []
+
+
+def test_due_for_followup_prefers_recorded_cadence_over_persona_default(tmp_path):
+    conn = connect(tmp_path / "t.db")
+    # recorded [2, 10]; persona default [2, 3, 5] would put stage2 on day 5.
+    _seed_initial_sent(conn, cadence=[2, 10], day=1)
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=1,
+                 message_id="<s1@gmail.com>", timestamp=datetime(2026, 1, 3, 9, tzinfo=timezone.utc))
+    assert due_for_followup(conn, _gc(), today=date(2026, 1, 6)) == []       # not day 12
+    assert [r["recipient"] for r in due_for_followup(conn, _gc(), today=date(2026, 1, 13))] == ["a@x.com"]
+
+
+def test_due_for_followup_falls_back_to_persona_cadence_when_unrecorded(tmp_path):
+    conn = connect(tmp_path / "t.db")
+    _seed_initial_sent(conn, cadence=None, day=1)  # no cadence recorded -> persona [2,3,5]
+    assert due_for_followup(conn, _gc(), today=date(2026, 1, 2)) == []
+    assert [r["recipient"] for r in due_for_followup(conn, _gc(), today=date(2026, 1, 3))] == ["a@x.com"]

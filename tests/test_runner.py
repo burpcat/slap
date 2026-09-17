@@ -1163,3 +1163,87 @@ def test_ooo_cadence_exhausted_recipient_does_not_retry_forever(conn, tmp_path):
         "SELECT COUNT(*) AS n FROM events WHERE recipient = 'jane@acme.com' AND type = 'send_failed'"
     ).fetchone()["n"]
     assert failed_count == 1  # exactly the one terminal marker, never repeated
+
+
+# --- app-side follow-up firing (§10 under SMTP; GMass used to fire these) ---
+
+def test_drain_fires_followup_stage_on_its_cadence_date(conn, tmp_path):
+    gc = make_global_config(tmp_path)
+    stage_one(conn, tmp_path, cadence=[2, 3, 5])  # recruiter; stage bodies s1/s2/s3
+
+    # Initial send today -> records message_id on the recipient.
+    send_init, _ = fake_smtp(message_id="<init@gmail.com>")
+    drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+          send_message_fn=send_init)
+
+    # No follow-up due the same day.
+    send_now, calls_now = fake_smtp(message_id="<fu@gmail.com>")
+    drain(conn, gc, SMTP, now=date.today(), sleep_fn=lambda s: None,
+          workdir_root=tmp_path / "workdir", send_message_fn=send_now)
+    assert calls_now["send"] == 0
+
+    # Stage 1 fires at day 0 + 2: it's sent, threaded into the initial message.
+    send_fu, calls_fu = fake_smtp(message_id="<fu1@gmail.com>")
+    drain(conn, gc, SMTP, now=date.today() + timedelta(days=2), sleep_fn=lambda s: None,
+          workdir_root=tmp_path / "workdir", send_message_fn=send_fu)
+    assert calls_fu["send"] == 1
+    assert calls_fu["last"]["in_reply_to"] == "<init@gmail.com>"
+    assert calls_fu["last"]["body"] == "s1"          # first follow-up body
+    assert calls_fu["last"]["attachment"] is None    # threaded reply, no résumé
+
+    sent_stages = [r["stage"] for r in
+                   conn.execute("SELECT stage FROM events WHERE type='sent' ORDER BY id")]
+    assert sent_stages == [0, 1]
+
+
+def test_drain_followup_suppressed_after_reply(conn, tmp_path):
+    # The stop-on-reply guarantee: a recipient who replied gets no follow-up,
+    # because the `reply` event flips status out of 'active' and due_for_followup
+    # only selects active recipients.
+    gc = make_global_config(tmp_path)
+    stage_one(conn, tmp_path, cadence=[2, 3, 5])
+    send_init, _ = fake_smtp()
+    drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+          send_message_fn=send_init)
+    append_event(conn, type="reply", recipient="jane@acme.com", campaign="c")
+
+    send_fu, calls_fu = fake_smtp()
+    drain(conn, gc, SMTP, now=date.today() + timedelta(days=2), sleep_fn=lambda s: None,
+          workdir_root=tmp_path / "workdir", send_message_fn=send_fu)
+    assert calls_fu["send"] == 0
+
+
+def test_drain_final_followup_marks_recipient_done(conn, tmp_path):
+    gc = make_global_config(tmp_path)
+    stage_one(conn, tmp_path, cadence=[2])  # single follow-up = the final stage
+    send_init, _ = fake_smtp()
+    drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+          send_message_fn=send_init)
+
+    send_fu, _ = fake_smtp()
+    drain(conn, gc, SMTP, now=date.today() + timedelta(days=2), sleep_fn=lambda s: None,
+          workdir_root=tmp_path / "workdir", send_message_fn=send_fu)
+
+    row = conn.execute(
+        "SELECT status, current_stage FROM recipients WHERE recipient = 'jane@acme.com'"
+    ).fetchone()
+    assert row["status"] == "done"      # is_final_stage on the last stage
+    assert row["current_stage"] == 1
+
+
+def test_drain_followup_chains_the_reply_thread(conn, tmp_path):
+    # Each follow-up threads into the PREVIOUS message (recipients.message_id is
+    # advanced by every send), producing a proper reply chain rather than always
+    # replying to the initial.
+    gc = make_global_config(tmp_path)
+    stage_one(conn, tmp_path, cadence=[2, 3, 5])
+    drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+          send_message_fn=fake_smtp(message_id="<init@gmail.com>")[0])
+    drain(conn, gc, SMTP, now=date.today() + timedelta(days=2), sleep_fn=lambda s: None,
+          workdir_root=tmp_path / "workdir", send_message_fn=fake_smtp(message_id="<fu1@gmail.com>")[0])
+
+    send_fu2, calls2 = fake_smtp(message_id="<fu2@gmail.com>")
+    drain(conn, gc, SMTP, now=date.today() + timedelta(days=5), sleep_fn=lambda s: None,
+          workdir_root=tmp_path / "workdir", send_message_fn=send_fu2)
+    assert calls2["send"] == 1
+    assert calls2["last"]["in_reply_to"] == "<fu1@gmail.com>"  # threads into stage 1, not the initial

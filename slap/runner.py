@@ -42,7 +42,9 @@ from pathlib import Path
 
 from slap import doctor, smtp, stages
 from slap.latex import WORKDIR_ROOT, recipient_workdir
-from slap.queue import due_for_ooo_resend, due_for_remind, due_recipients, load_manifest
+from slap.queue import (
+    due_for_followup, due_for_ooo_resend, due_for_remind, due_recipients, load_manifest,
+)
 from slap.tracking import append_event
 
 
@@ -382,6 +384,67 @@ def _send_ooo_resend(conn, smtp_config, row: dict, *, workdir_root: Path = WORKD
     return True
 
 
+def _send_followup(conn, smtp_config, row: dict, *, workdir_root: Path = WORKDIR_ROOT,
+                   send_message_fn=smtp.send_message, sender_name: str = None) -> bool:
+    """Fire the recipient's next normal-cadence follow-up stage as a reply
+    threaded into their original conversation. This is the app-side replacement
+    for a GMass server-side stage: the same reply-in-thread shape as
+    _send_ooo_resend (In-Reply-To the recipient's stored message_id, reusing the
+    staged stage body, no re-attached résumé), but on the NORMAL cadence — so it
+    records a `sent` event advancing current_stage (not a `requeued`), and marks
+    the sequence `done` via is_final_stage when the last stage fires.
+
+    Selection/idempotency is owned by slap.queue.due_for_followup (which gates on
+    fire date and current_stage); this function just sends the stage that query
+    identified. The cadence-exhausted guard here is pure defense in depth — the
+    due query already excludes exhausted recipients."""
+    recipient, campaign = row["recipient"], row["campaign"]
+    workdir = recipient_workdir(campaign, recipient, root=workdir_root)
+
+    try:
+        manifest = load_manifest(workdir)
+        cadence = manifest["cadence"]
+        stage_bodies = manifest["stage_bodies"]
+    except Exception as e:
+        append_event(conn, type="send_failed", recipient=recipient, campaign=campaign,
+                     meta={"stage": "load_staged_data_followup", "error": str(e)})
+        return False
+
+    next_stage = row["current_stage"] + 1
+    if next_stage > len(cadence):
+        append_event(conn, type="send_failed", recipient=recipient, campaign=campaign,
+                     meta={"stage": "followup_cadence_exhausted",
+                           "error": f"no next stage — current_stage={row['current_stage']}, "
+                                    f"cadence has {len(cadence)} stage(s)"})
+        return False
+
+    try:
+        stage_body = stage_bodies[next_stage - 1]
+        reply_to_message_id = row["message_id"]
+        if not reply_to_message_id:
+            raise RunnerError("no prior message_id to thread the follow-up into")
+        subject = f"Re: {manifest['subject']}"
+    except Exception as e:
+        append_event(conn, type="send_failed", recipient=recipient, campaign=campaign,
+                     meta={"stage": "load_staged_data_followup", "error": str(e)})
+        return False
+
+    try:
+        sent = send_message_fn(
+            smtp_config, sender=smtp_config.user, sender_name=sender_name,
+            recipient=recipient, subject=subject, body=stage_body,
+            in_reply_to=reply_to_message_id,
+        )
+    except Exception as e:
+        append_event(conn, type="send_failed", recipient=recipient, campaign=campaign,
+                     meta={"stage": "send_message_followup", "error": str(e)})
+        return False
+
+    append_event(conn, type="sent", recipient=recipient, campaign=campaign, stage=next_stage,
+                 message_id=sent["message_id"], meta={"is_final_stage": next_stage == len(cadence)})
+    return True
+
+
 def _send_remind(conn, smtp_config, row: dict, *, workdir_root: Path = WORKDIR_ROOT,
                  send_message_fn=smtp.send_message, sender_name: str = None) -> bool:
     """Fire a one-shot Remind (Engagement/reach-out Remind action) as a reply
@@ -475,17 +538,28 @@ def drain(conn, global_config, smtp_config, *, now: date = None, sleep_fn=time.s
     # query can never resend to the same recipient twice in one batch.
     due_initial = due_recipients(conn)
     due_ooo = due_for_ooo_resend(conn, today=today)
+    # Follow-up stages (§10): under SMTP the app fires stages 1..N itself (GMass
+    # used to fire them server-side). due_for_followup selects the next
+    # normal-cadence stage that's due today and excludes any OOO-managed
+    # recipient (owned by the OOO list above on its pause schedule), so the two
+    # never fire the same stage — dispatched via _send_followup on this same
+    # cap-bounded batch, just like every other send.
+    due_followup = due_for_followup(conn, global_config, today=today)
     # Reminds (one-shot manual nudges) fire on the same runner cadence as
     # everything else — just more rows in the same cap-bounded batch, dispatched
-    # via _send_remind. A recipient already dispatched this drain (initial or
-    # OOO) is excluded, belt-and-suspenders against any double-send.
+    # via _send_remind. A recipient already dispatched this drain (initial/OOO/
+    # follow-up) is excluded, belt-and-suspenders against any double-send.
     due_remind = due_for_remind(conn)
     initial_recipients = {row["recipient"] for row in due_initial}
     ooo_recipients = {row["recipient"] for row in due_ooo}
+    followup_recipients = {row["recipient"] for row in due_followup}
     due = ([(row, _send_one) for row in due_initial]
            + [(row, _send_ooo_resend) for row in due_ooo if row["recipient"] not in initial_recipients]
+           + [(row, _send_followup) for row in due_followup
+              if row["recipient"] not in initial_recipients and row["recipient"] not in ooo_recipients]
            + [(row, _send_remind) for row in due_remind
-              if row["recipient"] not in initial_recipients and row["recipient"] not in ooo_recipients])
+              if row["recipient"] not in initial_recipients and row["recipient"] not in ooo_recipients
+              and row["recipient"] not in followup_recipients])
     to_send = due[:headroom]
 
     sent_count = 0
@@ -521,7 +595,7 @@ def drain(conn, global_config, smtp_config, *, now: date = None, sleep_fn=time.s
             failed_count += 1
 
     remaining = (len(due_recipients(conn)) + len(due_for_ooo_resend(conn, today=today))
-                 + len(due_for_remind(conn)))
+                 + len(due_for_followup(conn, global_config, today=today)) + len(due_for_remind(conn)))
     append_event(conn, type="run_completed",
                  meta={"sent": sent_count, "failed": failed_count, "remaining_queued": remaining})
     return DrainResult(ran=True, sent=sent_count, failed=failed_count, remaining_queued=remaining)
