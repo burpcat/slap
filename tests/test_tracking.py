@@ -176,6 +176,37 @@ def test_requeued_advances_stage_and_campaign_id_like_sent_does(conn):
     assert row["last_gmass_campaign_id"] == "2"
 
 
+# --- message_id (SMTP threading + reply-match key) ---------------------
+
+def test_sent_populates_message_id_on_event_and_recipient(conn):
+    # The SMTP Message-ID rides on the sent event and lands on the recipient
+    # cache (superseding last_gmass_campaign_id's threading role).
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0)
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=0,
+                 message_id="<init-1@gmail.com>")
+    assert recipient_row(conn, "a@x.com")["message_id"] == "<init-1@gmail.com>"
+    ev = [e for e in all_events(conn) if e["type"] == "sent"][0]
+    assert ev["message_id"] == "<init-1@gmail.com>"
+
+
+def test_requeued_updates_message_id_like_sent_does(conn):
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0)
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=0,
+                 message_id="<init@gmail.com>")
+    append_event(conn, type="requeued", recipient="a@x.com", campaign="c", stage=1,
+                 message_id="<resend@gmail.com>")
+    assert recipient_row(conn, "a@x.com")["message_id"] == "<resend@gmail.com>"
+
+
+def test_rebuild_reproduces_message_id_column_identically(conn):
+    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0)
+    append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=0,
+                 message_id="<init@gmail.com>")
+    live = recipient_row(conn, "a@x.com")
+    rebuild(conn)
+    assert recipient_row(conn, "a@x.com") == live
+
+
 def test_click_does_not_change_status(conn):
     append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0)
     append_event(conn, type="sent", recipient="a@x.com", campaign="c", stage=0, timestamp=_ts(1))
@@ -788,6 +819,86 @@ def test_linkedin_gate_migration_is_idempotent(tmp_path):
     path = tmp_path / "post_interaction.db"
     raw = sqlite3.connect(path)
     raw.executescript(_pre_linkedin_gate_events_table_sql())
+    raw.commit()
+    raw.close()
+
+    connect(path).close()
+    connect(path).close()  # second connect on an already-migrated db must not raise
+
+
+# --- message_id columns: additive migration for a pre-existing db ------
+
+def _pre_message_id_schema_sql():
+    # events (already on the latest CHECK constraint, so the check-constraint
+    # migration is a no-op) + recipients, both WITHOUT the message_id column —
+    # a real owner's slap.db from just before the GMass->SMTP migration.
+    return """
+    CREATE TABLE events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        recipient TEXT,
+        campaign TEXT,
+        type TEXT NOT NULL CHECK (type IN (
+            'queued','draft_created','sent','click','reply','bounce','ooo_tagged','requeued',
+            'reply_reviewed','run_started','run_completed','send_failed','run_failed','stopped',
+            'interaction','linkedin_gate'
+        )),
+        stage INTEGER,
+        gmass_campaign_id TEXT,
+        gmass_draft_id TEXT,
+        meta TEXT
+    );
+    CREATE TABLE recipients (
+        recipient TEXT PRIMARY KEY,
+        campaign TEXT,
+        persona TEXT,
+        status TEXT,
+        current_stage INTEGER,
+        last_gmass_campaign_id TEXT,
+        first_sent_at TEXT,
+        last_event_at TEXT,
+        replied_at TEXT,
+        cadence TEXT
+    );
+    """
+
+
+def test_connect_adds_message_id_columns_to_a_pre_existing_db(tmp_path):
+    path = tmp_path / "pre_message_id.db"
+    raw = sqlite3.connect(path)
+    raw.executescript(_pre_message_id_schema_sql())
+    raw.execute(
+        "INSERT INTO events (timestamp, recipient, campaign, type, stage, gmass_campaign_id) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("2026-01-01T00:00:00+00:00", "a@x.com", "c", "sent", 0, "old-campaign-9"),
+    )
+    # The fixture genuinely lacks message_id — a raw insert into it errors.
+    with pytest.raises(sqlite3.OperationalError):
+        raw.execute("INSERT INTO events (timestamp, type, message_id) VALUES (?, ?, ?)",
+                    ("2026-01-01T00:00:00+00:00", "queued", "<x@gmail.com>"))
+    raw.commit()
+    raw.close()
+
+    migrated = connect(path)
+    # Both tables gained the column; the pre-existing history survived untouched.
+    for table in ("events", "recipients"):
+        cols = {r[1] for r in migrated.execute(f"PRAGMA table_info({table})")}
+        assert "message_id" in cols
+    rows = all_events(migrated)
+    assert len(rows) == 1 and rows[0]["gmass_campaign_id"] == "old-campaign-9"
+    assert rows[0]["message_id"] is None  # old row has no message_id, never fabricated
+
+    # A new SMTP-style send now records message_id end to end.
+    append_event(migrated, type="queued", recipient="b@x.com", campaign="c", stage=0)
+    append_event(migrated, type="sent", recipient="b@x.com", campaign="c", stage=0,
+                 message_id="<new@gmail.com>")
+    assert recipient_row(migrated, "b@x.com")["message_id"] == "<new@gmail.com>"
+
+
+def test_message_id_migration_is_idempotent(tmp_path):
+    path = tmp_path / "pre_message_id.db"
+    raw = sqlite3.connect(path)
+    raw.executescript(_pre_message_id_schema_sql())
     raw.commit()
     raw.close()
 
