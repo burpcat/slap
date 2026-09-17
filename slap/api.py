@@ -614,12 +614,13 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, ima
             return jsonify({"error": str(e)}), 404
         return jsonify({"ok": True})
 
-    @app.route("/api/gmass/refresh", methods=["POST"])
-    def api_gmass_refresh():
-        # Mirrors gmass_refresh() -- manual escalation of
-        # get_gmass_dependent_data's own background refresh. Reports
-        # redis-unavailability in the body (200) rather than a redirect,
-        # since there's no page to redirect a JSON caller back to.
+    @app.route("/api/refresh", methods=["POST"])
+    def api_refresh():
+        # Manual escalation of get_gmass_dependent_data's own background refresh
+        # (now an IMAP reply poll, not a GMass poll — route renamed from the
+        # legacy /api/gmass/refresh). Reports redis-unavailability in the body
+        # (200) rather than a redirect, since there's no page to redirect a
+        # JSON caller back to.
         try:
             gmass_cache.ping(redis_client)
         except gmass_cache.RedisUnavailable:

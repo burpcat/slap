@@ -170,10 +170,10 @@ export function useRemind(recipient: string) {
   });
 }
 
-export function useGmassRefresh() {
+export function useRefresh() {
   const invalidate = useInvalidateAfter([['home'], ['pipeline'], ['engagement'], ['sync-status']]);
   return useMutation({
-    mutationFn: () => apiPost<{ ok: boolean; reason?: string }>('/api/gmass/refresh', {}),
+    mutationFn: () => apiPost<{ ok: boolean; reason?: string }>('/api/refresh', {}),
     onSuccess: invalidate,
   });
 }

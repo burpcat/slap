@@ -1,4 +1,4 @@
-import { useGmassRefresh, useSyncStatus } from '../api/hooks';
+import { useRefresh, useSyncStatus } from '../api/hooks';
 import { Button } from './primitives/Button';
 import styles from './SyncBanner.module.css';
 
@@ -15,7 +15,7 @@ function formatSyncedAt(iso: string | null): string {
  * (a silently-stopped launchd job), same as base.html's global banner. */
 export function SyncBanner({ runnerWarning }: { runnerWarning: string | null }) {
   const { data, isLoading } = useSyncStatus();
-  const refresh = useGmassRefresh();
+  const refresh = useRefresh();
 
   const cacheStatus = data?.cache_status;
   const syncedAt = data?.sync_result.synced_at ?? null;

@@ -482,13 +482,13 @@ def test_api_hide_and_unhide_warm_but_silent(app, tmp_path):
     assert unhidden["warm_but_silent_hidden_count"] == 0
 
 
-def test_api_gmass_refresh_ok(app):
-    resp = app.test_client().post("/api/gmass/refresh")
+def test_api_refresh_ok(app):
+    resp = app.test_client().post("/api/refresh")
     assert resp.status_code == 200
     assert resp.get_json() == {"ok": True}
 
 
-def test_api_gmass_refresh_redis_unavailable(tmp_path, monkeypatch):
+def test_api_refresh_redis_unavailable(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("slap.dashboard.threading.Thread", _ImmediateThread)
     db_path = tmp_path / "test.db"
@@ -496,7 +496,7 @@ def test_api_gmass_refresh_redis_unavailable(tmp_path, monkeypatch):
     down_app = create_app(db_path, make_global_config(), consumer_domains=set(), imap_config="fake-imap",
                            redis_client=FakeRedisDown())
 
-    resp = down_app.test_client().post("/api/gmass/refresh")
+    resp = down_app.test_client().post("/api/refresh")
     assert resp.status_code == 200
     assert resp.get_json() == {"ok": False, "reason": "redis_unavailable"}
 
