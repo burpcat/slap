@@ -120,7 +120,7 @@ def test_send_fails_loud_when_doctor_preflight_fails(tmp_path):
         (campaign / f"stage{i}.txt").write_text(f"stage {i}\n")
     # resume.pdf deliberately never created.
 
-    env_with_key = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    env_with_key = {**os.environ, "GMAIL_APP_PASSWORD": "fake-app-password"}
     result = run("send", "coldpost", cwd=tmp_path, env=env_with_key)
     assert result.returncode != 0
     assert "doctor preflight failed" in result.stderr
@@ -176,7 +176,7 @@ def test_send_never_leaks_ansi_into_the_staged_message_even_with_color_forced(tm
     # drop, proceed-anyway, follow-ups-default, stage-this-send, no-more
     scripted_stdin = f"{drop}\n<<<EOF>>>\ny\n\ny\nn\n"
 
-    env_with_key = {**os.environ, "GMASS_API_KEY": "fake-key", "FORCE_COLOR": "1"}
+    env_with_key = {**os.environ, "GMAIL_APP_PASSWORD": "fake-app-password", "FORCE_COLOR": "1"}
     env_with_key.pop("NO_COLOR", None)
     env_with_key.setdefault("RESUME_ARCHIVE_DIR", "")  # hermetic — see run()'s own comment above
     result = subprocess.run(
@@ -231,7 +231,7 @@ def test_send_warns_about_empty_declared_fields_but_does_not_block(tmp_path):
     drop = f"Email: {recipient}\nCompany: Acme\n"  # Req ID deliberately omitted -- stays empty
     scripted_stdin = f"{drop}\n<<<EOF>>>\n\ny\nn\n"  # drop, follow-ups-default, stage-this-send, no-more
 
-    env_with_key = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    env_with_key = {**os.environ, "GMAIL_APP_PASSWORD": "fake-app-password"}
     result = run("send", "coldpost", cwd=tmp_path, env=env_with_key, input=scripted_stdin)
 
     assert result.returncode == 0, result.stderr
@@ -245,7 +245,7 @@ def test_send_no_empty_fields_warning_when_everything_is_filled(tmp_path):
     drop = f"Email: {recipient}\nCompany: Acme\nReq ID: 6900\n"
     scripted_stdin = f"{drop}\n<<<EOF>>>\n\ny\nn\n"  # drop, follow-ups-default, stage-this-send, no-more
 
-    env_with_key = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    env_with_key = {**os.environ, "GMAIL_APP_PASSWORD": "fake-app-password"}
     result = run("send", "coldpost", cwd=tmp_path, env=env_with_key, input=scripted_stdin)
 
     assert result.returncode == 0, result.stderr
@@ -264,7 +264,7 @@ def test_send_stray_old_terminator_line_inside_paste_does_not_truncate(tmp_path)
     drop = f"Email: {recipient}\nCompany: Acme\nEOF\nReq ID: 6900\n"
     scripted_stdin = f"{drop}\n<<<EOF>>>\n\ny\nn\n"  # drop, follow-ups-default, stage-this-send, no-more
 
-    env_with_key = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    env_with_key = {**os.environ, "GMAIL_APP_PASSWORD": "fake-app-password"}
     result = run("send", "coldpost", cwd=tmp_path, env=env_with_key, input=scripted_stdin)
 
     assert result.returncode == 0, result.stderr
@@ -306,7 +306,7 @@ def test_send_unified_routes_consecutive_drops_to_their_own_campaigns(tmp_path):
         "<<<EOF>>>", "", "y", "n", "",      # follow-ups default, stage, stop
     ])
 
-    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    env = {**os.environ, "GMAIL_APP_PASSWORD": "fake-app-password"}
     result = run("send", cwd=tmp_path, env=env, input=scripted_stdin)  # bare `send` = unified
 
     assert result.returncode == 0, result.stdout + result.stderr
@@ -336,7 +336,7 @@ def test_send_unified_fails_loud_per_drop_but_keeps_looping(tmp_path):
         "<<<EOF>>>", "", "y", "n", "",
     ])
 
-    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    env = {**os.environ, "GMAIL_APP_PASSWORD": "fake-app-password"}
     result = run("send", cwd=tmp_path, env=env, input=scripted_stdin)
 
     assert result.returncode == 0, result.stdout + result.stderr
@@ -383,7 +383,7 @@ def test_send_resume_flag_forces_the_named_resume_and_skips_picker(tmp_path):
     recipient = "jane@acme.com"
     drop = f"Email: {recipient}\nCompany: Acme\n"
     scripted_stdin = f"{drop}\n<<<EOF>>>\n\ny\nn\n"  # drop, follow-ups-default, stage, no-more
-    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    env = {**os.environ, "GMAIL_APP_PASSWORD": "fake-app-password"}
 
     result = run("send", "coldpost", "--resume", "alt", cwd=tmp_path, env=env, input=scripted_stdin)
 
@@ -396,7 +396,7 @@ def test_send_resume_flag_forces_the_named_resume_and_skips_picker(tmp_path):
 
 def test_send_resume_unknown_tag_fails_loud_before_staging(tmp_path):
     _setup_two_resume_campaign(tmp_path)
-    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    env = {**os.environ, "GMAIL_APP_PASSWORD": "fake-app-password"}
     # No input piped: must fail loud on the bad tag BEFORE reading any drop.
     result = run("send", "coldpost", "--resume", "nope", cwd=tmp_path, env=env)
     assert result.returncode != 0
@@ -414,7 +414,7 @@ def test_send_resume_tag_not_offered_by_locked_campaign_fails_loud(tmp_path):
         "cadence: [2, 3, 5]\nresumes: [alt]\n"
         "fields:\n  - { key: email, label: Email }\n  - { key: company, label: Company }\n"
     )
-    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    env = {**os.environ, "GMAIL_APP_PASSWORD": "fake-app-password"}
     result = run("send", "coldpost", "--resume", "default", cwd=tmp_path, env=env)
     assert result.returncode != 0
     assert "doesn't offer résumé 'default'" in result.stderr
@@ -426,7 +426,7 @@ def test_send_interactive_picker_selects_chosen_resume(tmp_path):
     drop = f"Email: {recipient}\nCompany: Acme\n"
     # drop, PICK résumé #2 (alt), follow-ups-default, stage, no-more
     scripted_stdin = f"{drop}\n<<<EOF>>>\n2\n\ny\nn\n"
-    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    env = {**os.environ, "GMAIL_APP_PASSWORD": "fake-app-password"}
 
     result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
 
@@ -441,7 +441,7 @@ def test_send_single_resume_campaign_shows_no_picker(tmp_path):
     recipient = "jane@acme.com"
     drop = f"Email: {recipient}\nCompany: Acme\n"
     scripted_stdin = f"{drop}\n<<<EOF>>>\n\ny\nn\n"
-    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    env = {**os.environ, "GMAIL_APP_PASSWORD": "fake-app-password"}
     result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Pick a résumé" not in result.stdout  # single résumé → attached silently
@@ -455,16 +455,16 @@ def test_doctor_fails_loud_without_config(tmp_path):
     assert "Traceback" not in (result.stdout + result.stderr)
 
 
-def test_doctor_reports_missing_api_key(tmp_path):
+def test_doctor_reports_missing_app_password(tmp_path):
     (tmp_path / "config.yaml").write_text(
         (Path(__file__).resolve().parent.parent / "config.yaml.example")
         .read_text()
         .replace("<Owner Name>", "Test Owner")
     )
-    env_without_key = {**os.environ, "GMASS_API_KEY": ""}
+    env_without_key = {**os.environ, "GMAIL_APP_PASSWORD": ""}
     result = run("doctor", cwd=tmp_path, env=env_without_key)
     assert result.returncode != 0
-    assert "GMASS_API_KEY: FAIL" in result.stdout
+    assert "GMAIL_APP_PASSWORD: FAIL" in result.stdout
 
 
 def test_doctor_seeds_missing_consumer_domains_and_passes(tmp_path):
@@ -473,7 +473,7 @@ def test_doctor_seeds_missing_consumer_domains_and_passes(tmp_path):
         .read_text()
         .replace("<Owner Name>", "Test Owner")
     )
-    env_with_key = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    env_with_key = {**os.environ, "GMAIL_APP_PASSWORD": "fake-app-password"}
     result = run("doctor", cwd=tmp_path, env=env_with_key)
     assert result.returncode == 0
     assert "All checks passed." in result.stdout
@@ -504,7 +504,7 @@ def test_doctor_reports_campaign_attachment_issues(tmp_path):
         (broken / f"stage{i}.txt").write_text(f"stage {i}\n")
     # resume.pdf deliberately never created.
 
-    env_with_key = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    env_with_key = {**os.environ, "GMAIL_APP_PASSWORD": "fake-app-password"}
     result = run("doctor", cwd=tmp_path, env=env_with_key)
     assert result.returncode != 0
     assert "campaign 'broken-campaign': FAIL" in result.stdout
@@ -871,7 +871,7 @@ def test_send_offers_resume_reuse_on_soft_warn_and_accepted(tmp_path):
     # drop, proceed-anyway, reuse #1, follow-ups-default, stage, no-more
     scripted_stdin = f"{drop}\n<<<EOF>>>\ny\n1\n\ny\nn\n"
 
-    env = {**os.environ, "GMASS_API_KEY": "fake-key", "RESUME_ARCHIVE_DIR": str(archive_dir)}
+    env = {**os.environ, "GMAIL_APP_PASSWORD": "fake-app-password", "RESUME_ARCHIVE_DIR": str(archive_dir)}
     result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
 
     assert result.returncode == 0, result.stdout + result.stderr
@@ -907,7 +907,7 @@ def test_send_offers_resume_reuse_multiple_matches_selects_correct_one(tmp_path)
     drop = f"Email: {recipient}\nCompany: Acme\nRole: Staff Engineer\n"
     scripted_stdin = f"{drop}\n<<<EOF>>>\ny\n2\n\ny\nn\n"  # pick the 2nd listed match, follow-ups-default
 
-    env = {**os.environ, "GMASS_API_KEY": "fake-key", "RESUME_ARCHIVE_DIR": str(archive_dir)}
+    env = {**os.environ, "GMAIL_APP_PASSWORD": "fake-app-password", "RESUME_ARCHIVE_DIR": str(archive_dir)}
     result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
 
     assert result.returncode == 0, result.stdout + result.stderr
@@ -933,7 +933,7 @@ def test_send_soft_warn_no_archive_matches_falls_through_no_prompt(tmp_path):
     # drop, proceed-anyway, stage, no-more (NO reuse prompt), follow-ups-default before stage
     scripted_stdin = f"{drop}\n<<<EOF>>>\ny\n\ny\nn\n"
 
-    env = {**os.environ, "GMASS_API_KEY": "fake-key", "RESUME_ARCHIVE_DIR": str(archive_dir)}
+    env = {**os.environ, "GMAIL_APP_PASSWORD": "fake-app-password", "RESUME_ARCHIVE_DIR": str(archive_dir)}
     result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
 
     assert result.returncode == 0, result.stdout + result.stderr
@@ -950,7 +950,7 @@ def test_send_soft_warn_archive_dir_unset_falls_through_no_prompt_no_error(tmp_p
     drop = f"Email: {recipient}\nCompany: Acme\nRole: Staff Engineer\n"
     scripted_stdin = f"{drop}\n<<<EOF>>>\ny\n\ny\nn\n"  # proceed-anyway, follow-ups-default, stage, no-more
 
-    env = {**os.environ, "GMASS_API_KEY": "fake-key", "RESUME_ARCHIVE_DIR": ""}  # archiving off (blank), hermetic
+    env = {**os.environ, "GMAIL_APP_PASSWORD": "fake-app-password", "RESUME_ARCHIVE_DIR": ""}  # archiving off (blank), hermetic
     result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
 
     assert result.returncode == 0, result.stdout + result.stderr
@@ -974,7 +974,7 @@ def test_send_declining_resume_reuse_uses_default(tmp_path):
     # drop, proceed-anyway, DECLINE reuse, follow-ups-default, stage, no-more
     scripted_stdin = f"{drop}\n<<<EOF>>>\ny\n0\n\ny\nn\n"
 
-    env = {**os.environ, "GMASS_API_KEY": "fake-key", "RESUME_ARCHIVE_DIR": str(archive_dir)}
+    env = {**os.environ, "GMAIL_APP_PASSWORD": "fake-app-password", "RESUME_ARCHIVE_DIR": str(archive_dir)}
     result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
 
     assert result.returncode == 0, result.stdout + result.stderr
@@ -1017,7 +1017,7 @@ def test_send_reuse_of_broken_archive_entry_fails_loud_for_that_recipient_only(t
         "",
     ])
 
-    env = {**os.environ, "GMASS_API_KEY": "fake-key", "RESUME_ARCHIVE_DIR": str(archive_dir)}
+    env = {**os.environ, "GMAIL_APP_PASSWORD": "fake-app-password", "RESUME_ARCHIVE_DIR": str(archive_dir)}
     result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
 
     assert result.returncode == 0, result.stdout + result.stderr
@@ -1101,7 +1101,7 @@ def test_send_substitutes_configured_signature_in_initial_and_stage_files(tmp_pa
     drop = f"Email: {recipient}\nCompany: Acme\nSignoff: Best\n"
     scripted_stdin = f"{drop}\n<<<EOF>>>\n\ny\nn\n"  # drop, follow-ups-default, stage, no-more
 
-    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    env = {**os.environ, "GMAIL_APP_PASSWORD": "fake-app-password"}
     result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
 
     assert result.returncode == 0, result.stdout + result.stderr
@@ -1116,7 +1116,7 @@ def test_send_substitutes_configured_signature_in_initial_and_stage_files(tmp_pa
 
 def test_send_fails_loud_when_signature_missing_before_reading_stdin(tmp_path):
     _setup_signature_campaign(tmp_path, signature_key_present=False)
-    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    env = {**os.environ, "GMAIL_APP_PASSWORD": "fake-app-password"}
     # No `input=` at all -- if this didn't fail before ever reading stdin,
     # the subprocess would hang waiting for a drop paste and the test would
     # time out instead of returning promptly.
@@ -1133,7 +1133,7 @@ def test_send_empty_signature_renders_blank_with_no_error(tmp_path):
     drop = f"Email: {recipient}\nCompany: Acme\nSignoff: Best\n"
     scripted_stdin = f"{drop}\n<<<EOF>>>\n\ny\nn\n"  # drop, follow-ups-default, stage, no-more
 
-    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    env = {**os.environ, "GMAIL_APP_PASSWORD": "fake-app-password"}
     result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
 
     assert result.returncode == 0, result.stdout + result.stderr
@@ -1280,7 +1280,7 @@ def _stage_via_send(tmp_path, *, recipient="jane@acme.com", company="Acme"):
     _setup_three_field_campaign(tmp_path)
     drop = f"Email: {recipient}\nCompany: {company}\n"
     scripted_stdin = f"{drop}\n<<<EOF>>>\n\ny\nn\n"  # drop, follow-ups-default, stage-this-send, no-more
-    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    env = {**os.environ, "GMAIL_APP_PASSWORD": "fake-app-password"}
     result = run("send", "coldpost", cwd=tmp_path, env=env, input=scripted_stdin)
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -1311,7 +1311,7 @@ def test_template_reload_applies_edited_template_on_confirm(tmp_path):
         "Subject: Hi from {{company}}\n\nHello there, {{company}} folks!\n"
     )
 
-    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    env = {**os.environ, "GMAIL_APP_PASSWORD": "fake-app-password"}
     result = run("template-reload", cwd=tmp_path, env=env, input="y\n")
 
     assert result.returncode == 0, result.stdout + result.stderr
@@ -1337,7 +1337,7 @@ def test_template_reload_declining_confirm_leaves_staged_content_untouched(tmp_p
         "Subject: Hi from {{company}}\n\nHello there, {{company}} folks!\n"
     )
 
-    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    env = {**os.environ, "GMAIL_APP_PASSWORD": "fake-app-password"}
     result = run("template-reload", cwd=tmp_path, env=env, input="n\n")
 
     assert result.returncode == 0, result.stdout + result.stderr
@@ -1362,7 +1362,7 @@ def test_template_reload_missing_placeholder_reported_in_failures_file(tmp_path)
     )
     campaign_dir.joinpath("stage1.txt").write_text("stage 1: {{special_note}}\n")
 
-    env = {**os.environ, "GMASS_API_KEY": "fake-key"}
+    env = {**os.environ, "GMAIL_APP_PASSWORD": "fake-app-password"}
     result = run("template-reload", cwd=tmp_path, env=env)
 
     assert result.returncode == 0, result.stdout + result.stderr

@@ -155,7 +155,7 @@ def test_step_gmass_key_scaffolds_and_writes_key(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     _copy_example_files(tmp_path)
     init.step_gmass_key(read_line=ScriptedInput(["abc123secretkey"]))
-    assert init._read_env_value(tmp_path / ".env", "GMASS_API_KEY") == "abc123secretkey"
+    assert init._read_env_value(tmp_path / ".env", "GMAIL_APP_PASSWORD") == "abc123secretkey"
 
 
 def test_step_gmass_key_is_idempotent_when_declined(tmp_path, monkeypatch):
@@ -163,7 +163,7 @@ def test_step_gmass_key_is_idempotent_when_declined(tmp_path, monkeypatch):
     _copy_example_files(tmp_path)
     init.step_gmass_key(read_line=ScriptedInput(["abc123secretkey"]))
     init.step_gmass_key(read_line=ScriptedInput(["n"]))
-    assert init._read_env_value(tmp_path / ".env", "GMASS_API_KEY") == "abc123secretkey"
+    assert init._read_env_value(tmp_path / ".env", "GMAIL_APP_PASSWORD") == "abc123secretkey"
 
 
 def test_step_gmass_key_never_prints_full_key(tmp_path, monkeypatch, capsys):
@@ -356,7 +356,7 @@ def test_run_init_end_to_end(tmp_path, monkeypatch, capsys):
     init.run_init(read_line=ScriptedInput(answers))
 
     assert (tmp_path / "config.yaml").exists()
-    assert init._read_env_value(tmp_path / ".env", "GMASS_API_KEY") == "abc123secretkey"
+    assert init._read_env_value(tmp_path / ".env", "GMAIL_APP_PASSWORD") == "abc123secretkey"
     assert (tmp_path / "campaigns" / "example-campaign" / "campaign.yaml").exists()
     assert (tmp_path / "slap.db").exists()
 
@@ -392,5 +392,5 @@ def test_run_init_is_fully_idempotent_on_second_run(tmp_path, monkeypatch):
 
     gc = load_global_config(tmp_path / "config.yaml")
     assert gc.from_email == "me@gmail.com"  # sender untouched (declined)
-    assert init._read_env_value(tmp_path / ".env", "GMASS_API_KEY") == "abc123secretkey"  # key untouched
+    assert init._read_env_value(tmp_path / ".env", "GMAIL_APP_PASSWORD") == "abc123secretkey"  # key untouched
     assert gc.schedule.fire_window_start == "10:00"  # schedule step always re-runs (no idempotency gate)

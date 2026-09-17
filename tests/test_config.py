@@ -122,10 +122,21 @@ def test_load_global_config_non_string_signature_fails_loud(tmp_path):
 
 
 def test_load_global_config_missing_key_fails_loud(tmp_path):
-    bad = VALID_CONFIG_YAML.replace("api_key_env: GMASS_API_KEY", "")
+    # A genuinely-required key (sender.from_name) still fails loud when absent.
+    # (The old gmass.api_key_env is optional now — the SMTP/IMAP creds are a
+    # Gmail App Password in .env, not a config key.)
+    bad = VALID_CONFIG_YAML.replace("  from_name: Test Owner\n", "")
     path = write_global_config(tmp_path, bad)
-    with pytest.raises(ConfigError, match="gmass.api_key_env"):
+    with pytest.raises(ConfigError, match="sender.from_name"):
         load_global_config(path)
+
+
+def test_load_global_config_without_gmass_block_still_loads(tmp_path):
+    # The whole `gmass:` block is optional post-migration — a config with none
+    # loads fine (api_key_env falls back to a defaulted, unused value).
+    no_gmass = VALID_CONFIG_YAML.replace("gmass:\n  api_key_env: GMASS_API_KEY\n", "")
+    cfg = load_global_config(write_global_config(tmp_path, no_gmass))
+    assert cfg.from_email == "everythingforgenius@gmail.com"
 
 
 # --- redis (post-launch feature: dashboard GMass-data cache) ---------------

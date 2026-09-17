@@ -25,7 +25,7 @@ from slap.prompts import PASTE_TERMINATOR, read_paste
 from slap.queue import AmbiguousArchiveChoice, QueueError, resend_bounced, stage_recipient
 from slap.templates import fill_template, merge_config_values, parse_drop
 from slap import (
-    archive, dashboard, doctor, domains, followups, gmass, gmass_cache, imap, init, launchd,
+    archive, dashboard, doctor, domains, followups, gmass_cache, imap, init, launchd,
     onboard, reload, runner, smtp, tracking,
 )
 

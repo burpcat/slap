@@ -1,5 +1,5 @@
 """Doctor preflight tests (Build Order step 12), per SLAP_BUILD_PROMPT.md §11:
-GMASS_API_KEY present; config sender fields set; SQLite reachable;
+GMAIL_APP_PASSWORD present; config sender fields set; SQLite reachable;
 consumer_domains.txt present (seeded if missing); attachment resolvable
 (xelatex+code on PATH when latex is on, attachment_file exists when off).
 """
@@ -18,7 +18,7 @@ from slap.tracking import connect
 
 
 def make_global_config(tmp_path, *, from_email="owner@gmail.com", from_name="Owner",
-                        api_key_env="GMASS_API_KEY", consumer_domains_file=None):
+                        api_key_env="GMAIL_APP_PASSWORD", consumer_domains_file=None):
     return GlobalConfig(
         from_email=from_email, from_name=from_name, api_key_env=api_key_env,
         personas={"recruiter": [2, 3, 5]},
@@ -52,20 +52,20 @@ def make_campaign_config(tmp_path, *, latex_enabled=False, resume_paths=None):
 # --- check_api_key -----------------------------------------------------
 
 def test_check_api_key_passes_when_set(tmp_path, monkeypatch):
-    monkeypatch.setenv("GMASS_API_KEY", "real-key")
+    monkeypatch.setenv("GMAIL_APP_PASSWORD", "real-key")
     result = check_api_key(make_global_config(tmp_path))
     assert result.ok
 
 
 def test_check_api_key_fails_when_unset(tmp_path, monkeypatch):
-    monkeypatch.delenv("GMASS_API_KEY", raising=False)
+    monkeypatch.delenv("GMAIL_APP_PASSWORD", raising=False)
     result = check_api_key(make_global_config(tmp_path))
     assert not result.ok
     assert "not set" in result.detail
 
 
 def test_check_api_key_fails_when_blank(tmp_path, monkeypatch):
-    monkeypatch.setenv("GMASS_API_KEY", "   ")
+    monkeypatch.setenv("GMAIL_APP_PASSWORD", "   ")
     result = check_api_key(make_global_config(tmp_path))
     assert not result.ok
 
@@ -138,11 +138,11 @@ def test_check_consumer_domains_seeds_default_when_missing(tmp_path):
 # --- run_global_checks -----------------------------------------------------
 
 def test_run_global_checks_returns_all_four_and_reuses_given_conn(tmp_path, monkeypatch):
-    monkeypatch.setenv("GMASS_API_KEY", "real-key")
+    monkeypatch.setenv("GMAIL_APP_PASSWORD", "real-key")
     conn = connect(tmp_path / "test.db")
     gc = make_global_config(tmp_path)
     results = run_global_checks(gc, conn)
-    assert {r.name for r in results} == {"GMASS_API_KEY", "sender fields", "SQLite DB", "consumer_domains.txt"}
+    assert {r.name for r in results} == {"GMAIL_APP_PASSWORD", "sender fields", "SQLite DB", "consumer_domains.txt"}
     assert all(r.ok for r in results)
 
 
@@ -243,7 +243,7 @@ def test_print_report_not_gated_by_broken_archive_symlink(tmp_path, monkeypatch)
     # a broken archive is cosmetic staleness fixable via `doctor
     # --prune-archive`, never a reason to fail doctor's exit code.
     monkeypatch.chdir(tmp_path)  # discover_campaigns() reads cwd-relative campaigns/ (none here)
-    monkeypatch.setenv("GMASS_API_KEY", "real-key")
+    monkeypatch.setenv("GMAIL_APP_PASSWORD", "real-key")
 
     archive_dir = tmp_path / "archive"
     archive_dir.mkdir()
@@ -284,7 +284,7 @@ def test_check_redis_fails_when_unreachable(tmp_path, monkeypatch):
 
 def test_print_report_not_gated_by_unreachable_redis(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)  # discover_campaigns() reads cwd-relative campaigns/ (none here)
-    monkeypatch.setenv("GMASS_API_KEY", "real-key")
+    monkeypatch.setenv("GMAIL_APP_PASSWORD", "real-key")
 
     def raise_unavailable(client):
         raise gmass_cache.RedisUnavailable("connection refused")
@@ -298,7 +298,7 @@ def test_run_global_checks_never_includes_resume_archive(tmp_path, monkeypatch):
     # Regression guard for the "must never block a send/drain" requirement:
     # if this ever starts passing check_resume_archive's name, a broken
     # archive dir would start failing send's/drain's preflight gate.
-    monkeypatch.setenv("GMASS_API_KEY", "real-key")
+    monkeypatch.setenv("GMAIL_APP_PASSWORD", "real-key")
     monkeypatch.setenv("RESUME_ARCHIVE_DIR", str(tmp_path / "does-not-exist"))
     results = run_global_checks(make_global_config(tmp_path))
     assert "RESUME_ARCHIVE_DIR" not in {r.name for r in results}

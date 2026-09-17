@@ -115,8 +115,11 @@ def conn(tmp_path):
 
 
 @pytest.fixture(autouse=True)
-def api_key_env(monkeypatch):
-    monkeypatch.setenv("GMASS_API_KEY", "fake-key")
+def app_password_env(monkeypatch):
+    # drain()'s preflight (doctor.check_api_key) now requires the Gmail App
+    # Password, not GMASS_API_KEY — set it so every drain test gets past
+    # preflight; the two preflight-FAILURE tests delenv it explicitly.
+    monkeypatch.setenv("GMAIL_APP_PASSWORD", "fake-app-password")
 
 
 # --- drain: happy path -------------------------------------------------
@@ -559,7 +562,7 @@ def test_no_gap_delay_for_a_single_send(conn, tmp_path):
 # --- preflight failure -> retry -> run_failed, queue intact -----------------
 
 def test_preflight_failure_retries_then_writes_run_failed(conn, tmp_path, monkeypatch):
-    monkeypatch.delenv("GMASS_API_KEY", raising=False)
+    monkeypatch.delenv("GMAIL_APP_PASSWORD", raising=False)
     gc = make_global_config(tmp_path, drain_retries=3)
     stage_one(conn, tmp_path)
 
@@ -574,7 +577,7 @@ def test_preflight_failure_retries_then_writes_run_failed(conn, tmp_path, monkey
 
 
 def test_preflight_failure_leaves_queue_completely_intact(conn, tmp_path, monkeypatch):
-    monkeypatch.delenv("GMASS_API_KEY", raising=False)
+    monkeypatch.delenv("GMAIL_APP_PASSWORD", raising=False)
     gc = make_global_config(tmp_path, drain_retries=1)
     stage_one(conn, tmp_path)
     drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir")
@@ -584,7 +587,7 @@ def test_preflight_failure_leaves_queue_completely_intact(conn, tmp_path, monkey
 def test_preflight_recovers_within_retries_and_drain_proceeds(conn, tmp_path, monkeypatch):
     # Fails the first check, then "recovers" (env var appears) before retries
     # are exhausted — the drain should proceed normally.
-    monkeypatch.delenv("GMASS_API_KEY", raising=False)
+    monkeypatch.delenv("GMAIL_APP_PASSWORD", raising=False)
     gc = make_global_config(tmp_path, drain_retries=3)
     stage_one(conn, tmp_path)
 
@@ -595,7 +598,7 @@ def test_preflight_recovers_within_retries_and_drain_proceeds(conn, tmp_path, mo
         real_sleep_calls.append(seconds)
         attempts["n"] += 1
         if attempts["n"] == 1:
-            os.environ["GMASS_API_KEY"] = "fake-key"
+            os.environ["GMAIL_APP_PASSWORD"] = "fake-app-password"
 
     send_fn, _ = fake_smtp()
     result = drain(conn, gc, SMTP, sleep_fn=flaky_sleep, workdir_root=tmp_path / "workdir",
