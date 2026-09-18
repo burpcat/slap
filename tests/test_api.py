@@ -125,7 +125,7 @@ def app(tmp_path, monkeypatch):
     monkeypatch.setattr("slap.dashboard.threading.Thread", _ImmediateThread)
     db_path = tmp_path / "test.db"
     connect(db_path).close()
-    flask_app = create_app(db_path, make_global_config(), consumer_domains=set(), api_key="fake-key",
+    flask_app = create_app(db_path, make_global_config(), consumer_domains=set(), imap_config="fake-imap",
                             redis_client=FakeRedis())
     flask_app.db_path = db_path
     return flask_app
@@ -134,7 +134,7 @@ def app(tmp_path, monkeypatch):
 # --- GET endpoints: 200 + expected top-level keys ---------------------------
 
 def test_api_home_returns_expected_keys(app):
-    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+    with patch("slap.dashboard.ingest_replies", return_value=0):
         resp = app.test_client().get("/api/home")
     assert resp.status_code == 200
     body = resp.get_json()
@@ -148,7 +148,7 @@ def test_api_home_returns_expected_keys(app):
 
 
 def test_api_pipeline_returns_expected_keys(app):
-    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+    with patch("slap.dashboard.ingest_replies", return_value=0):
         resp = app.test_client().get("/api/pipeline")
     assert resp.status_code == 200
     body = resp.get_json()
@@ -158,7 +158,7 @@ def test_api_pipeline_returns_expected_keys(app):
 
 
 def test_api_engagement_returns_expected_keys(app):
-    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+    with patch("slap.dashboard.ingest_replies", return_value=0):
         resp = app.test_client().get("/api/engagement")
     assert resp.status_code == 200
     body = resp.get_json()
@@ -173,7 +173,7 @@ def test_api_engagement_returns_expected_keys(app):
 
 
 def test_api_engagement_show_hidden_query_param(app):
-    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+    with patch("slap.dashboard.ingest_replies", return_value=0):
         resp = app.test_client().get("/api/engagement?show_hidden=1")
     assert resp.status_code == 200
     assert resp.get_json()["show_hidden"] is True
@@ -270,6 +270,28 @@ def test_api_reachouts_returns_rows_and_total_count(app, tmp_path):
     assert body["rows"][0]["recipient"] == "a@x.com"
 
 
+def test_api_reachouts_exposes_stage_and_next_shoot(app, tmp_path):
+    # End-to-end through the real route: an active recipient carries its
+    # estimated cadence stage, and a queued (not-yet-sent) recipient gets a
+    # next-drain "next shoot" — which only resolves because the route threads
+    # global_config into reachouts_rows().
+    conn = connect(tmp_path / "test.db")
+    seed_sent_recipient(conn, recipient="active@x.com", campaign="c")   # sent today -> initial
+    append_event(conn, type="queued", recipient="queued@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter"})                          # staged, never sent
+    conn.close()
+
+    rows = {r["recipient"]: r for r in app.test_client().get("/api/reachouts").get_json()["rows"]}
+    assert rows["active@x.com"]["stage_label"] == "initial"
+    assert rows["active@x.com"]["stage_index"] == 0
+    assert rows["queued@x.com"]["status"] == "queued"
+    assert rows["queued@x.com"]["stage_label"] == "initial"
+    # queued -> the runner's next fire window (non-null because the route passed
+    # global_config through). active-sent-today has no follow-up due yet today,
+    # but its next cadence stage is still scheduled -> also non-null.
+    assert rows["queued@x.com"]["next_shoot_at"] is not None
+
+
 def test_api_lifecycle_detail_returns_timeline_for_known_recipient(app, tmp_path):
     conn = connect(tmp_path / "test.db")
     seed_sent_recipient(conn, recipient="a@x.com", campaign="c")
@@ -306,7 +328,7 @@ def test_api_template_failures_returns_expected_keys(app):
 
 
 def test_api_sync_status_returns_expected_keys(app):
-    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+    with patch("slap.dashboard.ingest_replies", return_value=0):
         resp = app.test_client().get("/api/sync-status")
     assert resp.status_code == 200
     body = resp.get_json()
@@ -363,44 +385,14 @@ def test_api_reply_tag_ooo_missing_resume_date_returns_400_with_valueerror_messa
     assert "resume_date" in resp.get_json()["error"]
 
 
-def test_api_reply_tag_unsubscribe_failure_returns_502(app, tmp_path):
-    conn = connect(tmp_path / "test.db")
-    append_event(conn, type="queued", recipient="a@x.com", campaign="c", stage=0, meta={"persona": "recruiter"})
-    append_event(conn, type="reply", recipient="a@x.com", campaign="c")
-    conn.close()
-
-    with patch("slap.dashboard.gmass.unsubscribe_recipient", side_effect=RuntimeError("boom")):
-        resp = app.test_client().post(
-            "/api/reply/a@x.com/tag", json={"tag": "ooo", "resume_date": "2026-08-01"}
-        )
-    assert resp.status_code == 502
-    assert "nothing was recorded" in resp.get_json()["error"]
-
-    conn2 = connect(tmp_path / "test.db")
-    row = conn2.execute("SELECT * FROM events WHERE recipient = ? AND type = 'ooo_tagged'", ("a@x.com",)).fetchone()
-    assert row is None  # nothing recorded locally, matching tag_reply()'s guarantee
-
-
 def test_api_stop_outreach_success(app, tmp_path):
     conn = connect(tmp_path / "test.db")
     seed_sent_recipient(conn, recipient="a@x.com", campaign="c")
     conn.close()
 
-    with patch("slap.dashboard.gmass.unsubscribe_recipient", return_value={}):
-        resp = app.test_client().post("/api/reachouts/a@x.com/stop")
+    resp = app.test_client().post("/api/reachouts/a@x.com/stop")
     assert resp.status_code == 200
     assert resp.get_json() == {"ok": True}
-
-
-def test_api_stop_outreach_failure_returns_502(app, tmp_path):
-    conn = connect(tmp_path / "test.db")
-    seed_sent_recipient(conn, recipient="a@x.com", campaign="c")
-    conn.close()
-
-    with patch("slap.dashboard.gmass.unsubscribe_recipient", side_effect=RuntimeError("boom")):
-        resp = app.test_client().post("/api/reachouts/a@x.com/stop")
-    assert resp.status_code == 502
-    assert "nothing was recorded" in resp.get_json()["error"]
 
 
 def test_api_resend_missing_corrected_email_returns_400(app, tmp_path):
@@ -464,7 +456,7 @@ def test_api_hide_and_unhide_warm_but_silent(app, tmp_path):
     conn.close()
 
     client = app.test_client()
-    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+    with patch("slap.dashboard.ingest_replies", return_value=0):
         # First load: no cache yet -- renders an honest empty state while a
         # (synchronous, in this fixture) background refresh populates it.
         # Second load: reads that now-fresh cache. Same two-request pattern
@@ -476,7 +468,7 @@ def test_api_hide_and_unhide_warm_but_silent(app, tmp_path):
     assert resp.status_code == 200
     assert resp.get_json() == {"ok": True}
 
-    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+    with patch("slap.dashboard.ingest_replies", return_value=0):
         hidden = client.get("/api/engagement").get_json()
     assert hidden["warm_but_silent_hidden_count"] == 1
     assert hidden["warm_but_silent"] == []
@@ -485,26 +477,26 @@ def test_api_hide_and_unhide_warm_but_silent(app, tmp_path):
     assert resp.status_code == 200
     assert resp.get_json() == {"ok": True}
 
-    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+    with patch("slap.dashboard.ingest_replies", return_value=0):
         unhidden = client.get("/api/engagement?show_hidden=1").get_json()
     assert unhidden["warm_but_silent_hidden_count"] == 0
 
 
-def test_api_gmass_refresh_ok(app):
-    resp = app.test_client().post("/api/gmass/refresh")
+def test_api_refresh_ok(app):
+    resp = app.test_client().post("/api/refresh")
     assert resp.status_code == 200
     assert resp.get_json() == {"ok": True}
 
 
-def test_api_gmass_refresh_redis_unavailable(tmp_path, monkeypatch):
+def test_api_refresh_redis_unavailable(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("slap.dashboard.threading.Thread", _ImmediateThread)
     db_path = tmp_path / "test.db"
     connect(db_path).close()
-    down_app = create_app(db_path, make_global_config(), consumer_domains=set(), api_key="fake-key",
+    down_app = create_app(db_path, make_global_config(), consumer_domains=set(), imap_config="fake-imap",
                            redis_client=FakeRedisDown())
 
-    resp = down_app.test_client().post("/api/gmass/refresh")
+    resp = down_app.test_client().post("/api/refresh")
     assert resp.status_code == 200
     assert resp.get_json() == {"ok": False, "reason": "redis_unavailable"}
 
@@ -525,10 +517,10 @@ def test_api_survives_real_concurrent_request_threads(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     db_path = tmp_path / "test.db"
     connect(db_path).close()
-    app = create_app(db_path, make_global_config(), consumer_domains=set(), api_key="fake-key",
+    app = create_app(db_path, make_global_config(), consumer_domains=set(), imap_config="fake-imap",
                       redis_client=FakeRedis())
 
-    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+    with patch("slap.dashboard.ingest_replies", return_value=0):
         server = make_server("127.0.0.1", 0, app, threaded=True)
         port = server.server_address[1]
         thread = threading.Thread(target=server.serve_forever)
@@ -564,14 +556,11 @@ def test_api_linkedin_replied_gates_outreach_and_reflects_in_reachouts(app, tmp_
     conn.close()
     client = app.test_client()
 
-    # Marking LinkedIn-replied now HALTS GMass outreach (a real unsubscribe),
-    # so the endpoint fires gmass.unsubscribe_recipient and returns the new
-    # gated status.
-    with patch("slap.dashboard.gmass.unsubscribe_recipient", return_value={}) as unsub:
-        resp = client.post("/api/reachouts/a@x.com/linkedin-replied", json={"replied": True})
+    # Marking LinkedIn-replied HALTS outreach (status flips to linkedin-gate);
+    # under SMTP there is no external suppression call to make first.
+    resp = client.post("/api/reachouts/a@x.com/linkedin-replied", json={"replied": True})
     assert resp.status_code == 200
     assert resp.get_json() == {"ok": True, "status": "linkedin-gate"}
-    assert unsub.call_count == 1
 
     row = next(r for r in client.get("/api/reachouts").get_json()["rows"] if r["recipient"] == "a@x.com")
     assert row["linkedin_replied"] is True   # still lights the reply cell / Campaigns card
@@ -580,26 +569,13 @@ def test_api_linkedin_replied_gates_outreach_and_reflects_in_reachouts(app, tmp_
     assert row["chip"]["label"] == "LinkedIn"
 
 
-def test_api_linkedin_replied_failure_returns_502(app, tmp_path):
-    conn = connect(tmp_path / "test.db")
-    seed_sent_recipient(conn, recipient="a@x.com", campaign="c")
-    conn.close()
-
-    with patch("slap.dashboard.gmass.unsubscribe_recipient", side_effect=RuntimeError("boom")):
-        resp = app.test_client().post("/api/reachouts/a@x.com/linkedin-replied", json={"replied": True})
-    assert resp.status_code == 502
-    assert "nothing was recorded" in resp.get_json()["error"]
-
-
 def test_api_linkedin_replied_ungate_not_supported_400(app, tmp_path):
     conn = connect(tmp_path / "test.db")
     seed_sent_recipient(conn, recipient="a@x.com", campaign="c")
     conn.close()
-    # One-way, like Stop: an explicit un-gate fails loud and never hits GMass.
-    with patch("slap.dashboard.gmass.unsubscribe_recipient") as unsub:
-        resp = app.test_client().post("/api/reachouts/a@x.com/linkedin-replied", json={"replied": False})
+    # One-way, like Stop: an explicit un-gate fails loud.
+    resp = app.test_client().post("/api/reachouts/a@x.com/linkedin-replied", json={"replied": False})
     assert resp.status_code == 400
-    assert unsub.call_count == 0
 
 
 def test_api_linkedin_replied_unknown_recipient_404(app):
@@ -627,7 +603,8 @@ def test_api_followed_up_unknown_recipient_404(app):
 def _seed_real_lead_api(conn, recipient="a@acme.com", campaign="c"):
     append_event(conn, type="queued", recipient=recipient, campaign=campaign, stage=0,
                  meta={"persona": "recruiter", "cadence": []})
-    append_event(conn, type="sent", recipient=recipient, campaign=campaign, stage=0, gmass_campaign_id="555")
+    append_event(conn, type="sent", recipient=recipient, campaign=campaign, stage=0,
+                 message_id="<sent-555@gmail.com>")
     append_event(conn, type="reply", recipient=recipient, campaign=campaign)
     append_event(conn, type="reply_reviewed", recipient=recipient, campaign=campaign, meta={"tag": "real"})
 
@@ -675,7 +652,7 @@ def test_api_remind_missing_body_and_slug_returns_400(app, tmp_path):
 # --- company word-cloud roster ----------------------------------------------
 
 def test_api_home_companies_include_all_companies_roster(app):
-    with patch("slap.dashboard.gmass.get_reports", return_value=[]):
+    with patch("slap.dashboard.ingest_replies", return_value=0):
         companies = app.test_client().get("/api/home").get_json()["companies"]
     # Full roster is present and is a superset-shaped (domain, count) list — same
     # shape as top_companies, just not truncated to 5.

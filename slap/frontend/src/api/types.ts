@@ -310,6 +310,16 @@ export interface ReachoutRow {
   // one-way, like `stopped`. Durable, append-only read (see dashboard.py).
   linkedin_gated: boolean;
   stopped: boolean;
+  // Estimated cadence stage (dashboard.py reachouts_rows). stage_index is the
+  // numeric form (0 = initial) for sorting; both are null for a finished/
+  // non-in-flight sequence. GMass fires follow-ups server-side with no
+  // read-back, so these are estimates — surfaced with a tooltip, not marked
+  // inline. The chip label already carries stage_label for an active row.
+  stage_index: number | null;
+  stage_label: string | null;
+  // Local ISO timestamp of the next scheduled send (the "next shoot"
+  // countdown), or null when nothing further is scheduled (renders "—").
+  next_shoot_at: string | null;
   chip: StatusChip;
   date_local: string | null;
 }

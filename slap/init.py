@@ -219,12 +219,12 @@ def _check_env_gitignored() -> None:
 
 
 def step_gmass_key(*, read_line=input) -> None:
-    display.plain("\n== 3. GMass API key ==")
+    display.plain("\n== 3. Gmail App Password ==")
     if ENV_PATH.exists():
-        existing = _read_env_value(ENV_PATH, "GMASS_API_KEY")
+        existing = _read_env_value(ENV_PATH, "GMAIL_APP_PASSWORD")
         if existing:
             masked = f"{existing[:4]}…{existing[-4:]}" if len(existing) > 8 else "…"
-            display.plain(f"  {ENV_PATH} already has GMASS_API_KEY set ({masked}, {len(existing)} chars).")
+            display.plain(f"  {ENV_PATH} already has GMAIL_APP_PASSWORD set ({masked}, {len(existing)} chars).")
             if not _ask_yn("  Replace it?", default=False, read_line=read_line):
                 _check_env_gitignored()
                 return
@@ -233,15 +233,17 @@ def step_gmass_key(*, read_line=input) -> None:
             raise InitError(f"{ENV_EXAMPLE_PATH} not found — cannot scaffold {ENV_PATH}.")
         ENV_PATH.write_text(ENV_EXAMPLE_PATH.read_text())
 
-    key = _ask("  Paste your GMass API key (find it at gmass.co under Settings -> API)", read_line=read_line)
-    _set_env_value(ENV_PATH, "GMASS_API_KEY", key)
+    key = _ask("  Paste your Gmail App Password (create one at "
+               "https://myaccount.google.com/apppasswords — needs 2-Step Verification on). "
+               "Used for both SMTP sending and IMAP reply detection", read_line=read_line)
+    _set_env_value(ENV_PATH, "GMAIL_APP_PASSWORD", key)
     # Also set it in THIS process's environment immediately: .env is only
     # loaded into os.environ by python-dotenv at process start (slap.py's
     # own load_dotenv() call), which already ran before this key existed —
     # without this, step_finish's doctor check would show a false FAIL for
-    # a key that was just written correctly to disk.
-    os.environ["GMASS_API_KEY"] = key
-    display.success(f"  Wrote GMASS_API_KEY to {ENV_PATH} ({len(key)} chars — never printed in full).")
+    # a password that was just written correctly to disk.
+    os.environ["GMAIL_APP_PASSWORD"] = key
+    display.success(f"  Wrote GMAIL_APP_PASSWORD to {ENV_PATH} ({len(key)} chars — never printed in full).")
     _check_env_gitignored()
 
 

@@ -13,10 +13,10 @@ import { StatusChip, CampaignDot } from '../components/primitives/Chip';
 import { OooPopover } from '../components/OooPopover';
 import { ResendPopover } from '../components/ResendPopover';
 import { ConfirmPopover } from '../components/ConfirmPopover';
-import { shortDate } from '../utils/format';
+import { shortDate, countdownTo } from '../utils/format';
 import styles from './Reachouts.module.css';
 
-type SortKey = 'recipient' | 'campaign' | 'persona' | 'status' | 'date_local';
+type SortKey = 'recipient' | 'campaign' | 'persona' | 'status' | 'next_shoot_at' | 'date_local';
 type SortDir = 'asc' | 'desc';
 
 // Client-side filter state, mirroring the backend's filter_reachouts()
@@ -143,6 +143,20 @@ function ReplyCell({ row }: { row: ReachoutRow }) {
   );
 }
 
+// Time-until-next-send countdown (req: "Next shoot"). null next_shoot_at means
+// the sequence is over (replied / bounced / stopped / done, or the whole
+// cadence window elapsed) -> a plain "—". The value is an ESTIMATE (GMass
+// fires follow-ups server-side with no read-back — see slap.stages), signalled
+// via tooltip rather than an inline marker.
+const NEXT_SHOOT_ESTIMATE_HINT =
+  'Estimated from the follow-up cadence — GMass fires follow-ups on its own servers, so the real send time can differ.';
+
+function NextShootCell({ row }: { row: ReachoutRow }) {
+  if (!row.next_shoot_at) return <span className={styles.noneEngage}>—</span>;
+  const { label } = countdownTo(new Date(row.next_shoot_at).getTime());
+  return <span title={NEXT_SHOOT_ESTIMATE_HINT}>{label}</span>;
+}
+
 function RowActions({ row, colors }: { row: ReachoutRow; colors: Record<string, CampaignColor> }) {
   const { effective } = useTheme();
   const tag = useTagReply(row.recipient);
@@ -179,14 +193,21 @@ function RowActions({ row, colors }: { row: ReachoutRow; colors: Record<string, 
         {/* Just the status here (Image #11) — the full bounce reason lives on
             the Pipeline page. chip.label for a bounced row is
             "Blocked — <full DSN>", so shorten it to the category word; every
-            other status label is already short. Chip color is unchanged. */}
-        <StatusChip
-          color={row.chip.color}
-          label={row.status === 'bounced' ? (row.bounce_category === 'block' ? 'Blocked' : 'Bounced') : row.chip.label}
-        />
+            other status label is already short. Chip color is unchanged. For an
+            in-flight row the chip label is the ESTIMATED cadence stage
+            (initial / stage1 / …); a tooltip flags it as an estimate. */}
+        <span title={row.stage_index !== null ? 'Estimated current cadence stage (inferred from the follow-up schedule)' : undefined}>
+          <StatusChip
+            color={row.chip.color}
+            label={row.status === 'bounced' ? (row.bounce_category === 'block' ? 'Blocked' : 'Bounced') : row.chip.label}
+          />
+        </span>
       </td>
       <td>
         <ReplyCell row={row} />
+      </td>
+      <td className={styles.dateCell}>
+        <NextShootCell row={row} />
       </td>
       <td className={styles.dateCell}>{shortDate(row.date_local)}</td>
       <td>
@@ -332,7 +353,7 @@ export default function Reachouts() {
     { key: 'persona', label: 'Persona' },
     { key: 'status', label: 'Status' },
   ];
-  const TOTAL_COLS = columns.length + 3; // + Reply + Date + Actions
+  const TOTAL_COLS = columns.length + 4; // + Reply + Next shoot + Date + Actions
 
   return (
     <div className={styles.page}>
@@ -400,6 +421,10 @@ export default function Reachouts() {
                 </th>
               ))}
               <th className={styles.noSort}>Reply</th>
+              <th onClick={() => setSort('next_shoot_at')}>
+                Next shoot
+                {sortKey === 'next_shoot_at' && <span className={styles.arrow}>{sortDir === 'asc' ? '▲' : '▼'}</span>}
+              </th>
               <th onClick={() => setSort('date_local')}>
                 Date
                 {sortKey === 'date_local' && <span className={styles.arrow}>{sortDir === 'asc' ? '▲' : '▼'}</span>}

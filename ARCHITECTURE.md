@@ -1,5 +1,16 @@
 # Architecture & Implementation Notes
 
+> **Transport migrated: GMass API → local SMTP + IMAP.** Anywhere this document says
+> "GMass" (the two-call draft→campaign send, server-side follow-up stages, reply/click/
+> bounce reports, account-wide unsubscribe), the current code instead: sends one message
+> over Gmail SMTP (`slap/smtp.py`); fires follow-up stages itself
+> (`slap.queue.due_for_followup` + `slap.runner._send_followup`); detects replies over IMAP
+> (`slap/imap.py` + `runner.ingest_replies`, polled inside the drain for fire-time
+> stop-on-reply); and threads via RFC822 `In-Reply-To` on the recipient's `message_id`.
+> Credentials are one `GMAIL_APP_PASSWORD`. Click/bounce ingestion is dropped. See
+> `CLAUDE.md`'s "Transport: local SMTP + IMAP" section — that is authoritative over the
+> GMass descriptions below.
+
 A technical deep-dive into how `slap` is built and why — implementation approach,
 architectural decisions, and known limitations/future work. `README.md` covers setup and
 usage; this document is for understanding (or describing) the engineering behind it.

@@ -44,10 +44,10 @@ from __future__ import annotations
 
 import json
 import shutil
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
-from slap import archive, display
+from slap import archive, display, stages
 from slap.latex import WORKDIR_ROOT, recipient_workdir
 from slap.tracking import append_event
 
@@ -497,6 +497,66 @@ def due_for_ooo_resend(conn, *, today: date = None) -> list:
     return due
 
 
+def _has_ooo_history(conn, recipient: str, campaign: str) -> bool:
+    """True if this (recipient, campaign) was ever OOO-tagged. Such recipients
+    are owned entirely by the OOO resend path (due_for_ooo_resend), on its
+    pause/resume schedule — the normal follow-up path (due_for_followup) must
+    never fire their stages on the original cadence dates, which would ignore
+    the pause and could double-send alongside an OOO resend."""
+    row = conn.execute(
+        "SELECT 1 FROM events WHERE recipient = ? AND campaign = ? AND type = 'ooo_tagged' LIMIT 1",
+        (recipient, campaign),
+    ).fetchone()
+    return row is not None
+
+
+def due_for_followup(conn, global_config, *, today: date = None) -> list:
+    """Recipients whose next normal-cadence follow-up stage is due to fire today
+    or earlier and hasn't been sent yet — the app-side replacement for GMass's
+    server-side stage timer (which used to fire stages 1..N unilaterally). Under
+    SMTP the app owns the whole cadence, so the runner fires each due stage
+    itself via slap.runner._send_followup, threaded into the recipient's
+    original conversation. This is what makes stages.py's fire-date math an
+    actual trigger rather than the mere estimate it was under GMass.
+
+    A recipient qualifies when ALL of:
+      - status == 'active' with a real initial send recorded (first_sent_at set),
+      - no OOO history for their current campaign (_has_ooo_history) — an OOO'd
+        recipient's remaining cadence is owned by due_for_ooo_resend on its own
+        pause/resume schedule, so the two due-lists never fire the same stage
+        (drain() also dedupes defensively, belt-and-suspenders),
+      - the next stage (current_stage + 1) is within their cadence, and
+      - stages.stage_fire_date(first_sent_at, cadence, next_stage) <= today.
+
+    Idempotency comes from current_stage: the `sent` handler advances it to the
+    stage just fired, so next_stage becomes N+1 and the same stage is never
+    selected twice across drains. Cadence prefers the recipient's own recorded
+    cadence (a possible per-send override), falling back to the persona default
+    for rows queued before that column existed — the same preference order as
+    slap.runner._estimate_followups_firing_today (which reserves cap headroom
+    for exactly this set)."""
+    today = today or date.today()
+    rows = conn.execute(
+        "SELECT * FROM recipients WHERE status = 'active' AND first_sent_at IS NOT NULL "
+        "ORDER BY recipient"
+    ).fetchall()
+    due = []
+    for row in rows:
+        if _has_ooo_history(conn, row["recipient"], row["campaign"]):
+            continue
+        cadence = json.loads(row["cadence"]) if row["cadence"] else global_config.personas.get(row["persona"])
+        if not cadence:
+            continue
+        next_stage = row["current_stage"] + 1
+        if next_stage > len(cadence):
+            continue  # sequence exhausted
+        fire_date = stages.stage_fire_date(
+            datetime.fromisoformat(row["first_sent_at"]).date(), cadence, next_stage)
+        if fire_date <= today:
+            due.append(dict(row))
+    return due
+
+
 def queue_remind(conn, recipient: str, body: str, *, followup: str = None,
                  workdir_root: Path = WORKDIR_ROOT) -> None:
     """Queue a one-shot "Remind" reply for `recipient` (the Engagement/reach-out
@@ -512,18 +572,18 @@ def queue_remind(conn, recipient: str, body: str, *, followup: str = None,
     OOO-resend model (app-initiated reply-in-thread on the normal drain), the
     only sanctioned way this app sends after the initial: no scheduler.
 
-    Fail loud on an unknown recipient, or one with no prior GMass campaign to
-    reply into (they were never actually sent — nothing to thread onto), same
-    "must be a real, resend-able recipient" guard as resend_bounced()."""
+    Fail loud on an unknown recipient, or one with no prior send to reply into
+    (they were never actually sent — nothing to thread onto), same "must be a
+    real, resend-able recipient" guard as resend_bounced()."""
     row = conn.execute(
-        "SELECT campaign, last_gmass_campaign_id FROM recipients WHERE recipient = ?", (recipient,)
+        "SELECT campaign, message_id FROM recipients WHERE recipient = ?", (recipient,)
     ).fetchone()
     if row is None:
         raise QueueError(f"unknown recipient {recipient!r} — never staged/contacted")
-    reply_to = row["last_gmass_campaign_id"]
+    reply_to = row["message_id"]
     if not reply_to:
         raise QueueError(
-            f"{recipient} has no prior GMass send to reply into — a Remind is a threaded "
+            f"{recipient} has no prior send to reply into — a Remind is a threaded "
             f"follow-up, so it can only go to someone already contacted"
         )
     # Snapshot the original subject from the staged manifest when available, so
@@ -538,7 +598,7 @@ def queue_remind(conn, recipient: str, body: str, *, followup: str = None,
         subject_ref = ""
     append_event(conn, type="interaction", recipient=recipient, campaign=row["campaign"],
                  meta={"channel": "remind_queued", "followup": followup, "body": body,
-                       "campaign_id_to_reply_to": reply_to, "subject_ref": subject_ref})
+                       "reply_to_message_id": reply_to, "subject_ref": subject_ref})
 
 
 def due_for_remind(conn) -> list:

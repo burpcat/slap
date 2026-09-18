@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from slap import archive
+from slap import archive, stages
 from slap.config import GlobalConfig
 from slap.latex import WORKDIR_ROOT
 from slap.queue import MANIFEST_NAME, load_manifest
@@ -159,7 +159,7 @@ def classify_recipient(conn, campaign: str, recipient: str, global_config: Globa
     # event written before that field existed simply lacks it, falling back
     # to the persona default exactly like before.
     cadence = persona_rows[0]["meta"].get("cadence") or global_config.personas[persona]
-    window_days = sum(cadence)
+    window_days = stages.cadence_window_days(cadence)
     first_sent_at = datetime.fromisoformat(first_sent["timestamp"])
     elapsed_days = (now - first_sent_at).days
     if elapsed_days < window_days:

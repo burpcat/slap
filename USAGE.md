@@ -1,5 +1,11 @@
 # USAGE.md — using slap day to day
 
+> **Migrated off GMass → Gmail SMTP + IMAP.** Sending and reply detection now go through
+> your Gmail directly with a single **App Password** (`GMAIL_APP_PASSWORD` in `.env`) — no
+> GMass account or API key. `slap` fires its own follow-up cadence and stops on replies it
+> reads over IMAP. Click tracking and bounce detection aren't available over plain SMTP.
+> See `CLAUDE.md`'s "Transport: local SMTP + IMAP" section for details.
+
 This assumes you've already run `python slap.py init` (see [`README.md`](README.md)),
 built the dashboard's frontend once (`npm --prefix slap/frontend install && npm --prefix
 slap/frontend run build` — see README's Setup), and `doctor` passes. This doc covers

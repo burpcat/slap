@@ -261,7 +261,7 @@ class ApiJSONProvider(DefaultJSONProvider):
         return super().default(o)
 
 
-def register_api(app, *, get_conn, db_path, global_config, consumer_domains, api_key, redis_client, log_dir):
+def register_api(app, *, get_conn, db_path, global_config, consumer_domains, imap_config, redis_client, log_dir):
     """Registers every `/api/*` JSON route on `app`, closing over the same
     per-request `get_conn()` and startup-resolved params create_app() already
     built for the Jinja routes -- mirrors that function's own closure style
@@ -287,7 +287,7 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, api
         # three ride along here even though index() itself doesn't render
         # them (a later frontend collapses Home+Pipeline's overlap).
         conn = get_conn()
-        gmass_data = dashboard.get_gmass_dependent_data(api_key, consumer_domains, redis_client, db_path)
+        gmass_data = dashboard.get_gmass_dependent_data(imap_config, consumer_domains, redis_client, db_path)
         return jsonify({
             "sync_result": gmass_data["sync_result"],
             "replies": gmass_data["replies"],
@@ -307,7 +307,7 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, api
         # stopped_outreach) -- Deliverability is being merged into Pipeline
         # per this endpoint's own task brief.
         conn = get_conn()
-        gmass_data = dashboard.get_gmass_dependent_data(api_key, consumer_domains, redis_client, db_path)
+        gmass_data = dashboard.get_gmass_dependent_data(imap_config, consumer_domains, redis_client, db_path)
         return jsonify({
             # today_strip rides along (cheap, GMass-independent) so the
             # "follow-ups firing today" panel can show how many already FIRED
@@ -334,7 +334,7 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, api
         # Engagement in the same redesign that merges Deliverability into
         # Pipeline, above).
         conn = get_conn()
-        gmass_data = dashboard.get_gmass_dependent_data(api_key, consumer_domains, redis_client, db_path)
+        gmass_data = dashboard.get_gmass_dependent_data(imap_config, consumer_domains, redis_client, db_path)
         all_warm_but_silent = gmass_data["warm_but_silent"]
         hidden_recipients = dashboard._warm_but_silent_hidden_recipients(conn)
         show_hidden = request.args.get("show_hidden") == "1"
@@ -373,7 +373,7 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, api
         # theme from one payload without a second request.
         conn = get_conn()
         campaigns = discover_campaigns()
-        rows = dashboard.reachouts_rows(conn)
+        rows = dashboard.reachouts_rows(conn, global_config)
         leads = dashboard.active_leads(conn)
 
         def _slice(name):
@@ -396,7 +396,7 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, api
 
     @app.route("/api/reachouts")
     def api_reachouts():
-        rows = dashboard.reachouts_rows(get_conn())
+        rows = dashboard.reachouts_rows(get_conn(), global_config)
         # Campaign -> {light,dark} color map for row tinting (req 8.2), derived
         # live from the campaign names actually present in the rows — the React
         # table applies it as a CSS custom property, never a hardcoded hex.
@@ -441,7 +441,7 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, api
         # Lightweight banner poll -- reads the same cache
         # get_gmass_dependent_data() already maintains, never triggers a
         # second, independent GMass sweep of its own.
-        gmass_data = dashboard.get_gmass_dependent_data(api_key, consumer_domains, redis_client, db_path)
+        gmass_data = dashboard.get_gmass_dependent_data(imap_config, consumer_domains, redis_client, db_path)
         return jsonify({"sync_result": gmass_data["sync_result"], "cache_status": gmass_data["cache_status"]})
 
     @app.route("/api/followups")
@@ -521,7 +521,7 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, api
             except ValueError:
                 return jsonify({"error": f"invalid resume_date {resume_date_str!r} — expected YYYY-MM-DD"}), 400
         try:
-            dashboard.tag_reply(get_conn(), recipient, tag, resume_date=resume_date, api_key=api_key)
+            dashboard.tag_reply(get_conn(), recipient, tag, resume_date=resume_date)
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
         except Exception as e:
@@ -538,7 +538,7 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, api
     @app.route("/api/reachouts/<string:recipient>/stop", methods=["POST"])
     def api_stop_outreach(recipient):
         try:
-            dashboard.stop_outreach(get_conn(), recipient, api_key=api_key)
+            dashboard.stop_outreach(get_conn(), recipient)
         except Exception as e:
             return jsonify({
                 "error": f"could not stop outreach to {recipient} — GMass suppression call failed, "
@@ -584,12 +584,11 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, api
     @app.route("/api/reachouts/<string:recipient>/linkedin-replied", methods=["POST"])
     def api_linkedin_replied(recipient):
         # LinkedIn reply-gate (see dashboard.gate_linkedin): marking a recipient
-        # replied-on-LinkedIn now HALTS their GMass outreach (status
-        # 'linkedin-gate'), so this fires a real GMass unsubscribe first and
-        # carries the same 502-on-failure, nothing-recorded contract as /stop.
-        # One-way, like Stop: un-gating isn't supported (GMass unsubscribe is
-        # account-wide, with no clean re-subscribe), so an explicit
-        # {replied: false} fails loud rather than silently doing nothing.
+        # replied-on-LinkedIn HALTS their outreach (status 'linkedin-gate') — the
+        # app owns the whole cadence under SMTP, so the linkedin_gate event alone
+        # stops it (no external timer to suppress). One-way, like Stop: un-gating
+        # isn't supported, so an explicit {replied: false} fails loud rather than
+        # silently doing nothing.
         # Unknown recipient -> 404, same as any missing resource.
         body = request.get_json(silent=True) or {}
         if body.get("replied") is False:
@@ -597,7 +596,7 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, api
                 "error": "un-gating a LinkedIn-gated recipient is not supported (one-way, like Stop)"
             }), 400
         try:
-            dashboard.gate_linkedin(get_conn(), recipient, api_key=api_key)
+            dashboard.gate_linkedin(get_conn(), recipient)
         except ValueError as e:
             return jsonify({"error": str(e)}), 404
         except Exception as e:
@@ -617,15 +616,16 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, api
             return jsonify({"error": str(e)}), 404
         return jsonify({"ok": True})
 
-    @app.route("/api/gmass/refresh", methods=["POST"])
-    def api_gmass_refresh():
-        # Mirrors gmass_refresh() -- manual escalation of
-        # get_gmass_dependent_data's own background refresh. Reports
-        # redis-unavailability in the body (200) rather than a redirect,
-        # since there's no page to redirect a JSON caller back to.
+    @app.route("/api/refresh", methods=["POST"])
+    def api_refresh():
+        # Manual escalation of get_gmass_dependent_data's own background refresh
+        # (now an IMAP reply poll, not a GMass poll — route renamed from the
+        # legacy /api/gmass/refresh). Reports redis-unavailability in the body
+        # (200) rather than a redirect, since there's no page to redirect a
+        # JSON caller back to.
         try:
             gmass_cache.ping(redis_client)
         except gmass_cache.RedisUnavailable:
             return jsonify({"ok": False, "reason": "redis_unavailable"})
-        dashboard._spawn_background_refresh(db_path, api_key, consumer_domains, redis_client)
+        dashboard._spawn_background_refresh(db_path, imap_config, consumer_domains, redis_client)
         return jsonify({"ok": True})

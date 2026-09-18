@@ -25,9 +25,33 @@ from slap.prompts import PASTE_TERMINATOR, read_paste
 from slap.queue import AmbiguousArchiveChoice, QueueError, resend_bounced, stage_recipient
 from slap.templates import fill_template, merge_config_values, parse_drop
 from slap import (
-    archive, dashboard, doctor, domains, followups, gmass, gmass_cache, init, launchd, onboard,
-    reload, runner, tracking,
+    archive, dashboard, doctor, domains, followups, gmass_cache, imap, init, launchd,
+    onboard, reload, runner, smtp, tracking,
 )
+
+
+def _smtp_config(global_config):
+    """SMTP transport credentials for a drain, built from config + env. The
+    Gmail App Password is loaded from .env into os.environ by load_dotenv();
+    the SMTP login/sender is the configured from_email. An empty password is
+    left to fail loud at send time (SmtpError) / preflight, mirroring how the
+    old GMASS_API_KEY path deferred its own empty-key check to doctor."""
+    return smtp.SmtpConfig(
+        host=smtp.DEFAULT_SMTP_HOST, port=smtp.DEFAULT_SMTP_PORT,
+        user=global_config.from_email,
+        password=os.environ.get(smtp.PASSWORD_ENV, "").strip(),
+    )
+
+
+def _imap_config(global_config):
+    """IMAP read credentials for reply detection, from config + env. Same Gmail
+    account + App Password as SMTP (Gmail accepts the app password for IMAP).
+    Passed to runner.drain so stop-on-reply is enforced at fire time."""
+    return imap.ImapConfig(
+        host=imap.DEFAULT_IMAP_HOST, port=imap.DEFAULT_IMAP_PORT,
+        user=global_config.from_email,
+        password=os.environ.get(smtp.PASSWORD_ENV, "").strip(),
+    )
 
 
 def cmd_list(args):
@@ -150,7 +174,8 @@ def cmd_send(args):
 
     if args.now:
         print("\n--now: draining the queue immediately...")
-        result = runner.drain(conn, global_config, os.environ.get(global_config.api_key_env, ""))
+        result = runner.drain(conn, global_config, _smtp_config(global_config),
+                             imap_config=_imap_config(global_config))
         _print_drain_result(result)
 
 
@@ -244,7 +269,8 @@ def cmd_send_unified(args):
 
     if args.now:
         print("\n--now: draining the queue immediately...")
-        result = runner.drain(conn, global_config, os.environ.get(global_config.api_key_env, ""))
+        result = runner.drain(conn, global_config, _smtp_config(global_config),
+                             imap_config=_imap_config(global_config))
         _print_drain_result(result)
 
 
@@ -421,7 +447,8 @@ def cmd_send_custom(args):
 
     if args.now:
         print("\n--now: draining the queue immediately...")
-        result = runner.drain(conn, global_config, os.environ.get(global_config.api_key_env, ""))
+        result = runner.drain(conn, global_config, _smtp_config(global_config),
+                             imap_config=_imap_config(global_config))
         _print_drain_result(result)
 
 
@@ -667,7 +694,8 @@ def cmd_runner(args):
         return
     conn = tracking.connect()
     runner.wait_for_fire_window(global_config.schedule)
-    result = runner.drain(conn, global_config, os.environ.get(global_config.api_key_env, ""))
+    result = runner.drain(conn, global_config, _smtp_config(global_config),
+                             imap_config=_imap_config(global_config))
     _print_drain_result(result)
 
 
@@ -687,17 +715,17 @@ def cmd_sync(args):
         display.fail(f"slap: {e}")
         sys.exit(1)
 
-    api_key = os.environ.get(global_config.api_key_env, "").strip()
-    if not api_key:
-        display.fail(f"slap: {global_config.api_key_env} is not set — sync needs it to poll GMass. "
-                     f"See .env.example.")
+    if not os.environ.get(smtp.PASSWORD_ENV, "").strip():
+        display.fail(f"slap: {smtp.PASSWORD_ENV} is not set — sync needs it to poll IMAP for "
+                     f"replies. See .env.example.")
         sys.exit(1)
+    imap_config = _imap_config(global_config)
 
     conn = tracking.connect()
     redis_client = gmass_cache.redis_client_from_url(global_config.redis_url)
 
     def do_refresh():
-        return dashboard.compute_gmass_dependent_data(conn, api_key, consumer_domains)
+        return dashboard.compute_gmass_dependent_data(conn, imap_config, consumer_domains)
 
     try:
         result = gmass_cache.refresh_with_lock(redis_client, do_refresh)
@@ -749,11 +777,11 @@ def cmd_dashboard(args):
         display.fail(f"slap: {e}")
         sys.exit(1)
 
-    api_key = os.environ.get(global_config.api_key_env, "").strip()
-    if not api_key:
-        display.fail(f"slap: {global_config.api_key_env} is not set — the dashboard's on-open "
-                     f"GMass poll (replies/clicks/bounces) needs it. See .env.example.")
+    if not os.environ.get(smtp.PASSWORD_ENV, "").strip():
+        display.fail(f"slap: {smtp.PASSWORD_ENV} is not set — the dashboard's on-open "
+                     f"IMAP reply poll needs it. See .env.example.")
         sys.exit(1)
+    imap_config = _imap_config(global_config)
 
     # The dashboard is now a React SPA served from a built bundle (slap/static/
     # dist/). Fail loud with the exact build command if it's missing, same "run
@@ -765,7 +793,7 @@ def cmd_dashboard(args):
         sys.exit(1)
 
     tracking.connect().close()  # ensure the DB file + schema exist before serving
-    app = dashboard.create_app(tracking.DB_PATH, global_config, consumer_domains, api_key)
+    app = dashboard.create_app(tracking.DB_PATH, global_config, consumer_domains, imap_config)
     # Not 5000: macOS's AirPlay Receiver (Control Center) listens there by
     # default on every Mac since Monterey and silently intercepts requests
     # with its own 403 page, making the dashboard look broken when it's
@@ -875,21 +903,16 @@ def cmd_interaction(args):
     conn = tracking.connect()
     try:
         if args.channel == "linkedin-reply":
-            # Marking LinkedIn-replied now HALTS GMass outreach (status
-            # 'linkedin-gate'), so it fires a real GMass unsubscribe and needs
-            # the api key. One-way, like Stop — --off can't clear it.
+            # Marking LinkedIn-replied HALTS outreach (status 'linkedin-gate').
+            # Under SMTP the app owns the cadence, so the gate event alone stops
+            # it — no external suppression call needed. One-way, like Stop —
+            # --off can't clear it.
             if args.off:
                 display.error("linkedin-reply is a one-way gate (like Stop) — --off can't clear it.")
                 return 1
-            global_config = load_global_config()
-            api_key = os.environ.get(global_config.api_key_env, "").strip()
-            if not api_key:
-                display.error(f"{global_config.api_key_env} is not set — the LinkedIn gate halts "
-                              f"GMass outreach and needs it. See .env.example.")
-                return 1
-            dashboard.gate_linkedin(conn, args.recipient, api_key=api_key)
+            dashboard.gate_linkedin(conn, args.recipient)
             display.success(
-                f"Marked {args.recipient} LinkedIn-replied — GMass outreach halted (status linkedin-gate)."
+                f"Marked {args.recipient} LinkedIn-replied — outreach halted (status linkedin-gate)."
             )
         else:  # followed-up
             dashboard.mark_followed_up(conn, args.recipient)

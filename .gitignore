@@ -61,3 +61,6 @@ CLAUDE.md
 # itself and must never be committed. Only the generic builder/workflow file is tracked.
 prompt-store/*
 !prompt-store/CLAUDE.md
+
+# smtp_selfsend smoke-test state (transient, holds a Message-ID)
+probes/.smoke_state.json

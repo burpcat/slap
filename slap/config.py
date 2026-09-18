@@ -198,7 +198,12 @@ def load_global_config(path: Path = CONFIG_PATH) -> GlobalConfig:
 
     from_email = _require(raw, "sender.from_email", path)
     from_name = _require(raw, "sender.from_name", path)
-    api_key_env = _require(raw, "gmass.api_key_env", path)
+    # The GMass era required a `gmass.api_key_env` block; under SMTP+IMAP the
+    # send/reply credentials are a Gmail App Password in .env (GMAIL_APP_PASSWORD,
+    # see slap.smtp.PASSWORD_ENV), not a config key. The block is now OPTIONAL —
+    # api_key_env survives only as a defaulted, unused field so existing configs
+    # and test constructors keep loading.
+    api_key_env = (raw.get("gmass") or {}).get("api_key_env", "GMASS_API_KEY")
 
     # _require raises only when the KEY is absent — a key present but set to
     # "" returns "" cleanly, exactly matching this feature's required
@@ -273,11 +278,12 @@ def load_global_config(path: Path = CONFIG_PATH) -> GlobalConfig:
     if not isinstance(redis_url, str):
         raise ConfigError(f"{path}: redis.url must be a string — got {redis_url!r}")
 
-    # Both optional, unlike gmass.api_key_env above (already _require()'d,
-    # so `gmass` is already guaranteed to be a dict by this point). Absent
-    # entirely -> None/False -> build_campaign_settings() sends neither
-    # field, byte-for-byte today's pre-existing behavior.
-    gmass_raw = raw["gmass"]
+    # The whole `gmass` block is optional now (see api_key_env above). These
+    # two knobs configured GMass's server-side follow-up timer, which no longer
+    # exists — nothing reads them post-migration, but they're still parsed/
+    # validated (and kept as defaulted fields) so a config that still carries
+    # them loads without error rather than failing loud on a now-inert key.
+    gmass_raw = raw.get("gmass") or {}
     gmass_allowed_days_raw = gmass_raw.get("allowed_days")
     gmass_allowed_days = (
         _validate_day_list(gmass_allowed_days_raw, f"{path}: gmass.allowed_days")

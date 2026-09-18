@@ -53,7 +53,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from slap import archive, gmass_cache, tracking
+from slap import archive, gmass_cache, smtp, tracking
 from slap.config import CampaignConfig, GlobalConfig
 from slap.prompts import placeholder_pdf
 
@@ -71,9 +71,14 @@ class CheckResult:
 
 
 def check_api_key(global_config: GlobalConfig) -> CheckResult:
-    if not os.environ.get(global_config.api_key_env, "").strip():
-        return CheckResult(global_config.api_key_env, False, "not set")
-    return CheckResult(global_config.api_key_env, True)
+    """Verify the Gmail App Password is present in the environment (loaded from
+    .env by python-dotenv). This single credential covers both SMTP sending and
+    IMAP reply detection — it replaced GMASS_API_KEY in the SMTP migration.
+    (Function name kept for now to limit the migration's blast radius across
+    run_global_checks and its tests.)"""
+    if not os.environ.get(smtp.PASSWORD_ENV, "").strip():
+        return CheckResult(smtp.PASSWORD_ENV, False, "not set")
+    return CheckResult(smtp.PASSWORD_ENV, True)
 
 
 def check_sender_fields(global_config: GlobalConfig) -> CheckResult:

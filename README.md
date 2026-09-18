@@ -1,11 +1,21 @@
 # slap
 
-A personal cold job-outreach CLI over the [GMass](https://www.gmass.co/) API. `slap`
+A personal cold job-outreach CLI that sends through your own Gmail over **SMTP**. `slap`
 fills an email template from a pasted "drop" (line-by-line `key: value`), optionally
-compiles a pasted LaTeX résumé and attaches it, then sends via GMass — which relays
-through your own Gmail account and runs the follow-up cadence on GMass's servers.
+compiles a pasted LaTeX résumé and attaches it, then sends and runs the follow-up cadence
+itself, detecting replies over **IMAP** to stop following up anyone who wrote back.
 Everything sent is tracked in local SQLite, with a localhost dashboard for status, reply
 triage, and an all-campaigns filterable Reach-outs view.
+
+> **Note — migrated off GMass.** `slap` used to send via the GMass API; it now sends
+> directly over Gmail SMTP and detects replies (and bounces) over IMAP, using a single
+> Gmail **App Password** (`GMAIL_APP_PASSWORD` in `.env`) for both. See
+> [`CHANGELOG.md`](CHANGELOG.md) for the full changelog (new features, breaking changes,
+> updated routes) and `CLAUDE.md`'s "Transport: local SMTP + IMAP" section for the
+> architecture. Setup: create an App Password at
+> <https://myaccount.google.com/apppasswords> (needs 2-Step Verification) and put it in
+> `.env`; `python slap.py init` walks you through it. Click tracking is not available over
+> plain SMTP. The previous GMass-stable version lives on the `old/gmass` branch.
 
 Single-owner, personal-use tool. Not multi-tenant, not a SaaS product.
 

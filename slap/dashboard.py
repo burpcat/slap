@@ -40,33 +40,25 @@ import threading
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-import requests
 from flask import Flask, abort, g, send_file
 
-from slap import archive, display, domains, gmass, gmass_cache, reload, tracking, ui_state
+from slap import archive, display, domains, gmass_cache, reload, stages, tracking, ui_state
 from slap.config import discover_campaigns
 from slap.domains import check_recipient
+from slap.imap import ImapError
 from slap.queue import (
     QueueError, _pending_ooo_resume_date, due_for_ooo_resend, due_recipients, resend_bounced,
     tag_ooo as _tag_ooo,
 )
 from slap.queue import queue_remind as _queue_remind
-from slap.runner import cap_headroom, staleness_warning as _runner_staleness_warning
+from slap.runner import (
+    cap_headroom, ingest_replies, next_fire_moment, staleness_warning as _runner_staleness_warning,
+)
 from slap.tracking import append_event
 
 STATIC_DIST = Path(__file__).parent / "static" / "dist"
 SPA_MISSING_MESSAGE = ("Frontend bundle not built \u2014 run "
                        "`npm --prefix slap/frontend run build`.")
-
-
-def _all_campaign_ids(conn) -> list:
-    """Every distinct GMass campaign this app has ever created, mapped back
-    to the recipient/campaign it belongs to."""
-    rows = conn.execute(
-        "SELECT DISTINCT gmass_campaign_id, recipient, campaign FROM events "
-        "WHERE gmass_campaign_id IS NOT NULL AND recipient IS NOT NULL"
-    ).fetchall()
-    return [dict(r) for r in rows]
 
 
 def _event_meta_values(conn, recipient: str, event_type: str) -> list:
@@ -81,171 +73,29 @@ def _current_stage(conn, recipient: str):
     return row["current_stage"] if row else None
 
 
-def _sync_replies(conn, api_key: str, campaign_id, recipient: str, campaign: str):
-    try:
-        items = gmass.get_reports(api_key, campaign_id, "replies")
-    except requests.exceptions.RequestException:
-        return 0, None  # transient network failure — tolerate, next poll retries
-    except gmass.GMassError as e:
-        return 0, str(e)  # a real API-level problem (bad key, schema drift) — surface it
-    seen = {m["reply_id"] for m in _event_meta_values(conn, recipient, "reply") if "reply_id" in m}
-    # Recorded on the reply's own `stage` column (not just in meta) so the
-    # dashboard's "reply-by-stage" panel (§8) can group by it directly —
-    # stage can't change mid-poll (reply events don't advance current_stage),
-    # so it's safe to look up once rather than per item.
-    stage = _current_stage(conn, recipient)
-    count = 0
-    for item in items:
-        reply_id = item.get("replyId")
-        if reply_id is None or reply_id in seen:
-            continue
-        append_event(conn, type="reply", recipient=recipient, campaign=campaign, stage=stage,
-                     meta={"reply_id": reply_id, "reply_time": item.get("replyTime")})
-        seen.add(reply_id)
-        count += 1
-    return count, None
+def sync_reports(conn, imap_config) -> dict:
+    """Poll IMAP for new replies and record them, returning a summary in the
+    same shape the dashboard/cache have always consumed. This is the SMTP
+    replacement for the old per-campaign GMass reports sweep: replies now come
+    from slap.runner.ingest_replies (matching an inbound reply's In-Reply-To/
+    References against our sent Message-IDs), and clicks/bounces have no free
+    SMTP equivalent — their counts are always 0 now. Historical click/bounce
+    events still render in their widgets; nothing new is ingested.
 
-
-def _sync_clicks(conn, api_key: str, campaign_id, recipient: str, campaign: str):
-    try:
-        items = gmass.get_reports(api_key, campaign_id, "clicks")
-    except requests.exceptions.RequestException:
-        return 0, None
-    except gmass.GMassError as e:
-        return 0, str(e)
-    seen = {(m["url"], m["click_time"]) for m in _event_meta_values(conn, recipient, "click")
-            if "url" in m and "click_time" in m}
-    stage = _current_stage(conn, recipient)  # §8's "click-by-stage" panel
-    count = 0
-    for item in items:
-        key = (item.get("url"), item.get("clickTime"))
-        if key in seen:
-            continue
-        append_event(conn, type="click", recipient=recipient, campaign=campaign, stage=stage,
-                     meta={"url": item.get("url"), "click_time": item.get("clickTime")})
-        seen.add(key)
-        count += 1
-    return count, None
-
-
-def _bounce_lifecycle_dedup_keys(conn, recipient: str) -> set:
-    """Every (reason, time) pair already recorded for this recipient across
-    BOTH bounces and blocks — they share the same `bounce` event type and
-    the same `bounce_reason`/`bounce_time` meta keys (see module docstring),
-    so one shared dedup set correctly prevents re-inserting either kind
-    twice, with no risk of a bounce and an unrelated block being conflated
-    (their reason/time text never coincidentally matches in practice)."""
-    return {(m["bounce_reason"], m["bounce_time"]) for m in _event_meta_values(conn, recipient, "bounce")
-            if "bounce_reason" in m and "bounce_time" in m}
-
-
-def _sync_bounces(conn, api_key: str, campaign_id, recipient: str, campaign: str):
-    try:
-        items = gmass.get_reports(api_key, campaign_id, "bounces")
-    except requests.exceptions.RequestException:
-        return 0, None
-    except gmass.GMassError as e:
-        return 0, str(e)
-    seen = _bounce_lifecycle_dedup_keys(conn, recipient)
-    count = 0
-    for item in items:
-        key = (item.get("bounceReason"), item.get("bounceTime"))
-        if key in seen:
-            continue
-        append_event(conn, type="bounce", recipient=recipient, campaign=campaign,
-                     meta={"bounce_reason": item.get("bounceReason"), "bounce_time": item.get("bounceTime"),
-                           "category": "bounce"})
-        seen.add(key)
-        count += 1
-    return count, None
-
-
-def _sync_blocks(conn, api_key: str, campaign_id, recipient: str, campaign: str):
-    """The `/blocks` report counterpart to _sync_bounces() — found missing
-    via real usage (the owner saw two delivery failures, the Bounces widget
-    showed only one). GMass reports blocks as an entirely separate category
-    from bounces (separate endpoint, separate `blockReason`/`blockTime`
-    field names — see slap.gmass.REPORT_TYPES, which already listed
-    "blocks" as a valid report type that nothing ever actually polled).
-
-    Writes the SAME `bounce` event type as _sync_bounces() — NOT a new
-    `block` type — deliberately: this app's `events.type` column has a SQL
-    CHECK constraint baked into every already-existing, populated slap.db
-    at table-creation time (see slap/tracking.py's _SCHEMA). Adding a new
-    literal event type would require a real ALTER-TABLE-style migration of
-    every owner's live database (SQLite has no ALTER TABLE ... ADD CHECK
-    VALUE — the only path is a full table rebuild), a live-data-migration
-    risk this fix does not need to take on. A block is functionally a dead-
-    delivery signal for every purpose this app already treats a bounce as
-    one (cleanup eligibility in slap.cleanup, dedup, recipients.status) —
-    reusing `bounce` means zero changes needed anywhere else in the app.
-    `meta["category"] = "block"` (mirroring reply_reviewed's meta["tag"]
-    pattern) is what lets the Bounces widget still show the distinction to
-    the owner instead of silently blending the two — see bounces() below."""
-    try:
-        items = gmass.get_reports(api_key, campaign_id, "blocks")
-    except requests.exceptions.RequestException:
-        return 0, None
-    except gmass.GMassError as e:
-        return 0, str(e)
-    seen = _bounce_lifecycle_dedup_keys(conn, recipient)
-    count = 0
-    for item in items:
-        key = (item.get("blockReason"), item.get("blockTime"))
-        if key in seen:
-            continue
-        append_event(conn, type="bounce", recipient=recipient, campaign=campaign,
-                     meta={"bounce_reason": item.get("blockReason"), "bounce_time": item.get("blockTime"),
-                           "category": "block"})
-        seen.add(key)
-        count += 1
-    return count, None
-
-
-def sync_reports(conn, api_key: str) -> dict:
-    """Poll every known campaign for new replies/clicks/bounces/blocks, write
-    events for anything not already recorded, and return a summary
-    including the UTC "last synced" instant (§8) — convert to local only at
-    display time.
-
-    A transient network failure (timeout, connection refused) on one
-    campaign's poll is tolerated silently — one campaign's poll failing must
-    not block syncing the rest, and the next on-open poll retries it. A real
-    API-level problem (bad/expired key, GMass schema drift) raises
-    `gmass.GMassError` instead, which is NOT swallowed the same way: it's
-    collected into `errors` and surfaced in the dashboard header, so an
-    auth failure doesn't silently look like "nothing new" forever.
-
-    `new_bounces` combines both _sync_bounces() and _sync_blocks() counts —
-    the top-of-dashboard sync summary just needs "how many new delivery
-    failures arrived," not a sub-category breakdown; the per-recipient
-    bounce/block distinction is what the Bounces widget itself (bounces(),
-    below) surfaces."""
-    new_replies = new_clicks = new_bounces = 0
+    An IMAP failure is surfaced in `errors` (not raised) so the on-open poll
+    degrades to "nothing new" with a visible reason, exactly as a GMass
+    auth/schema error used to (see get_gmass_dependent_data's header banner)."""
     errors = []
-    for row in _all_campaign_ids(conn):
-        cid, recipient, campaign = row["gmass_campaign_id"], row["recipient"], row["campaign"]
-        count, error = _sync_replies(conn, api_key, cid, recipient, campaign)
-        new_replies += count
-        if error:
-            errors.append(error)
-        count, error = _sync_clicks(conn, api_key, cid, recipient, campaign)
-        new_clicks += count
-        if error:
-            errors.append(error)
-        count, error = _sync_bounces(conn, api_key, cid, recipient, campaign)
-        new_bounces += count
-        if error:
-            errors.append(error)
-        count, error = _sync_blocks(conn, api_key, cid, recipient, campaign)
-        new_bounces += count
-        if error:
-            errors.append(error)
+    new_replies = 0
+    try:
+        new_replies = ingest_replies(conn, imap_config)
+    except ImapError as e:
+        errors.append(str(e))
     return {
         "synced_at": datetime.now(timezone.utc),
         "new_replies": new_replies,
-        "new_clicks": new_clicks,
-        "new_bounces": new_bounces,
+        "new_clicks": 0,
+        "new_bounces": 0,
         "errors": errors,
     }
 
@@ -548,8 +398,7 @@ def actionable_replies(conn, consumer_domains: set) -> list:
     return result
 
 
-def tag_reply(conn, recipient: str, tag: str, *, resume_date: date = None, api_key: str = None,
-              unsubscribe_fn=None) -> None:
+def tag_reply(conn, recipient: str, tag: str, *, resume_date: date = None) -> None:
     """The single underlying action behind BOTH OOO entry points: the
     original reply-tag widget (dashboard.html, gated on a detected `reply`
     event) and the manual "Mark OOO" action on every Reach-outs row
@@ -557,67 +406,41 @@ def tag_reply(conn, recipient: str, tag: str, *, resume_date: date = None, api_k
     needed). Both hit the exact same `/reply/<recipient>/tag` route, which
     calls this one function — never duplicated.
 
-    'ooo' now requires `resume_date` (the owner-chosen date this recipient
-    is expected back) and, before any local state changes, calls
-    `unsubscribe_fn` (slap.gmass.unsubscribe_recipient) to suppress GMass's
-    own native follow-up timer for this recipient — deliberately FIRST,
-    since that's the step that actually prevents a double-send (GMass firing
-    a native stage while SLAP separately, later, also fires one manually).
-    If that call raises, this function raises too and NOTHING is recorded
-    locally — a locally-recorded pause with no working GMass-side
-    suppression would be worse than not marking OOO at all: it would look
-    "handled" on the dashboard while GMass's native timer stayed fully live.
-    See slap.gmass.unsubscribe_recipient's docstring for why this is
-    account-wide, not per-campaign.
+    'ooo' requires `resume_date` (the owner-chosen date this recipient is
+    expected back) and records a local pause; the app then owns the rest of
+    that recipient's cadence via slap.queue.due_for_ooo_resend on its own
+    resume schedule. Under SMTP there is no external follow-up timer to
+    suppress (GMass's server-side timer is gone), so — unlike the GMass era —
+    this no longer needs to call any account-wide unsubscribe first: the
+    `ooo_tagged` event alone removes the recipient from every active query and
+    hands their remaining stages to the OOO path.
 
-    'not_interested' now ALSO calls `unsubscribe_fn` first, same as 'ooo' —
-    an explicit "not interested" is a stronger stop signal than an
-    auto-detected OOO (a temporary pause, not a request to stop), so it gets
-    the same GMass-side suppression and the same "nothing recorded locally
-    if the call fails" guarantee. 'real' is the one tag left as pure triage
-    bookkeeping with no side effect — a genuinely engaged reply should never
-    be touched.
-
-    'unreal' (post-launch: the Reach-outs "Unreal" action — the deal died
-    after being marked Real) is local-only, same as 'real', and for the
-    exact same reason: it's a hard requirement of this feature that
-    Real/Unreal never touch GMass at all (no call, no send, no suppression)
-    — going cold isn't a delivery/compliance signal the way OOO/not-
-    interested are, it's pure pipeline bookkeeping the owner's dashboard
-    alone cares about. Recorded as its OWN reply_reviewed tag value rather
-    than deleting/rewriting the original 'real' event — "was a lead, then
-    wasn't" is real history (§5 append-only), and reply_tags()'s existing
-    last-write-wins resolution already makes a later 'unreal' correctly
-    supersede an earlier 'real' with no extra logic (see that function's
-    own docstring).
-
-    `unsubscribe_fn` defaults to None and is resolved to
-    `gmass.unsubscribe_recipient` INSIDE this function body, not as a bound
-    default parameter — a default parameter value is captured once, at
-    module-import time, which would silently ignore a test's
-    `patch("slap.dashboard.gmass.unsubscribe_recipient", ...)` (the patch
-    replaces the module attribute; a stale bound-at-def-time reference never
-    sees it). Resolving it here instead means every call always sees
-    whatever `gmass.unsubscribe_recipient` currently is."""
+    'not_interested' and 'unreal' are pure reply_reviewed triage bookkeeping
+    with no side effect; 'real' likewise. (Under GMass, 'ooo'/'not_interested'
+    additionally fired an account-wide unsubscribe to stop GMass's native
+    timer — that lever, and its "nothing recorded locally if the call fails"
+    guarantee, are gone with the timer they existed to stop.) 'unreal'
+    (Reach-outs "Unreal" — the deal died after being marked Real) is recorded
+    as its OWN reply_reviewed tag value rather than rewriting the original
+    'real' event: "was a lead, then wasn't" is real history (§5 append-only),
+    and reply_tags()'s last-write-wins resolution makes a later 'unreal'
+    supersede an earlier 'real' with no extra logic."""
     if tag not in ("real", "ooo", "not_interested", "unreal"):
         raise ValueError(f"unknown tag {tag!r} — must be 'real', 'ooo', 'not_interested', or 'unreal'")
     if tag == "ooo":
         if resume_date is None:
             raise ValueError("resume_date is required when tag='ooo'")
-        (unsubscribe_fn or gmass.unsubscribe_recipient)(api_key, recipient)
         _tag_ooo(conn, recipient, resume_date)
         return
-    if tag == "not_interested":
-        (unsubscribe_fn or gmass.unsubscribe_recipient)(api_key, recipient)
     row = conn.execute("SELECT campaign FROM recipients WHERE recipient = ?", (recipient,)).fetchone()
     campaign = row["campaign"] if row else None
     append_event(conn, type="reply_reviewed", recipient=recipient, campaign=campaign, meta={"tag": tag})
 
 
-def stop_outreach(conn, recipient: str, *, api_key: str = None, unsubscribe_fn=None) -> None:
+def stop_outreach(conn, recipient: str) -> None:
     """"Stop outreach" (Part 2, post-launch): a permanent, one-recipient halt
     to further follow-ups — e.g. the owner was rejected for the specific
-    role this recipient was contacted about and doesn't want GMass's
+    role this recipient was contacted about and doesn't want the app's
     remaining cadence stages to keep firing at them. **Scoped to exactly
     this ONE recipient — confirmed with the owner.** A "stop the whole
     campaign" reading of the original request was considered and explicitly
@@ -629,18 +452,12 @@ def stop_outreach(conn, recipient: str, *, api_key: str = None, unsubscribe_fn=N
     against in favor of keeping this to the smallest, least-surprising
     blast radius: the one row the owner actually clicked.
 
-    Treated exactly like OOO/not_interested (tag_reply, above) — same real
-    suppression action, same ordering: calls `unsubscribe_fn`
-    (slap.gmass.unsubscribe_recipient, the only suppression lever confirmed
-    to actually register — a per-campaign variant was disproven, see that
-    function's own docstring) FIRST, before any local write. If it raises,
-    this function raises too and NOTHING is recorded locally — a
-    locally-recorded stop with no working GMass-side suppression would look
-    "handled" on the dashboard while GMass's native timer stayed fully live,
-    the identical failure mode tag_reply's own docstring already rejects for
-    OOO/not_interested.
+    Under SMTP the app owns the entire follow-up cadence itself, so the
+    `stopped` event alone halts everything — there is no external GMass timer
+    to also suppress (the GMass era additionally fired an account-wide
+    unsubscribe here FIRST; that lever is gone with the timer it stopped).
 
-    Only on success does this append the `stopped` event
+    Appends the `stopped` event
     (`meta={"scope": "recipient"}` — the scope rides in the event itself so
     a future wider scope, if ever built, is still distinguishable from this
     one in the append-only log rather than silently indistinguishable).
@@ -661,7 +478,6 @@ def stop_outreach(conn, recipient: str, *, api_key: str = None, unsubscribe_fn=N
     (append-only — this never rewrites the Real/Unreal tag), and the
     status column alone can't be trusted to still say 'stopped' by the time
     any of those later read it."""
-    (unsubscribe_fn or gmass.unsubscribe_recipient)(api_key, recipient)
     row = conn.execute("SELECT campaign FROM recipients WHERE recipient = ?", (recipient,)).fetchone()
     campaign = row["campaign"] if row else None
     append_event(conn, type="stopped", recipient=recipient, campaign=campaign, meta={"scope": "recipient"})
@@ -687,8 +503,7 @@ def _followups_scheduled(conn, global_config, *, today: date = None) -> dict:
         next_stage = row["current_stage"] + 1
         if next_stage > len(cadence):
             continue
-        cumulative_days = sum(cadence[:next_stage])
-        fire_date = _local_date(row["first_sent_at"]) + timedelta(days=cumulative_days)
+        fire_date = stages.stage_fire_date(_local_date(row["first_sent_at"]), cadence, next_stage)
         entry = {"recipient": row["recipient"], "next_stage": next_stage, "fire_date": fire_date}
         if fire_date == today:
             due_today.append(entry)
@@ -1253,20 +1068,19 @@ def mark_linkedin_replied(conn, recipient: str, replied: bool) -> None:
                           meta={"channel": "linkedin_reply", "state": bool(replied)})
 
 
-def gate_linkedin(conn, recipient: str, *, api_key: str = None, unsubscribe_fn=None) -> None:
+def gate_linkedin(conn, recipient: str) -> None:
     """LinkedIn reply-gate: the owner marks this recipient as replied-on-LinkedIn,
-    which HALTS their GMass outreach and moves them to status 'linkedin-gate'.
+    which HALTS their outreach and moves them to status 'linkedin-gate'.
 
-    Treated exactly like stop_outreach() — same real GMass suppression, same
-    ordering: call `unsubscribe_fn` (slap.gmass.unsubscribe_recipient) FIRST,
-    before any local write, and if it raises, raise too and record NOTHING
-    locally (a locally-gated recipient with GMass's native timer still live is
-    the exact "looks handled but isn't" failure stop_outreach() rejects). Unlike
-    plain mark_linkedin_replied() (which is pure bookkeeping and fires no GMass
-    call), gating IS delivery suppression — the owner has moved the conversation
-    to LinkedIn and doesn't want GMass's remaining cadence firing.
+    Under SMTP the app owns the whole follow-up cadence, so the `linkedin_gate`
+    event alone halts everything — there is no external GMass timer to suppress
+    first (the GMass era fired an account-wide unsubscribe here before the local
+    write; that lever is gone with the timer it stopped). Unlike plain
+    mark_linkedin_replied() (pure bookkeeping), gating IS delivery suppression —
+    the owner has moved the conversation to LinkedIn and doesn't want the
+    remaining cadence firing.
 
-    On success, appends TWO append-only events (same connection, atomic):
+    Appends TWO append-only events (same connection, atomic):
       * `interaction` {channel: linkedin_reply, state: True} — so
         linkedin_replied_state() reports them as LinkedIn-replied, keeping the
         Campaigns "Replied on LinkedIn" card and the Reach-outs reply cell lit;
@@ -1276,15 +1090,13 @@ def gate_linkedin(conn, recipient: str, *, api_key: str = None, unsubscribe_fn=N
         active-only query (due_recipients/due_for_ooo_resend/followups_scheduled)
         with zero query changes.
 
-    One-way, like Stop: GMass unsubscribe is account-wide with no clean
-    re-subscribe, so there is no un-gate. Idempotent — a no-op (no second GMass
-    call, no duplicate events) if the recipient is already gated. Fail loud on an
-    unknown recipient, same guard as mark_linkedin_replied()/stop_outreach()."""
+    One-way, like Stop: there is no un-gate. Idempotent — a no-op (no duplicate
+    events) if the recipient is already gated. Fail loud on an unknown
+    recipient, same guard as mark_linkedin_replied()/stop_outreach()."""
     if not _recipient_exists(conn, recipient):
         raise ValueError(f"unknown recipient {recipient!r} — never staged/contacted")
     if recipient in _linkedin_gated_recipients(conn):
-        return  # already gated — idempotent, don't re-hit GMass or double-log
-    (unsubscribe_fn or gmass.unsubscribe_recipient)(api_key, recipient)
+        return  # already gated — idempotent, don't double-log
     campaign = conn.execute(
         "SELECT campaign FROM recipients WHERE recipient = ?", (recipient,)
     ).fetchone()["campaign"]
@@ -1609,7 +1421,8 @@ def _already_corrected_to(conn) -> dict:
 
 
 def _status_chip(*, status: str, engagement: str, reply_tag, bounce_category, bounce_reason,
-                  ooo_resume_date, num_clicks: int, stopped: bool = False, gated: bool = False) -> dict:
+                  ooo_resume_date, num_clicks: int, stopped: bool = False, gated: bool = False,
+                  stage_label: str = None) -> dict:
     """One computed `{color, label}` per Reach-outs row — folds status,
     engagement, reply_tag, and bounce category/reason into a single display
     value (see the Reach-outs layout redesign) instead of several columns
@@ -1687,7 +1500,16 @@ def _status_chip(*, status: str, engagement: str, reply_tag, bounce_category, bo
     if engagement == "clicked":
         return {"color": "serious", "label": f"Clicked ({num_clicks})" if num_clicks > 1 else "Clicked"}
 
-    if status in ("done", "active", "queued"):
+    # In-flight (active) rows lead with the estimated CADENCE STAGE they're in
+    # (initial / stage1 / stage2 …) rather than a generic "Active" — a
+    # best-effort estimate (GMass fires follow-ups server-side with no
+    # read-back; see slap.stages), surfaced as an estimate in the UI via
+    # tooltip. `stage_label` is precomputed by reachouts_rows(); falls back to
+    # "Active" for any caller that doesn't pass one (e.g. an older cadence-less
+    # row). done/queued keep their plain status word.
+    if status == "active":
+        return {"color": None, "label": stage_label or "Active"}
+    if status in ("done", "queued"):
         return {"color": None, "label": status.capitalize()}
     return {"color": None, "label": status or "—"}
 
@@ -1701,7 +1523,7 @@ def template_failures() -> list:
     return reload.load_failures()
 
 
-def reachouts_rows(conn) -> list:
+def reachouts_rows(conn, global_config=None) -> list:
     """One row per recipient (the `recipients` cache's own natural grain —
     a recipient's single current row already reflects whichever campaign
     they're most recently associated with), spanning every campaign with no
@@ -1809,6 +1631,7 @@ def reachouts_rows(conn) -> list:
     linkedin_replied_at_map = linkedin_replied_at(conn)
     pending_retry = _pending_retry_recipients(conn)
     rows = conn.execute("SELECT * FROM recipients").fetchall()
+    today = date.today()  # local, for the cadence stage/next-shoot estimates below
 
     result = []
     for row in rows:
@@ -1844,6 +1667,65 @@ def reachouts_rows(conn) -> list:
         clicks = click_details.get(recipient, [])
         is_stopped = recipient in stopped_recipients
         is_gated = recipient in gated_recipients
+
+        # Estimated cadence stage ("initial"/"stage1"/…) + next scheduled send
+        # ("next shoot"). Both are BEST-EFFORT estimates: GMass fires
+        # follow-ups server-side with no read-back (see slap.stages /
+        # CONTROL_SHEET.md), so recipients.current_stage stays 0 for a
+        # normally-progressing recipient and we infer the stage from elapsed
+        # calendar days vs the recipient's own recorded cadence. Surfaced only
+        # for in-flight rows; a finished sequence (replied/bounced/stopped/
+        # gated/done/not-interested) leaves both None so the Status chip keeps
+        # its own label and "Next shoot" renders a plain "-". current_stage is
+        # passed as the estimate FLOOR so an OOO-advanced recipient never reads
+        # below the stage the event log already confirms.
+        stage_index = None
+        stage_label = None
+        next_shoot_at = None
+        sequence_over = (
+            is_stopped or is_gated
+            or status in ("replied", "bounced", "done")
+            or tags.get(recipient) == "not_interested"
+        )
+        cadence = None
+        if row["cadence"]:
+            cadence = json.loads(row["cadence"])
+        elif global_config is not None and row["persona"]:
+            cadence = global_config.personas.get(row["persona"])
+
+        if status == "ooo_requeued":
+            # OOO is paused mid-sequence, not finished — the resume date IS the
+            # next scheduled email (already resolved above). No stage estimate:
+            # OOO progression is app-driven, off the original calendar offsets.
+            next_shoot_at = ooo_resume_date
+        elif not sequence_over and status in ("active", "queued", "pending_retry"):
+            if row["first_sent_at"] is None:
+                # Nothing sent yet (queued, or a never-sent pending_retry): the
+                # next send is the INITIAL one, on the runner's next drain window.
+                stage_index = 0
+                if global_config is not None:
+                    next_shoot_at = next_fire_moment(global_config.schedule).isoformat()
+            elif cadence is not None:
+                fs_local = _local_date(row["first_sent_at"])
+                stage_index = stages.estimate_current_stage(
+                    fs_local, cadence, today, floor=row["current_stage"] or 0)
+                if status == "active":
+                    # Next GMass-fired follow-up on the cadence calendar; None
+                    # once the whole window has elapsed (nothing left to send).
+                    nfd = stages.next_fire_date(fs_local, cadence, today, from_stage=stage_index)
+                    if nfd is not None:
+                        next_shoot_at = datetime.combine(nfd, datetime.min.time()).isoformat()
+                elif global_config is not None:
+                    # pending_retry (already sent once): the last attempt failed;
+                    # it retries on the next drain window, not on the cadence date.
+                    next_shoot_at = next_fire_moment(global_config.schedule).isoformat()
+            else:
+                # Sent at least once but no cadence data (a legacy row with a
+                # NULL cadence column and no global_config to fall back on):
+                # can't estimate elapsed stages — floor to the recorded stage,
+                # leave next_shoot None rather than guess.
+                stage_index = row["current_stage"] or 0
+            stage_label = stages.stage_label(stage_index)
 
         result.append({
             "recipient": recipient,
@@ -1886,11 +1768,19 @@ def reachouts_rows(conn) -> list:
             # silently un-mark this row. Drives the chip precedence below and
             # the React table's "gate the 'in' button once gated" state.
             "linkedin_gated": is_gated,
+            # Estimated cadence stage (see the block above). stage_index is the
+            # numeric form (0 = initial) for sorting; stage_label ("initial"/
+            # "stage1"/…) is what the Status chip leads with for an active row.
+            # Both None for a finished/non-in-flight sequence. next_shoot_at is
+            # a local ISO timestamp of the next scheduled send, or None ("-").
+            "stage_index": stage_index,
+            "stage_label": stage_label,
+            "next_shoot_at": next_shoot_at,
             "chip": _status_chip(status=status, engagement=engagement, reply_tag=tags.get(recipient),
                                   bounce_category=bounce_category, bounce_reason=bounce_reason,
                                   ooo_resume_date=ooo_resume_date,
                                   num_clicks=len(clicks) or (1 if engagement == "clicked" else 0),
-                                  stopped=is_stopped, gated=is_gated),
+                                  stopped=is_stopped, gated=is_gated, stage_label=stage_label),
             # Precomputed LOCAL calendar date (YYYY-MM-DD), reusing the same
             # _local_date() conversion todays_runs()/companies_contacted()
             # already use — so the client-side date-range filter (reachouts.
@@ -1966,15 +1856,17 @@ def filter_reachouts(rows: list, filters: dict) -> list:
 # way or the other. Left uncached, computed fresh from SQLite every load,
 # same as every other genuinely local-only widget.
 
-def compute_gmass_dependent_data(conn, api_key: str, consumer_domains: set) -> dict:
-    """The one place that computes everything the dashboard's four GMass-
-    dependent widgets need: runs the EXISTING sync_reports() (completely
-    unchanged — polls GMass, writes new click/reply/bounce/block events),
-    then computes engagement_intelligence()/warm_but_silent()/bounces()/
-    actionable_replies() fresh from the now-updated SQLite. Both the hourly
-    `slap.py sync` job and the dashboard's on-open fallback call this exact
-    function via gmass_cache.refresh_with_lock() — never two independent
-    implementations of "go get fresh GMass data."
+def compute_gmass_dependent_data(conn, imap_config, consumer_domains: set) -> dict:
+    """The one place that computes everything the dashboard's four
+    engagement widgets need: runs sync_reports() (now an IMAP reply poll —
+    writes new `reply` events; clicks/bounces are no longer ingested under
+    SMTP), then computes engagement_intelligence()/warm_but_silent()/
+    bounces()/actionable_replies() fresh from the now-updated SQLite. Both the
+    hourly `slap.py sync` job and the dashboard's on-open fallback call this
+    exact function via gmass_cache.refresh_with_lock() — never two independent
+    implementations of "go get fresh reply data." (The `gmass`/`gmass_*`
+    naming is retained for now to limit the migration's blast radius; the
+    Redis cache module is transport-agnostic.)
 
     Fully JSON-serializable (no datetime/dataclass objects) so it can be
     written straight into Redis. Renders identically whether it's used
@@ -1982,7 +1874,7 @@ def compute_gmass_dependent_data(conn, api_key: str, consumer_domains: set) -> d
     access on a plain dict falls back to item access, so
     `{{ r.dedup_context.hard_warning }}` works the same either way
     (verified directly, not assumed)."""
-    sync_result = sync_reports(conn, api_key)
+    sync_result = sync_reports(conn, imap_config)
     replies = actionable_replies(conn, consumer_domains)
     return {
         "cached_at": datetime.now(timezone.utc).isoformat(),
@@ -2022,7 +1914,7 @@ def _empty_gmass_data() -> dict:
     }
 
 
-def _background_refresh(db_path: Path, api_key: str, consumer_domains: set, redis_client) -> None:
+def _background_refresh(db_path: Path, imap_config: str, consumer_domains: set, redis_client) -> None:
     """Runs the SAME refresh_with_lock()/compute_gmass_dependent_data() path
     the hourly `slap.py sync` job uses, but on a daemon thread spawned from
     a dashboard request — see get_gmass_dependent_data's docstring for why
@@ -2045,7 +1937,7 @@ def _background_refresh(db_path: Path, api_key: str, consumer_domains: set, redi
     conn = tracking.connect(db_path)
     try:
         def do_refresh():
-            return compute_gmass_dependent_data(conn, api_key, consumer_domains)
+            return compute_gmass_dependent_data(conn, imap_config, consumer_domains)
         gmass_cache.refresh_with_lock(redis_client, do_refresh)
     except Exception as e:
         display.error(f"slap dashboard: background GMass refresh failed: {e}")
@@ -2053,13 +1945,13 @@ def _background_refresh(db_path: Path, api_key: str, consumer_domains: set, redi
         conn.close()
 
 
-def _spawn_background_refresh(db_path: Path, api_key: str, consumer_domains: set, redis_client) -> None:
+def _spawn_background_refresh(db_path: Path, imap_config: str, consumer_domains: set, redis_client) -> None:
     threading.Thread(
-        target=_background_refresh, args=(db_path, api_key, consumer_domains, redis_client), daemon=True,
+        target=_background_refresh, args=(db_path, imap_config, consumer_domains, redis_client), daemon=True,
     ).start()
 
 
-def get_gmass_dependent_data(api_key: str, consumer_domains: set, redis_client, db_path: Path) -> dict:
+def get_gmass_dependent_data(imap_config: str, consumer_domains: set, redis_client, db_path: Path) -> dict:
     """Orchestrates the dashboard's four GMass-dependent widgets against the
     Redis cache refreshed hourly by `slap.py sync` (slap/gmass_cache.py).
     Never blocks the request on a live GMass poll — a stale/missing/absent
@@ -2099,7 +1991,7 @@ def get_gmass_dependent_data(api_key: str, consumer_domains: set, redis_client, 
     if cached is not None and gmass_cache.is_fresh(cached):
         return {**cached, "cache_status": "fresh"}
 
-    _spawn_background_refresh(db_path, api_key, consumer_domains, redis_client)
+    _spawn_background_refresh(db_path, imap_config, consumer_domains, redis_client)
 
     if cached is not None:
         return {**cached, "cache_status": "stale_refreshing"}
@@ -2292,7 +2184,9 @@ def recipient_timeline(conn, recipient: str, *, global_config=None, now: datetim
         for stage in range(1, len(cadence) + 1):
             if stage in real_send_stages:
                 continue  # a real send/requeue already covers this stage
-            est_dt = first_sent_dt + timedelta(days=sum(cadence[:stage]))
+            # stage_fire_date is date-agnostic (datetime + timedelta preserves
+            # the send's time-of-day here, unlike the date-based callers).
+            est_dt = stages.stage_fire_date(first_sent_dt, cadence, stage)
             if terminal_dt is not None and est_dt >= terminal_dt:
                 break  # cadence halted at the terminal event — no later sends
             nodes.append({
@@ -2346,7 +2240,7 @@ def read_log_tail(path: Path, *, n_lines: int = 200) -> list:
     return path.read_text().splitlines()[-n_lines:][::-1]
 
 
-def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str, *,
+def create_app(db_path: Path, global_config, consumer_domains: set, imap_config: str, *,
                 redis_client=None, log_dir: Path = None) -> Flask:
     """§8: reads SQLite, renders read-only panels except the single write
     action (reply tagging). The four GMass-dependent widgets (engagement
@@ -2427,7 +2321,7 @@ def create_app(db_path: Path, global_config, consumer_domains: set, api_key: str
     from slap.api import register_api
     register_api(
         app, get_conn=get_conn, db_path=db_path, global_config=global_config,
-        consumer_domains=consumer_domains, api_key=api_key, redis_client=redis_client, log_dir=log_dir,
+        consumer_domains=consumer_domains, imap_config=imap_config, redis_client=redis_client, log_dir=log_dir,
     )
 
     return app
