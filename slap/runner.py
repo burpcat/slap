@@ -360,6 +360,24 @@ def ingest_bounces(conn, imap_config, *, poll_bounces_fn=imap.poll_bounces) -> i
     return new
 
 
+def _thread_references(conn, recipient: str) -> str:
+    """The RFC 5322 References chain for the next threaded message to
+    `recipient`: every Message-ID we've already sent them, in send order,
+    space-joined. A strict mail client threads a late follow-up back to the
+    original by intersecting References sets, so carrying the WHOLE chain (not
+    just the immediate parent, which In-Reply-To already gives) keeps the
+    conversation grouped even where In-Reply-To alone wouldn't. Derived live
+    from the append-only log — no parallel state to keep in sync. Returns None
+    when the recipient has no prior send (the initial send has no chain)."""
+    rows = conn.execute(
+        "SELECT message_id FROM events WHERE recipient = ? AND message_id IS NOT NULL "
+        "AND type IN ('sent', 'requeued', 'interaction') ORDER BY id ASC",
+        (recipient,),
+    ).fetchall()
+    ids = [r["message_id"] for r in rows]
+    return " ".join(ids) if ids else None
+
+
 def _send_one(conn, smtp_config, row: dict, *, workdir_root: Path = WORKDIR_ROOT,
               send_message_fn=smtp.send_message, sender_name: str = None) -> bool:
     recipient, campaign = row["recipient"], row["campaign"]
@@ -491,7 +509,7 @@ def _send_ooo_resend(conn, smtp_config, row: dict, *, workdir_root: Path = WORKD
         sent = send_message_fn(
             smtp_config, sender=smtp_config.user, sender_name=sender_name,
             recipient=recipient, subject=subject, body=stage_body,
-            in_reply_to=reply_to_message_id,
+            in_reply_to=reply_to_message_id, references=_thread_references(conn, recipient),
         )
     except Exception as e:
         append_event(conn, type="send_failed", recipient=recipient, campaign=campaign,
@@ -557,7 +575,7 @@ def _send_followup(conn, smtp_config, row: dict, *, workdir_root: Path = WORKDIR
         sent = send_message_fn(
             smtp_config, sender=smtp_config.user, sender_name=sender_name,
             recipient=recipient, subject=subject, body=stage_body,
-            in_reply_to=reply_to_message_id,
+            in_reply_to=reply_to_message_id, references=_thread_references(conn, recipient),
         )
     except Exception as e:
         append_event(conn, type="send_failed", recipient=recipient, campaign=campaign,
@@ -601,7 +619,7 @@ def _send_remind(conn, smtp_config, row: dict, *, workdir_root: Path = WORKDIR_R
         sent = send_message_fn(
             smtp_config, sender=smtp_config.user, sender_name=sender_name,
             recipient=recipient, subject=subject, body=body,
-            in_reply_to=reply_to_message_id,
+            in_reply_to=reply_to_message_id, references=_thread_references(conn, recipient),
         )
     except Exception as e:
         append_event(conn, type="send_failed", recipient=recipient, campaign=campaign,

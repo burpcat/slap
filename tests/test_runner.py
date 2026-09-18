@@ -1265,6 +1265,21 @@ def test_drain_followup_chains_the_reply_thread(conn, tmp_path):
           workdir_root=tmp_path / "workdir", send_message_fn=send_fu2)
     assert calls2["send"] == 1
     assert calls2["last"]["in_reply_to"] == "<fu1@gmail.com>"  # threads into stage 1, not the initial
+    # References carries the FULL ancestor chain (initial + stage 1), so even a
+    # strict References-set client still groups this stage with the original.
+    assert calls2["last"]["references"] == "<init@gmail.com> <fu1@gmail.com>"
+
+
+def test_drain_first_followup_references_only_the_initial(conn, tmp_path):
+    gc = make_global_config(tmp_path)
+    stage_one(conn, tmp_path, cadence=[2, 3, 5])
+    drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+          send_message_fn=fake_smtp(message_id="<init@gmail.com>")[0])
+    send_fu, calls = fake_smtp(message_id="<fu1@gmail.com>")
+    drain(conn, gc, SMTP, now=date.today() + timedelta(days=2), sleep_fn=lambda s: None,
+          workdir_root=tmp_path / "workdir", send_message_fn=send_fu)
+    assert calls["last"]["in_reply_to"] == "<init@gmail.com>"
+    assert calls["last"]["references"] == "<init@gmail.com>"
 
 
 # --- IMAP reply ingestion + stop-on-reply at fire time (§8/§10 under SMTP) ---
