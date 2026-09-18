@@ -10,17 +10,22 @@ with a different owner's config is automatically guarded to THEIR address.
 
 Requires ``GMAIL_APP_PASSWORD`` in the environment (loaded from .env). Usage:
 
-  python probes/smtp_selfsend.py send [N]      # send an initial to +testmass{N} (default 1)
-  python probes/smtp_selfsend.py poll-replies  # IMAP-poll for a reply to the last send
-  python probes/smtp_selfsend.py poll-bounces  # IMAP-poll (read-only) for bounce DSNs
+  python probes/smtp_selfsend.py send [N]       # send an initial to +testmass{N} (default 1)
+  python probes/smtp_selfsend.py send-followup  # send a threaded follow-up into that thread
+  python probes/smtp_selfsend.py poll-replies   # IMAP-poll for a reply to any message we sent
+  python probes/smtp_selfsend.py poll-bounces   # IMAP-poll (read-only) for bounce DSNs
 
 Verify the whole loop end to end:
   1. `send`               → a real email lands in your own +testmass inbox.
-  2. reply to that email from Gmail.
-  3. `poll-replies`       → should report the reply detected, i.e. stop-on-reply
-                            would fire (the recipient flips to status='replied').
+  2. `send-followup`      → a follow-up lands IN THE SAME Gmail conversation.
+                            Open it, "Show original", and confirm the follow-up's
+                            In-Reply-To + References point at the earlier message(s)
+                            — exactly what runner._send_followup emits in production.
+  3. reply to the thread from Gmail, then `poll-replies` → reports the reply
+                            detected, i.e. stop-on-reply would fire.
 This exercises the real slap.smtp + slap.imap code paths the unit tests can only
-mock. State (the last send's Message-ID) is written to probes/.smoke_state.json.
+mock. State (the accumulated Message-ID chain) is written to
+probes/.smoke_state.json, so send-followup threads exactly as production does.
 """
 import json
 import os
@@ -83,10 +88,40 @@ def cmd_send(n):
         body=("This is a live SMTP smoke test from slap. Reply to this email to verify "
               "IMAP reply detection.\n\n" + (gc.signature or "")),
     )
-    STATE.write_text(json.dumps({"message_id": result["message_id"], "recipient": recipient}))
+    STATE.write_text(json.dumps({"recipient": recipient, "subject": "slap SMTP smoke test",
+                                 "chain": [result["message_id"]]}))
     print(f"SENT to {recipient}")
     print(f"  Message-ID: {result['message_id']}")
-    print("  Next: reply to that email, then run: python probes/smtp_selfsend.py poll-replies")
+    print("  Next: python probes/smtp_selfsend.py send-followup   (threads a reply into this)")
+
+
+def cmd_send_followup():
+    load_dotenv()
+    gc, local, domain = _owner_parts()
+    if not STATE.exists():
+        sys.exit("FAIL: no prior send recorded — run `send` first.")
+    st = json.loads(STATE.read_text())
+    recipient = _guard(st["recipient"], local, domain)  # guard the saved recipient too
+    chain = st["chain"]
+    smtp_cfg, _ = _creds(gc)
+    # Thread exactly as runner._send_followup does: In-Reply-To = the latest
+    # message, References = the whole accumulated chain, "Re:" the subject.
+    in_reply_to = chain[-1]
+    references = " ".join(chain)
+    result = smtp.send_message(
+        smtp_cfg, sender=gc.from_email, sender_name=gc.from_name, recipient=recipient,
+        subject=f"Re: {st['subject']}", in_reply_to=in_reply_to, references=references,
+        body="Threaded follow-up from slap's smoke test — this should land in the SAME "
+             "Gmail conversation as the initial send.\n\n" + (gc.signature or ""),
+    )
+    st["chain"].append(result["message_id"])
+    STATE.write_text(json.dumps(st))
+    print(f"SENT FOLLOW-UP to {recipient} (should thread into the existing conversation)")
+    print(f"  In-Reply-To: {in_reply_to}")
+    print(f"  References:  {references}")
+    print(f"  Message-ID:  {result['message_id']}")
+    print("  Check Gmail: the follow-up should appear inside the original thread. "
+          "'Show original' to confirm the headers.")
 
 
 def cmd_poll_replies():
@@ -96,7 +131,7 @@ def cmd_poll_replies():
     if not STATE.exists():
         sys.exit("FAIL: no prior send recorded — run `send` first.")
     st = json.loads(STATE.read_text())
-    replies = imap.poll_replies(imap_cfg, {st["message_id"]})
+    replies = imap.poll_replies(imap_cfg, set(st["chain"]))  # a reply to ANY message we sent
     if replies:
         print(f"REPLY DETECTED to {st['recipient']}:")
         for r in replies:
@@ -104,7 +139,7 @@ def cmd_poll_replies():
         print("  -> stop-on-reply would fire: this recipient flips to status='replied' and "
               "receives no further follow-ups.")
     else:
-        print(f"No reply detected yet for {st['message_id']}.")
+        print(f"No reply detected yet for the thread {st['chain']}.")
         print("  Reply to the test email from Gmail, then re-run (IMAP can lag a few seconds).")
 
 
@@ -130,6 +165,8 @@ def main():
     cmd = sys.argv[1]
     if cmd == "send":
         cmd_send(sys.argv[2] if len(sys.argv) > 2 else "1")
+    elif cmd == "send-followup":
+        cmd_send_followup()
     elif cmd == "poll-replies":
         cmd_poll_replies()
     elif cmd == "poll-bounces":
