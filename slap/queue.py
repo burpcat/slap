@@ -521,6 +521,14 @@ def due_for_followup(conn, global_config, *, today: date = None) -> list:
 
     A recipient qualifies when ALL of:
       - status == 'active' with a real initial send recorded (first_sent_at set),
+      - a `message_id` on record — i.e. they were sent via the new SMTP path, so
+        there's a real thread to reply into. Recipients contacted under the old
+        GMass transport have a gmass_campaign_id but NO message_id, and the app
+        cannot (and must not) thread a follow-up to them: they belong to the old
+        cadence GMass already ran, not the new app-owned one. Without this guard
+        every pre-migration recipient would be re-selected on every drain and
+        fail with "no prior message_id to thread the follow-up into" — noisy and
+        wrong. Excluding them here leaves the GMass-era backlog untouched.
       - no OOO history for their current campaign (_has_ooo_history) — an OOO'd
         recipient's remaining cadence is owned by due_for_ooo_resend on its own
         pause/resume schedule, so the two due-lists never fire the same stage
@@ -538,7 +546,7 @@ def due_for_followup(conn, global_config, *, today: date = None) -> list:
     today = today or date.today()
     rows = conn.execute(
         "SELECT * FROM recipients WHERE status = 'active' AND first_sent_at IS NOT NULL "
-        "ORDER BY recipient"
+        "AND message_id IS NOT NULL ORDER BY recipient"
     ).fetchall()
     due = []
     for row in rows:

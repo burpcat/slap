@@ -867,3 +867,19 @@ def test_due_for_followup_falls_back_to_persona_cadence_when_unrecorded(tmp_path
     _seed_initial_sent(conn, cadence=None, day=1)  # no cadence recorded -> persona [2,3,5]
     assert due_for_followup(conn, _gc(), today=date(2026, 1, 2)) == []
     assert [r["recipient"] for r in due_for_followup(conn, _gc(), today=date(2026, 1, 3))] == ["a@x.com"]
+
+
+def test_due_for_followup_excludes_gmass_era_recipient_with_no_message_id(tmp_path):
+    # A recipient sent under the OLD GMass transport has a gmass_campaign_id but
+    # NO message_id — the app can't thread a follow-up to them and must leave
+    # them to the cadence GMass already ran, never re-selecting them (which
+    # would spam send_failed "no prior message_id" on every drain).
+    conn = connect(tmp_path / "t.db")
+    append_event(conn, type="queued", recipient="old@x.com", campaign="c", stage=0,
+                 meta={"persona": "recruiter", "cadence": [2, 3, 5]},
+                 timestamp=datetime(2026, 1, 1, 9, tzinfo=timezone.utc))
+    append_event(conn, type="sent", recipient="old@x.com", campaign="c", stage=0,
+                 gmass_campaign_id="gmass-999",  # GMass-era: no message_id
+                 timestamp=datetime(2026, 1, 1, 9, tzinfo=timezone.utc))
+    # Fire date for stage 1 (day 0 + 2) is long past, yet they must NOT be due.
+    assert due_for_followup(conn, _gc(), today=date(2026, 6, 1)) == []
