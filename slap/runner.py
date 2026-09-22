@@ -636,11 +636,16 @@ def drain(conn, global_config, smtp_config, *, now: date = None, sleep_fn=time.s
           random_fn=random.uniform, workdir_root: Path = WORKDIR_ROOT,
           send_message_fn=smtp.send_message, imap_config=None,
           poll_replies_fn=imap.poll_replies, poll_bounces_fn=imap.poll_bounces,
-          log_fn=print) -> DrainResult:
+          staged_only=False, log_fn=print) -> DrainResult:
     """Drain whatever's queued and due, right now — no window waiting (that's
     wait_for_fire_window's job). Cap-aware, resilient: a preflight failure
     retries then gives up loud (run_failed, queue untouched); a per-email
     failure logs send_failed and moves on (queue stays intact either way).
+
+    `staged_only=True` (the interactive `send --now` path) fires ONLY the
+    currently-queued initial sends — not the follow-up/OOO/remind cadence, which
+    belongs to the unattended scheduled runner (cmd_runner / launchd). The
+    default (False) drains the full due set, as the scheduled runner must.
 
     `log_fn` prints one line per recipient as each send attempt resolves —
     real-time progress instead of the previous total silence until the final
@@ -670,8 +675,13 @@ def drain(conn, global_config, smtp_config, *, now: date = None, sleep_fn=time.s
     # directly. If the poll itself fails, we must NOT fire follow-ups this drain
     # (we can't confirm nobody replied) — but initial sends and reminds still
     # go, since those don't depend on reply state.
+    #
+    # staged_only (the `send --now` path) fires ONLY freshly-queued initial
+    # sends — no follow-up cadence — so the reply/bounce polls (which exist to
+    # gate follow-ups) are skipped entirely, keeping an interactive --now fast
+    # (no IMAP round-trip).
     followups_enabled = True
-    if imap_config is not None:
+    if imap_config is not None and not staged_only:
         try:
             ingest_replies(conn, imap_config, poll_replies_fn=poll_replies_fn)
         except imap.ImapError as e:
@@ -703,20 +713,30 @@ def drain(conn, global_config, smtp_config, *, now: date = None, sleep_fn=time.s
     # already dispatched to _send_one this drain is explicitly excluded from
     # the OOO list too, belt-and-suspenders, so a future change to either
     # query can never resend to the same recipient twice in one batch.
+    # `staged_only` (the interactive `send --now` path) fires ONLY the initial
+    # sends that are currently queued — "send what I just staged." Everything
+    # cadence/time-driven (follow-up stages, OOO resumes, reminds) is the
+    # UNATTENDED scheduled runner's job (cmd_runner / launchd), not something a
+    # one-off --now should sweep. This restores the GMass-era feel of --now:
+    # under GMass, follow-ups fired server-side and were never in drain's scope
+    # at all, so --now only ever drained queued initials; the migration moved
+    # follow-up firing INTO drain (due_for_followup), and without this gate
+    # --now would inherit the whole past-due cadence backlog (the surprising
+    # "[N/130]" sweep). due_recipients is always drained — that IS the staged work.
     due_initial = due_recipients(conn)
-    due_ooo = due_for_ooo_resend(conn, today=today)
-    # Follow-up stages (§10): under SMTP the app fires stages 1..N itself (GMass
-    # used to fire them server-side). due_for_followup selects the next
-    # normal-cadence stage that's due today and excludes any OOO-managed
-    # recipient (owned by the OOO list above on its pause schedule), so the two
-    # never fire the same stage — dispatched via _send_followup on this same
-    # cap-bounded batch, just like every other send.
-    due_followup = due_for_followup(conn, global_config, today=today) if followups_enabled else []
-    # Reminds (one-shot manual nudges) fire on the same runner cadence as
-    # everything else — just more rows in the same cap-bounded batch, dispatched
-    # via _send_remind. A recipient already dispatched this drain (initial/OOO/
-    # follow-up) is excluded, belt-and-suspenders against any double-send.
-    due_remind = due_for_remind(conn)
+    if staged_only:
+        due_ooo = due_followup = due_remind = []
+    else:
+        due_ooo = due_for_ooo_resend(conn, today=today)
+        # Follow-up stages (§10): under SMTP the app fires stages 1..N itself
+        # (GMass used to fire them server-side). due_for_followup selects the
+        # next normal-cadence stage due today and excludes any OOO-managed
+        # recipient (owned by the OOO list, on its pause schedule), so the two
+        # never fire the same stage — dispatched via _send_followup.
+        due_followup = due_for_followup(conn, global_config, today=today) if followups_enabled else []
+        # Reminds (one-shot manual nudges) fire on the same runner cadence —
+        # just more rows in the same cap-bounded batch, via _send_remind.
+        due_remind = due_for_remind(conn)
     initial_recipients = {row["recipient"] for row in due_initial}
     ooo_recipients = {row["recipient"] for row in due_ooo}
     followup_recipients = {row["recipient"] for row in due_followup}
@@ -761,8 +781,14 @@ def drain(conn, global_config, smtp_config, *, now: date = None, sleep_fn=time.s
         else:
             failed_count += 1
 
-    remaining = (len(due_recipients(conn)) + len(due_for_ooo_resend(conn, today=today))
-                 + len(due_for_followup(conn, global_config, today=today)) + len(due_for_remind(conn)))
+    # `remaining` reflects only what THIS drain was scoped to fire: staged_only
+    # counts leftover queued initials (cap overflow); a full drain counts the
+    # whole due set it's responsible for.
+    if staged_only:
+        remaining = len(due_recipients(conn))
+    else:
+        remaining = (len(due_recipients(conn)) + len(due_for_ooo_resend(conn, today=today))
+                     + len(due_for_followup(conn, global_config, today=today)) + len(due_for_remind(conn)))
     append_event(conn, type="run_completed",
                  meta={"sent": sent_count, "failed": failed_count, "remaining_queued": remaining})
     return DrainResult(ran=True, sent=sent_count, failed=failed_count, remaining_queued=remaining)

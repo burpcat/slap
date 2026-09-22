@@ -61,6 +61,23 @@ single Gmail **App Password**. The GMass-stable version is preserved on the
   recipient's `message_id` (`In-Reply-To`) instead of a GMass
   `campaignIdToReplyTo`.
 
+### Fixed
+
+- **`send --now` no longer sweeps the whole follow-up backlog.** Under GMass,
+  follow-ups fired server-side and were never in `drain`'s scope, so `--now`
+  only ever sent queued initials. The migration moved follow-up firing into
+  `drain` (`due_for_followup`), which `--now` shares — so `--now` started firing
+  the entire past-due cadence too (the surprising `[N/130]` sweep). `drain` now
+  takes `staged_only`; `send --now` passes it to fire **only currently-queued
+  initial sends** (and skip the IMAP poll), leaving the follow-up/OOO/remind
+  cadence to the unattended scheduled runner (`cmd_runner` / launchd), which
+  still drains the full due set.
+- **Pre-migration (GMass-era) recipients are excluded from `due_for_followup`.**
+  They have a `gmass_campaign_id` but no `message_id`, so a follow-up can't be
+  threaded to them; before this they were re-selected every drain and failed
+  with "no prior message_id to thread the follow-up into." `due_for_followup`
+  now requires `message_id IS NOT NULL`, leaving the GMass back-catalog untouched.
+
 ### Removed
 
 - `slap/gmass.py` (the GMass API client), `tests/test_gmass.py`, and the GMass

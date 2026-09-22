@@ -1408,3 +1408,43 @@ def test_drain_bounce_poll_failure_is_best_effort_and_does_not_skip_followups(co
           imap_config=IMAP, poll_replies_fn=_fake_poll([]), poll_bounces_fn=boom,
           log_fn=lambda m: None)
     assert calls["send"] == 1
+
+
+# --- staged_only: `send --now` fires ONLY queued initials, not the cadence ---
+
+def test_staged_only_drain_fires_initials_not_due_followups(conn, tmp_path):
+    gc = make_global_config(tmp_path)
+    # A recipient already sent (SMTP-era, has message_id) with a follow-up due.
+    stage_one(conn, tmp_path, recipient="old@x.com", cadence=[2, 3, 5])
+    drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+          send_message_fn=fake_smtp(message_id="<old-init@gmail.com>")[0])
+    # A freshly-staged recipient (queued initial).
+    stage_one(conn, tmp_path, recipient="new@x.com", cadence=[2, 3, 5])
+
+    # staged_only drain on a day when old@x's stage-1 follow-up IS due.
+    send_fn, calls = fake_smtp(message_id="<new-init@gmail.com>")
+    result = drain(conn, gc, SMTP, now=date.today() + timedelta(days=2), sleep_fn=lambda s: None,
+                   workdir_root=tmp_path / "workdir", send_message_fn=send_fn, staged_only=True)
+
+    new_stages = [r["stage"] for r in conn.execute(
+        "SELECT stage FROM events WHERE type='sent' AND recipient='new@x.com'")]
+    old_stages = [r["stage"] for r in conn.execute(
+        "SELECT stage FROM events WHERE type='sent' AND recipient='old@x.com'")]
+    assert result.sent == 1        # only the freshly-staged initial
+    assert new_stages == [0]       # new@x's initial fired
+    assert old_stages == [0]       # old@x's due follow-up did NOT fire (stage 1 absent)
+
+
+def test_staged_only_drain_does_not_poll_imap(conn, tmp_path):
+    # --now fires only fresh initials, which don't depend on reply/bounce state,
+    # so the IMAP polls are skipped entirely (fast interactive send).
+    gc = make_global_config(tmp_path)
+    stage_one(conn, tmp_path)
+
+    def boom(*a, **k):
+        raise AssertionError("staged_only drain must not poll IMAP")
+
+    result = drain(conn, gc, SMTP, sleep_fn=lambda s: None, workdir_root=tmp_path / "workdir",
+                   send_message_fn=fake_smtp()[0], imap_config=IMAP,
+                   poll_replies_fn=boom, poll_bounces_fn=boom, staged_only=True)
+    assert result.sent == 1

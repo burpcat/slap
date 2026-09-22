@@ -175,7 +175,7 @@ def cmd_send(args):
     if args.now:
         print("\n--now: draining the queue immediately...")
         result = runner.drain(conn, global_config, _smtp_config(global_config),
-                             imap_config=_imap_config(global_config))
+                             staged_only=True)
         _print_drain_result(result)
 
 
@@ -270,7 +270,7 @@ def cmd_send_unified(args):
     if args.now:
         print("\n--now: draining the queue immediately...")
         result = runner.drain(conn, global_config, _smtp_config(global_config),
-                             imap_config=_imap_config(global_config))
+                             staged_only=True)
         _print_drain_result(result)
 
 
@@ -448,7 +448,7 @@ def cmd_send_custom(args):
     if args.now:
         print("\n--now: draining the queue immediately...")
         result = runner.drain(conn, global_config, _smtp_config(global_config),
-                             imap_config=_imap_config(global_config))
+                             staged_only=True)
         _print_drain_result(result)
 
 
