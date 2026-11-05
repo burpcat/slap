@@ -52,9 +52,9 @@ from urllib.parse import urlsplit
 from flask import jsonify, request, send_file
 from flask.json.provider import DefaultJSONProvider
 
-from slap import archive, derived, gmass_cache, leads, tracking, ui_state
+from slap import archive, gmass_cache, leads, outreach, tracking, ui_state
 from slap.color import campaign_colors
-from slap.config import discover_campaigns
+from slap.config import ConfigError, discover_campaigns, load_campaign
 from slap.domains import check_recipient, contacts_at_company
 from slap.followups import FollowupError, discover_followups, load_followup, save_followup
 from slap.queue import QueueError, resend_bounced
@@ -672,15 +672,57 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, ima
 
     # --- leads: browser extension -> slap (slap.leads) -------------------
 
+    def _details(data) -> dict:
+        """Campaign / résumé / contact from the panel, with names checked
+        against the real campaigns and send_tags (LeadError on a bad one)."""
+        details = {k: data[k] for k in leads.DETAIL_KEYS if data.get(k)}
+        if details.get("campaign"):
+            try:
+                camp = load_campaign(details["campaign"], global_config)
+            except ConfigError as e:
+                raise leads.LeadError(str(e)) from e
+            if details.get("resume") and details["resume"] not in camp.resume_paths:
+                raise leads.LeadError(f"campaign '{camp.name}' doesn't offer résumé '{details['resume']}' "
+                                      f"(offers: {list(camp.resume_paths)})")
+        elif details.get("resume") and details["resume"] not in global_config.send_tags:
+            raise leads.LeadError(f"unknown résumé tag {details['resume']!r}")
+        return details
+
+    @app.route("/api/campaign-options")
+    def api_campaign_options():
+        # The panel's campaign + résumé pickers: static-résumé campaigns only.
+        options, errors = [], []
+        for name in discover_campaigns():
+            try:
+                camp = load_campaign(name, global_config)
+            except ConfigError as e:
+                errors.append({"campaign": name, "error": str(e)})
+                continue
+            if not camp.latex_enabled:
+                options.append({"name": name, "persona": camp.persona, "resumes": list(camp.resume_paths)})
+        return jsonify({"campaigns": options, "errors": errors})
+
     @app.route("/api/leads", methods=["POST"])
     def api_lead_capture():
         data = request.get_json(silent=True) or {}
         try:
             lead_id, created = leads.capture(get_conn(), url=data.get("url", ""), jd=data.get("jd", ""),
-                                             company=data.get("company", ""), role=data.get("role", ""))
+                                             company=data.get("company", ""), role=data.get("role", ""),
+                                             **_details(data))
         except leads.LeadError as e:
             return jsonify({"error": str(e)}), 400
         return jsonify({"lead_id": lead_id, "created": created}), 201 if created else 200
+
+    @app.route("/api/leads/details", methods=["POST"])
+    def api_lead_details():
+        data = request.get_json(silent=True) or {}
+        conn = get_conn()
+        try:
+            lead_id = leads.lead_id_for(data.get("url", ""))
+            leads.set_details(conn, lead_id, **_details(data))
+        except leads.LeadError as e:
+            return jsonify({"error": str(e)}), 400
+        return jsonify({"lead_id": lead_id})
 
     @app.route("/api/leads")
     def api_lead_by_url():
@@ -701,12 +743,19 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, ima
         path = Path(global_config.docs_dir) / global_config.send_tags[tag]
         if not path.is_file():
             return jsonify({"error": f"{path} not found"}), 400
+        conn = get_conn()
         try:
-            lead_id = leads.mark_applied(get_conn(), url=data.get("url", ""), resume=tag,
+            lead_id = leads.mark_applied(conn, url=data.get("url", ""), resume=tag,
                                          resume_sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+            # Applying is what lets the reach-out go: stage it now if the drop and
+            # contact are ready (otherwise saving the drop later stages it).
+            result = outreach.stage(conn, global_config, lead_id,
+                                    acknowledge_warnings=bool(data.get("acknowledge_warnings")))
         except leads.LeadError as e:
             return jsonify({"error": str(e)}), 400
-        return jsonify({"lead_id": lead_id})
+        except outreach.OutreachError as e:
+            return jsonify({"error": str(e)}), 409
+        return jsonify({"lead_id": lead_id, "outreach": result})
 
     @app.route("/api/leads/questions", methods=["POST"])
     def api_lead_questions():
@@ -731,7 +780,7 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, ima
         # is), and this posting's lead state (matched/applied résumé). Warn-only.
         conn = get_conn()
         email, company, url = (request.args.get(k, "").strip() for k in ("email", "company", "url"))
-        out = {"recipient": None, "company_contacts": [], "lead": None, "suggested_resume": None}
+        out = {"recipient": None, "company_contacts": [], "lead": None, "email": None, "email_warnings": []}
         if email:
             dedup = check_recipient(conn, email, consumer_domains)
             out["recipient"] = {"hard": dedup.hard_warning,
@@ -745,12 +794,13 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, ima
             except leads.LeadError as e:
                 return jsonify({"error": str(e)}), 400
             lead = out["lead"]
-            if lead and lead["jd"] and not lead["resume"]:
-                try:  # zero-token hint from up-to-date cards; Claude still decides
-                    cards = {c["tag"]: c["card"] for c in derived.resume_cards(global_config) if not c["stale"]}
-                except derived.DerivedError as e:
-                    return jsonify({"error": str(e)}), 500
-                out["suggested_resume"] = derived.suggest_resume(lead["jd"], cards)
+            if lead and lead["campaign"]:  # the reach-out as it would be staged right now
+                try:
+                    out["email"] = outreach.public(outreach.render(lead, global_config))
+                    if lead["contact_email"] and not lead["staged_to"]:
+                        out["email_warnings"] = outreach.dedup_warnings(conn, global_config, lead["contact_email"])
+                except outreach.OutreachError as e:
+                    out["email"] = {"error": str(e)}
         return jsonify(out)
 
     @app.route("/api/resumes")

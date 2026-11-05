@@ -1,49 +1,41 @@
 #!/usr/bin/env python3
-"""slap MCP server (stdio) — the prep half of `slap.py send`, driven by Claude Code.
+"""slap MCP server (stdio) for Claude Code: one application at a time.
 
-Claude generates the per-recipient field values itself (via the slap-outreach
-skill), previews, and stages through these tools; the unattended runner
-(launchd) still fires the queue and owns the follow-up cadence. Pure
-composition of existing library functions — no new send logic lives here.
+The browser extension captures a posting (with its campaign, résumé and
+contact) and records the application; Claude's job is narrow and scoped to
+ONE application, by default the one the owner touched most recently:
 
-Tools: slap_context · slap_stars · slap_resume_text · slap_save_derived ·
-slap_leads · slap_add_leads · slap_match_lead · slap_pending_questions · slap_answer_questions ·
-slap_preview · slap_send. Only slap_send writes to the queue; leave it
-un-allowlisted in Claude Code so its permission prompt is the human confirm.
+    slap_application       that application: JD, campaign fields + template,
+                           the current drop and email preview, open form questions
+    slap_save_drop         write the drop (campaign field values); if the owner
+                           already applied, this stages the reach-out
+    slap_answer_questions  answer that application's open form questions
+    slap_stars             full star.json entries, the only source of claims
+
+Staging only ever happens for an applied posting (slap.outreach). Leave
+slap_save_drop off the allowlist so its permission prompt is your confirm.
 
 Register:  claude mcp add --scope user slap -- <repo>/.venv/bin/python <repo>/slap_mcp.py
 """
 import json
 import os
-import sys
-import threading
-import uuid
-from dataclasses import asdict
 from pathlib import Path
 
 from dotenv import load_dotenv
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
-from pypdf import PdfReader
 
-from slap import archive, derived, doctor, domains, leads, runner, smtp, tracking
-from slap.config import ConfigError, discover_campaigns, load_campaign, load_global_config
-from slap.queue import held_initials, stage_recipient
-from slap.templates import fill_template, merge_config_values
+from slap import leads, outreach, tracking
+from slap.config import ConfigError, load_global_config
 
 REPO_ROOT = Path(__file__).resolve().parent
-STAR_FILE = "star.json"          # inside config.yaml references_dir
+STAR_FILE = "star.json"  # inside config.yaml references_dir
 
 server = MCPServer(
     "slap",
-    instructions="Cold job outreach through the owner's Gmail. Call slap_context once per session; "
-                 "slap_preview before slap_send; never send without showing the owner the preview.",
+    instructions="Work on ONE job application at a time: call slap_application first and stay on the "
+                 "application it returns. Don't discuss other applications unless the owner asks.",
 )
-
-# preview_id -> everything slap_send needs. In-memory on purpose: a restarted
-# server forgets previews, so a send can only ever stage what was just shown.
-_previews: dict = {}
-_send_lock = threading.Lock()
 
 
 def _config():
@@ -53,18 +45,13 @@ def _config():
         raise ToolError(str(e)) from e
 
 
-def _campaign(name, global_config):
-    try:
-        return load_campaign(name, global_config)
-    except ConfigError as e:
-        raise ToolError(str(e)) from e
-
-
-def _derived_or_fail(fn, *args):
-    try:
-        return fn(*args)
-    except derived.DerivedError as e:
-        raise ToolError(str(e)) from e
+def _lead(conn, lead_id):
+    lead_id = lead_id or leads.current(conn)
+    lead = leads.get(conn, lead_id) if lead_id else None
+    if lead is None:
+        raise ToolError("no application yet: capture a posting with the slap browser extension first"
+                        if not lead_id else f"unknown application {lead_id!r}")
+    return lead
 
 
 def _load_stars(global_config) -> list:
@@ -89,277 +76,98 @@ def _load_stars(global_config) -> list:
     return experiences
 
 
-def _resume_path(global_config, tag) -> Path:
-    if tag not in global_config.send_tags:
-        raise ToolError(f"résumé '{tag}' is not a send_tag in {global_config.path} "
-                        f"(known: {sorted(global_config.send_tags)})")
-    return global_config.docs_dir / global_config.send_tags[tag]
-
-
-def _dedup_warnings(global_config, recipient) -> list:
-    try:
-        consumer = domains.load_consumer_domains(Path(global_config.consumer_domains_file))
-    except domains.DomainsError as e:
-        raise ToolError(str(e)) from e
-    dedup = domains.check_recipient(tracking.connect(), recipient, consumer)
-    warnings = []
-    if dedup.hard_warning:
-        w = dedup.hard_warning
-        warnings.append(f"HARD: {recipient} already contacted — campaign={w.campaign} status={w.status} "
-                        f"first_sent={w.first_sent_at} replied={'yes' if w.replied_at else 'no'}")
-    for c in dedup.soft_warning_contacts or []:
-        warnings.append(f"SOFT: same domain {dedup.soft_warning_domain} — {c.recipient} "
-                        f"campaign={c.campaign} status={c.status}")
-    return warnings
+def _status(lead) -> str:
+    if lead["staged_to"]:
+        return f"reach-out staged to {lead['staged_to'][0]}"
+    if lead["applied_resume"]:
+        return f"applied with résumé '{lead['applied_resume']}'; reach-out not staged yet"
+    return "not applied yet (the reach-out stages only after the owner applies)"
 
 
 @server.tool()
-def slap_context() -> dict:
-    """Everything needed to pick a campaign + résumé and write fields: campaigns
-    (fields with generation hints), résumé cards (stale = regenerate before use),
-    other derived references, the STAR index (id/title/tags), and today's send
-    headroom. Call once per session."""
+def slap_application(lead_id: str | None = None) -> dict:
+    """The one application to work on (default: the one the owner touched
+    most recently in the browser). Includes the JD, the campaign's drop
+    fields (with hints) and template, the current drop + email preview, open
+    form questions, and the star.json index. Name the company and role back
+    to the owner before working."""
     global_config = _config()
-    campaigns = []
-    for name in discover_campaigns():
-        try:
-            c = load_campaign(name, global_config)
-        except ConfigError as e:
-            campaigns.append({"name": name, "error": str(e)})
-            continue
-        campaigns.append({
-            "name": c.name, "persona": c.persona, "cadence": c.cadence,
-            "resumes": list(c.resume_paths),
-            "fields": [{"key": f.key, "optional": f.optional, "hint": f.hint} for f in c.fields],
-        })
-
-    resumes = _derived_or_fail(derived.resume_cards, global_config)
-    references = {name: {"text": e.get("text"), "stale": derived.is_stale(e)}
-                  for name, e in _derived_or_fail(derived.load_derived, global_config).items()
-                  if not name.startswith(derived.CARD_PREFIX)}
-
-    try:
-        stars = [{"id": s["id"], "title": s["title"], "tags": s["tags"]} for s in _load_stars(global_config)]
-        stars_error = None
-    except ToolError as e:
-        stars, stars_error = [], str(e)
-
     conn = tracking.connect()
-    return {
-        "campaigns": campaigns, "resumes": resumes, "references": references,
-        "stars": stars, "stars_error": stars_error,
-        "cap_headroom": runner.cap_headroom(conn, global_config),
+    lead = _lead(conn, lead_id)
+    out = {
+        "lead_id": lead["lead_id"], "company": lead["company"], "role": lead["role"], "url": lead["url"],
+        "jd": lead["jd"], "status": _status(lead),
+        "campaign": lead["campaign"] or None, "resume": lead["applied_resume"] or lead["resume"] or None,
+        "contact": {"email": lead["contact_email"], "name": lead["contact_name"]},
+        "open_questions": [q for q in lead["questions"] if q["label"] not in lead["answers"]],
     }
+    try:
+        camp = outreach.campaign_for(lead, global_config)
+        if camp is None:
+            out["drop"] = "no campaign yet: the owner picks one in the extension panel"
+        else:
+            out["drop_fields"] = [{"key": f.key, "label": f.label, "optional": f.optional, "hint": f.hint}
+                                  for f in outreach.drop_fields(camp)]
+            out["template"] = {"subject": camp.subject_template, "body": camp.body_template}
+            out["drop"] = lead["drop"]
+            out["email_preview"] = outreach.public(outreach.render(lead, global_config))
+    except outreach.OutreachError as e:
+        raise ToolError(str(e)) from e
+    try:
+        out["stars"] = [{"id": s["id"], "title": s["title"], "tags": s["tags"]} for s in _load_stars(global_config)]
+    except ToolError as e:
+        out["stars"], out["stars_error"] = [], str(e)
+    return out
+
+
+@server.tool()
+def slap_save_drop(lead_id: str, fields: dict[str, str], acknowledge_warnings: bool = False) -> dict:
+    """Save the drop (values for the application's drop_fields) and return the
+    rendered email. If the owner already applied, this also stages the
+    reach-out; with dedup warnings it refuses until acknowledge_warnings=true
+    (ask the owner first)."""
+    global_config = _config()
+    conn = tracking.connect()
+    lead = _lead(conn, lead_id)
+    try:
+        camp = outreach.campaign_for(lead, global_config)
+        if camp is None:
+            raise ToolError("this application has no campaign yet; ask the owner to pick one in the panel")
+        allowed = {f.key for f in outreach.drop_fields(camp)}
+        unknown = sorted(set(fields) - allowed)
+        if unknown:
+            raise ToolError(f"not drop fields for campaign '{camp.name}': {unknown} (fields: {sorted(allowed)})")
+        leads.save_drop(conn, lead["lead_id"], fields)
+        lead = leads.get(conn, lead["lead_id"])
+        result = {"email": outreach.public(outreach.render(lead, global_config))}
+        result["outreach"] = outreach.stage(conn, global_config, lead["lead_id"],
+                                            acknowledge_warnings=acknowledge_warnings)
+    except (leads.LeadError, outreach.OutreachError) as e:
+        raise ToolError(str(e)) from e
+    return result
+
+
+@server.tool()
+def slap_answer_questions(lead_id: str, answers: dict[str, str]) -> str:
+    """Answers keyed by the exact question label from slap_application's
+    open_questions. Keep every claim inside star.json. For a select/radio
+    question, answer with one of its options verbatim. The extension fills
+    them in after the owner reviews."""
+    try:
+        leads.answer_questions(tracking.connect(), lead_id, answers)
+    except leads.LeadError as e:
+        raise ToolError(str(e)) from e
+    return f"{len(answers)} answer(s) saved; the owner clicks Prepare answers in the panel to see them"
 
 
 @server.tool()
 def slap_stars(ids: list[str]) -> list[dict]:
-    """Full star.json entries for the given ids (the claim source for bullets)."""
+    """Full star.json entries for the given ids (the claim source for the drop and answers)."""
     by_id = {s["id"]: s for s in _load_stars(_config())}
     unknown = [i for i in ids if i not in by_id]
     if unknown:
         raise ToolError(f"unknown STAR ids: {unknown}")
     return [by_id[i] for i in ids]
-
-
-@server.tool()
-def slap_resume_text(tag: str) -> str:
-    """Plain text of a résumé PDF — only for (re)building its card."""
-    path = _resume_path(_config(), tag)
-    if not path.is_file():
-        raise ToolError(f"{path} not found")
-    return "\n".join(page.extract_text() or "" for page in PdfReader(path).pages)
-
-
-@server.tool()
-def slap_save_derived(name: str, source: str, text: str) -> str:
-    """Store distilled text (e.g. a résumé card as name='card:<tag>', source='resume:<tag>';
-    or a voice summary with source = an absolute file path). Records the source's hash
-    so slap_context flags it stale when the source changes."""
-    global_config = _config()
-    if source.startswith("resume:"):
-        src = _resume_path(global_config, source.removeprefix("resume:"))
-    else:
-        src = Path(source).expanduser()
-    path = _derived_or_fail(derived.save_derived, global_config, name, src, text)
-    return f"saved {name} to {path}"
-
-
-@server.tool()
-def slap_leads() -> dict:
-    """Job postings captured from the browser that no email references yet
-    (each with its JD), plus staged emails still held for an application."""
-    conn = tracking.connect()
-    return {"pending": leads.pending(conn), "held": held_initials(conn)}
-
-
-@server.tool()
-def slap_add_leads(urls: list[str]) -> list[dict]:
-    """Capture job postings from links in one go (fetched by slap, so the JDs
-    never pass through you). Per-link result or error; follow with slap_leads."""
-    try:
-        return leads.add_from_urls(tracking.connect(), urls)
-    except leads.LeadError as e:
-        raise ToolError(str(e)) from e
-
-
-@server.tool()
-def slap_match_lead(lead_id: str, resume: str, campaign: str) -> str:
-    """Record the résumé + campaign chosen for a lead, so the browser extension
-    uploads that résumé when the owner applies. Re-matching overrides."""
-    global_config = _config()
-    _resume_path(global_config, resume)
-    _campaign(campaign, global_config)
-    try:
-        leads.match(tracking.connect(), lead_id, resume=resume, campaign=campaign)
-    except leads.LeadError as e:
-        raise ToolError(str(e)) from e
-    return f"lead {lead_id}: résumé '{resume}', campaign '{campaign}'"
-
-
-@server.tool()
-def slap_pending_questions() -> list:
-    """Application-form questions the browser extension couldn't fill from
-    profile.yaml, per lead (with its JD and matched résumé). Answer each with
-    slap_answer_questions; the extension fills them in after you review."""
-    return leads.pending_questions(tracking.connect())
-
-
-@server.tool()
-def slap_answer_questions(lead_id: str, answers: dict[str, str]) -> str:
-    """Answers keyed by the exact question label from slap_pending_questions.
-    Keep every claim inside star.json. For a select/radio question, answer with
-    one of its options verbatim."""
-    try:
-        leads.answer_questions(tracking.connect(), lead_id, answers)
-    except leads.LeadError as e:
-        raise ToolError(str(e)) from e
-    return f"lead {lead_id}: {len(answers)} answer(s) saved"
-
-
-@server.tool()
-def slap_preview(campaign: str, resume: str, fields: dict[str, str], followups: int | None = None,
-                 lead_id: str | None = None, hold_until_applied: bool = False) -> dict:
-    """Render the exact email that would be staged, plus dedup warnings. Writes
-    nothing. `fields` keys are the campaign's field keys; omitted = empty
-    (an empty optional field drops its line). `followups` = how many of the
-    campaign's follow-up stages to send (default all). `lead_id` links the
-    email to a captured posting; `hold_until_applied` (needs lead_id) keeps it
-    unsent until the owner applies there. Returns a preview_id for slap_send."""
-    global_config = _config()
-    hold = False
-    if lead_id is not None:
-        lead = leads.get(tracking.connect(), lead_id)
-        if lead is None:
-            raise ToolError(f"unknown lead {lead_id!r}")
-        if lead["applied_resume"] and lead["applied_resume"] != resume:
-            raise ToolError(f"already applied to this posting with résumé '{lead['applied_resume']}' — "
-                            f"the email must attach that one")
-        hold = hold_until_applied and not lead["applied_resume"]
-    elif hold_until_applied:
-        raise ToolError("hold_until_applied needs a lead_id")
-    camp = _campaign(campaign, global_config)
-    if camp.latex_enabled:
-        raise ToolError(f"campaign '{campaign}' is a LaTeX campaign — use `slap.py send {campaign}`")
-    if resume not in camp.resume_paths:
-        raise ToolError(f"campaign '{campaign}' doesn't offer résumé '{resume}' (offers: {list(camp.resume_paths)})")
-    attachment_path = camp.resume_paths[resume]
-    if not attachment_path.is_file():
-        raise ToolError(f"résumé file {attachment_path} not found")
-
-    known = {f.key for f in camp.fields}
-    unknown = sorted(set(fields) - known)
-    if unknown:
-        raise ToolError(f"unknown field keys {unknown} for campaign '{campaign}' (known: {sorted(known)})")
-    values = {f.key: fields.get(f.key, "") for f in camp.fields}
-    recipient = values["email"].strip()
-    if not recipient:
-        raise ToolError("the 'email' field is empty")
-
-    max_n = len(camp.cadence)
-    n = max_n if followups is None else followups
-    if not 0 <= n <= max_n:
-        raise ToolError(f"followups must be 0-{max_n}")
-
-    fill_values = merge_config_values(values, signature=global_config.signature)
-    subject = fill_template(camp.subject_template, fill_values, camp.fields)
-    body = fill_template(camp.body_template, fill_values, camp.fields)
-    stage_bodies = [fill_template(s, fill_values, camp.fields) for s in camp.stage_bodies][:n]
-    cadence = camp.cadence[:n]
-
-    warnings = _dedup_warnings(global_config, recipient)
-
-    preview_id = uuid.uuid4().hex[:12]
-    _previews[preview_id] = {
-        "global_config": global_config, "campaign": camp, "recipient": recipient, "values": values,
-        "subject": subject, "body": body, "stage_bodies": stage_bodies, "cadence": cadence,
-        "attachment_path": attachment_path, "warnings": warnings,
-        "resume": resume, "lead_id": lead_id, "hold": hold,
-    }
-    return {
-        "preview_id": preview_id, "to": recipient, "subject": subject, "body": body,
-        "followups": [{"day": d, "body": b} for d, b in zip(cadence, stage_bodies)],
-        "attachment": f"{camp.attachment_name} (résumé: {resume})",
-        "held_until_applied": hold,
-        "warnings": warnings,
-        "empty_required": [f.key for f in camp.fields if not f.optional and values[f.key] == ""],
-    }
-
-
-@server.tool()
-def slap_send(preview_id: str, acknowledge_warnings: bool = False, now: bool = False) -> dict:
-    """Stage exactly what slap_preview rendered. Refuses while the preview has
-    dedup warnings unless acknowledge_warnings=true (ask the owner first), and
-    refuses outright if the dedup picture changed since the preview (e.g. this
-    address was staged in the meantime) — re-preview then. now=true fires
-    queued initial sends immediately; otherwise the scheduled runner sends at
-    its next window."""
-    with _send_lock:  # one stage at a time: no two sends race the same preview/recipient
-        return _send(preview_id, acknowledge_warnings, now)
-
-
-def _send(preview_id, acknowledge_warnings, now):
-    p = _previews.get(preview_id)
-    if p is None:
-        raise ToolError(f"unknown preview_id '{preview_id}' — call slap_preview again")
-    global_config, camp, values = p["global_config"], p["campaign"], p["values"]
-    current = _dedup_warnings(global_config, p["recipient"])
-    if current != p["warnings"]:
-        _previews.pop(preview_id)
-        raise ToolError("dedup state changed since this preview — call slap_preview again:\n"
-                        + "\n".join(current or ["(no warnings now)"]))
-    if current and not acknowledge_warnings:
-        raise ToolError("preview has dedup warnings — confirm with the owner, then pass "
-                        "acknowledge_warnings=true:\n" + "\n".join(current))
-
-    failures = [r for r in doctor.run_global_checks(global_config) + doctor.run_campaign_checks(camp) if not r.ok]
-    if failures:
-        raise ToolError("doctor preflight failed:\n" + "\n".join(f"- {r.name}: {r.detail}" for r in failures))
-
-    conn = tracking.connect()
-    stage_recipient(
-        conn, campaign=camp.name, recipient=p["recipient"], persona=camp.persona,
-        cadence=p["cadence"], subject=p["subject"], body=p["body"], stage_bodies=p["stage_bodies"],
-        attachment_path=p["attachment_path"], attachment_name=camp.attachment_name, latex_enabled=False,
-        company=values.get("company", ""), role=values.get("role_catted", ""), req_id=values.get("req_id", ""),
-        name=values.get(camp.name_field, "") if camp.name_field else "",
-        archive_dir=archive.archive_dir_from_env(), field_values=values,
-        extra_meta={"resume": p["resume"], "resume_file": str(Path(p["attachment_path"]).resolve()),
-                    **({"lead_id": p["lead_id"]} if p["lead_id"] else {}),
-                    **({"hold": "applied"} if p["hold"] else {})},
-    )
-    del _previews[preview_id]  # one preview stages at most once
-    result = {"staged": p["recipient"], "held_until_applied": p["hold"]}
-    if now:
-        # Same transport config slap.py's _smtp_config builds (not importable: slap.py
-        # is shadowed by the slap/ package name).
-        smtp_config = smtp.SmtpConfig(host=smtp.DEFAULT_SMTP_HOST, port=smtp.DEFAULT_SMTP_PORT,
-                                      user=global_config.from_email,
-                                      password=os.environ.get(smtp.PASSWORD_ENV, "").strip())
-        drained = runner.drain(conn, global_config, smtp_config, staged_only=True,
-                               log_fn=lambda s: print(s, file=sys.stderr))
-        result["drain"] = asdict(drained)
-    return result
 
 
 def main():

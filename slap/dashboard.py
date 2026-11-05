@@ -2331,7 +2331,8 @@ def create_app(db_path: Path, global_config, consumer_domains: set, imap_config:
 
 _LEAD_NODE = {
     "captured": ("Posting captured", "neutral"),
-    "matched": ("Résumé matched", "neutral"),
+    "details": ("Campaign / contact set", "neutral"),
+    "drafted": ("Claude wrote the drop", "neutral"),
     "applied": ("Applied", "good"),
     "questions": ("Form questions sent to Claude", "neutral"),
     "answered": ("Claude answered form questions", "neutral"),
@@ -2387,7 +2388,8 @@ def company_timeline(conn, company: str, *, global_config=None) -> dict | None:
     for lead, events in company_leads:
         for ev in events:
             label, chip = _LEAD_NODE.get(ev["stage"], (ev["stage"], "neutral"))
-            detail = {"captured": lead["role"], "matched": f"{ev.get('resume')} · {ev.get('campaign')}",
+            detail = {"captured": lead["role"],
+                      "details": " · ".join(ev.get(k, "") for k in ("campaign", "contact_email") if ev.get(k)),
                       "applied": f"with {ev.get('resume')}"}.get(ev["stage"], "")
             nodes.append({"kind": "lead", "time": ev["timestamp"], "label": label, "chip": chip,
                           "detail": detail, "lead_id": lead["lead_id"], "url": lead["url"], "recipient": None})
@@ -2401,7 +2403,7 @@ def company_timeline(conn, company: str, *, global_config=None) -> dict | None:
     nodes.sort(key=lambda n: n["time"] or "")
     return {
         "company": (company_leads[0][0]["company"] if company_leads else company).strip(),
-        "leads": [{k: l[k] for k in ("lead_id", "url", "role", "stage", "resume", "applied_resume")}
+        "leads": [{k: l[k] for k in ("lead_id", "url", "role", "stage", "campaign", "resume", "applied_resume")}
                   for l, _ in company_leads],
         "contacts": [dataclasses.asdict(c) for c in contacts],
         "timeline": nodes,

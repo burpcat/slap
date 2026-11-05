@@ -1,24 +1,25 @@
-"""slap_mcp contract: preview renders exactly what send stages, once, and
-dedup warnings refuse a send until acknowledged. Tool functions are called
-directly (MCPServer.tool() returns the undecorated function)."""
+"""The extension flow end to end at the slap level: capture (with campaign,
+résumé, contact) -> Claude writes the drop -> applying stages the reach-out,
+exactly once. MCP tool functions are called directly (MCPServer.tool()
+returns the undecorated function)."""
 import json
 
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
 import slap_mcp
-from slap import leads, runner, smtp, tracking
+from slap import leads, outreach, runner, smtp, tracking
 from slap.config import load_global_config
 from slap.latex import recipient_workdir
-from slap.queue import held_initials, load_manifest
+from slap.queue import load_manifest
 
 CONFIG = """
 sender: { from_email: everythingforgenius@gmail.com, from_name: Test Owner }
 signature: "Test Owner"
-personas: { recruiter: { stages: [2, 5] } }
+personas: { hiring_manager: { stages: [1, 2] } }
 schedule:
-  fire_window_start: "09:00"
-  fire_window_end: "09:15"
+  fire_window_start: "00:00"
+  fire_window_end: "00:01"
   send_delay_min: 0
   send_delay_max: 0
   daily_cap: 500
@@ -26,256 +27,183 @@ schedule:
   active_days: [mon, tue, wed, thu, fri, sat, sun]
 tracking: { consumer_domains_file: consumer_domains.txt }
 docs_dir: docs
-send_tags: { ai: ai.pdf }
+send_tags: { resume-a: a.pdf, resume-b: b.pdf }
 references_dir: refs
 """
 
 CAMPAIGN = """
-persona: recruiter
-cadence: [2, 5]
+persona: hiring_manager
+cadence: [1, 2]
 latex: { enabled: false, attachment_name: Resume.pdf }
 name_field: name
 fields:
-  - { key: email,   label: Email }
-  - { key: company, label: Company, hint: as written in the JD }
-  - { key: name,    label: Name }
-  - { key: signal,  label: Signal, optional: true }
+  - { key: email,       label: Email }
+  - { key: role_catted, label: Role }
+  - { key: company,     label: Company }
+  - { key: name,        label: Name }
+  - { key: why_line,    label: Why, hint: one sentence from the JD }
+  - { key: signal,      label: Signal, optional: true }
 """
+
+JOB = "https://jobs.lever.co/acme/123"
+CONTACT = "hm+slaptest1@gmail.com"
 
 
 @pytest.fixture
 def repo(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv(smtp.PASSWORD_ENV, "app-password")
-    monkeypatch.setattr(slap_mcp, "_previews", {})
     (tmp_path / "config.yaml").write_text(CONFIG)
     (tmp_path / "consumer_domains.txt").write_text("gmail.com\n")
     (tmp_path / "docs").mkdir()
-    (tmp_path / "docs" / "ai.pdf").write_bytes(b"%PDF-1.4 real resume")
+    (tmp_path / "docs" / "a.pdf").write_bytes(b"%PDF-1.4 resume a")
+    (tmp_path / "docs" / "b.pdf").write_bytes(b"%PDF-1.4 resume b")
     (tmp_path / "refs").mkdir()
     (tmp_path / "refs" / "star.json").write_text(json.dumps({"experiences": [
-        {"id": "s1", "title": "Shipped X", "tags": ["llm"], "core": "anything else passes through"},
-    ]}))
-    camp = tmp_path / "campaigns" / "recruiter"
+        {"id": "s1", "title": "Shipped X", "tags": ["llm"], "core": "passes through"}]}))
+    camp = tmp_path / "campaigns" / "test-hm"
     camp.mkdir(parents=True)
     (camp / "campaign.yaml").write_text(CAMPAIGN)
-    (camp / "initial.txt").write_text("Subject: Hi from {{company}}\n\nHi {{name}},\n{{signal}}\nThanks\n")
+    (camp / "initial.txt").write_text("Subject: Your {{role_catted}} opening at {{company}}\n\n"
+                                      "Hi {{name}},\n{{why_line}}\n{{signal}}\nThanks\n")
     (camp / "stage1.txt").write_text("Bump {{name}}\n")
-    (camp / "stage2.txt").write_text("Last bump {{name}}\n")
+    (camp / "stage2.txt").write_text("Last {{name}}\n")
     return tmp_path
 
 
-FIELDS = {"email": "jane@acme.com", "company": "Acme", "name": "Jane"}
-
-
-def _queued(recipient):
-    rows = tracking.connect().execute(
-        "SELECT * FROM events WHERE type='queued' AND recipient=?", (recipient,)).fetchall()
-    return rows
-
-
-def test_context_lists_campaign_hints_stars_and_stale_card(repo):
-    ctx = slap_mcp.slap_context()
-    (camp,) = ctx["campaigns"]
-    assert camp["name"] == "recruiter"
-    assert {"key": "company", "optional": False, "hint": "as written in the JD"} in camp["fields"]
-    assert ctx["stars"] == [{"id": "s1", "title": "Shipped X", "tags": ["llm"]}]
-    assert ctx["resumes"] == [{"tag": "ai", "file": "ai.pdf", "card": None, "stale": True}]
-
-
-def test_saved_card_goes_stale_when_pdf_changes(repo):
-    slap_mcp.slap_save_derived("card:ai", "resume:ai", "AI eng card")
-    assert slap_mcp.slap_context()["resumes"][0] == {"tag": "ai", "file": "ai.pdf", "card": "AI eng card",
-                                                     "stale": False}
-    (repo / "docs" / "ai.pdf").write_bytes(b"%PDF-1.4 edited")
-    assert slap_mcp.slap_context()["resumes"][0]["stale"] is True
-
-
-def test_stars_passes_entries_through_and_rejects_unknown(repo):
-    assert slap_mcp.slap_stars(["s1"])[0]["core"] == "anything else passes through"
-    with pytest.raises(ToolError, match="unknown STAR"):
-        slap_mcp.slap_stars(["nope"])
-
-
-def test_star_entry_missing_required_key_fails_loud(repo):
-    (repo / "refs" / "star.json").write_text(json.dumps({"experiences": [{"id": "s1"}]}))
-    with pytest.raises(ToolError, match=r"experiences\[0\] is missing \['title', 'tags'\]"):
-        slap_mcp.slap_stars(["s1"])
-
-
-def test_preview_then_send_stages_exactly_the_preview_once(repo):
-    p = slap_mcp.slap_preview("recruiter", "ai", FIELDS)
-    assert p["subject"] == "Hi from Acme"
-    assert "Hi Jane," in p["body"] and "{{" not in p["body"]  # empty optional signal line dropped
-    assert p["warnings"] == [] and p["empty_required"] == []
-
-    assert slap_mcp.slap_send(p["preview_id"]) == {"staged": "jane@acme.com", "held_until_applied": False}
-    assert len(_queued("jane@acme.com")) == 1
-    manifest = load_manifest(recipient_workdir("recruiter", "jane@acme.com"))
-    assert (manifest["subject"], manifest["body"]) == (p["subject"], p["body"])
-    assert manifest["stage_bodies"] == ["Bump Jane", "Last bump Jane"]
-
-    with pytest.raises(ToolError, match="unknown preview_id"):
-        slap_mcp.slap_send(p["preview_id"])
-    assert len(_queued("jane@acme.com")) == 1
-
-
-def test_followups_override_truncates_cadence(repo):
-    p = slap_mcp.slap_preview("recruiter", "ai", FIELDS, followups=1)
-    assert [f["day"] for f in p["followups"]] == [2]
-    with pytest.raises(ToolError, match="followups must be 0-2"):
-        slap_mcp.slap_preview("recruiter", "ai", FIELDS, followups=3)
-
-
-def test_hard_warn_refuses_send_until_acknowledged(repo):
-    slap_mcp.slap_send(slap_mcp.slap_preview("recruiter", "ai", FIELDS)["preview_id"])
-    p = slap_mcp.slap_preview("recruiter", "ai", FIELDS)
-    assert p["warnings"][0].startswith("HARD:")
-    with pytest.raises(ToolError, match="acknowledge_warnings"):
-        slap_mcp.slap_send(p["preview_id"])
-    slap_mcp.slap_send(p["preview_id"], acknowledge_warnings=True)
-    assert len(_queued("jane@acme.com")) == 2
-
-
-def test_unknown_field_key_and_bad_resume_fail_loud(repo):
-    with pytest.raises(ToolError, match="unknown field keys"):
-        slap_mcp.slap_preview("recruiter", "ai", {**FIELDS, "nmae": "typo"})
-    with pytest.raises(ToolError, match="doesn't offer résumé"):
-        slap_mcp.slap_preview("recruiter", "nope", FIELDS)
-
-
-def test_send_now_drains_staged_only(repo, monkeypatch):
-    calls = {}
-
-    def fake_drain(conn, global_config, smtp_config, **kw):
-        calls.update(kw, password=smtp_config.password)
-        return runner.DrainResult(ran=True, sent=1)
-
-    monkeypatch.setattr(runner, "drain", fake_drain)
-    out = slap_mcp.slap_send(slap_mcp.slap_preview("recruiter", "ai", FIELDS)["preview_id"], now=True)
-    assert out["drain"]["sent"] == 1
-    assert calls["staged_only"] is True and calls["password"] == "app-password"
-
-
-# --- leads + hold-until-applied ----------------------------------------------
-
-JOB = "https://jobs.lever.co/acme/123"
-
-
-def _drain(calls):
-    def send_message_fn(smtp_config, *, recipient, **kw):
-        calls.append(recipient)
-        return {"message_id": f"<{len(calls)}@slap>", "raw": {}}
-    cfg = smtp.SmtpConfig(host="h", port=1, user="u", password="p")
-    return runner.drain(tracking.connect(), load_global_config(), cfg, sleep_fn=lambda s: None,
-                        send_message_fn=send_message_fn, staged_only=True, log_fn=lambda s: None)
-
-
-def test_held_email_sends_only_after_application(repo):
+def _capture(**details):
     conn = tracking.connect()
-    lead_id, _ = leads.capture(conn, url=JOB, jd="Build agents", company="Acme")
-    assert [l["lead_id"] for l in slap_mcp.slap_leads()["pending"]] == [lead_id]
-    slap_mcp.slap_match_lead(lead_id, "ai", "recruiter")
-
-    p = slap_mcp.slap_preview("recruiter", "ai", FIELDS, lead_id=lead_id, hold_until_applied=True)
-    assert p["held_until_applied"] is True
-    assert slap_mcp.slap_send(p["preview_id"])["held_until_applied"] is True
-    inbox = slap_mcp.slap_leads()
-    assert inbox["pending"] == []
-    assert [(h["recipient"], h["lead_id"], h["reason"]) for h in inbox["held"]] == \
-        [("jane@acme.com", lead_id, "waiting for application")]
-
-    calls = []
-    _drain(calls)
-    assert calls == []  # held
-
-    leads.mark_applied(conn, url=JOB, resume="ai")
-    _drain(calls)
-    assert calls == ["jane@acme.com"]
+    lead_id, _ = leads.capture(conn, url=JOB, jd="Build agents", company="Acme", role="ML Engineer",
+                               **{"campaign": "test-hm", "resume": "resume-a", "contact_email": CONTACT,
+                                  "contact_name": "Sam", **details})
+    return conn, lead_id
 
 
-def test_applied_with_other_resume_stays_held_and_blocks_new_preview(repo):
-    conn = tracking.connect()
-    lead_id, _ = leads.capture(conn, url=JOB, jd="JD")
-    slap_mcp.slap_send(slap_mcp.slap_preview("recruiter", "ai", FIELDS, lead_id=lead_id,
-                                             hold_until_applied=True)["preview_id"])
-    leads.mark_applied(conn, url=JOB, resume="ds")
-    calls = []
-    _drain(calls)
-    assert calls == []
-    assert "applied with résumé 'ds'" in slap_mcp.slap_leads()["held"][0]["reason"]
-    with pytest.raises(ToolError, match="already applied"):
-        slap_mcp.slap_preview("recruiter", "ai", FIELDS, lead_id=lead_id)
+def _apply(conn, resume="resume-a"):
+    """What POST /api/leads/applied does."""
+    pdf = "docs/a.pdf" if resume == "resume-a" else "docs/b.pdf"
+    lead_id = leads.mark_applied(conn, url=JOB, resume=resume, resume_sha256=outreach._sha256(pdf))
+    return outreach.stage(conn, load_global_config(), lead_id)
 
 
-def test_hold_needs_lead_and_match_validates(repo):
-    with pytest.raises(ToolError, match="needs a lead_id"):
-        slap_mcp.slap_preview("recruiter", "ai", FIELDS, hold_until_applied=True)
-    with pytest.raises(ToolError, match="unknown lead"):
-        slap_mcp.slap_match_lead("nope", "ai", "recruiter")
-    with pytest.raises(ToolError, match="not a send_tag"):
-        slap_mcp.slap_match_lead("nope", "zzz", "recruiter")
+def _queued(conn):
+    return conn.execute("SELECT recipient, meta FROM events WHERE type='queued'").fetchall()
 
 
-def test_two_previews_for_one_address_cannot_both_stage(repo):
-    a = slap_mcp.slap_preview("recruiter", "ai", FIELDS)
-    b = slap_mcp.slap_preview("recruiter", "ai", {**FIELDS, "signal": "revised"})
-    slap_mcp.slap_send(a["preview_id"])
-    with pytest.raises(ToolError, match="dedup state changed"):
-        slap_mcp.slap_send(b["preview_id"], acknowledge_warnings=True)
-    assert len(_queued("jane@acme.com")) == 1
-    with pytest.raises(ToolError, match="unknown preview_id"):  # stale preview is dropped
-        slap_mcp.slap_send(b["preview_id"], acknowledge_warnings=True)
+DROP = {"why_line": "I've shipped LLM agents to production."}
 
 
-def _sha(b):
-    import hashlib
-    return hashlib.sha256(b).hexdigest()
+def test_application_is_the_current_one_and_only_one(repo):
+    with pytest.raises(ToolError, match="capture a posting"):
+        slap_mcp.slap_application()
+    _, lead_id = _capture()
+    leads.capture(tracking.connect(), url="https://jobs.lever.co/other/9", jd="Other JD", company="Other")
+    app = slap_mcp.slap_application()  # the most recently touched one
+    assert app["company"] == "Other" and app["campaign"] is None and "no campaign" in app["drop"]
+    app = slap_mcp.slap_application(lead_id)
+    assert app["company"] == "Acme" and app["status"].startswith("not applied")
+    assert [f["key"] for f in app["drop_fields"]] == ["role_catted", "company", "why_line", "signal"]
+    assert app["stars"] == [{"id": "s1", "title": "Shipped X", "tags": ["llm"]}]
+    assert app["email_preview"]["missing"] == ["why_line"]
+    assert "jobs.lever.co/other" not in json.dumps(app)  # nothing about the other application
 
 
-def test_held_email_stays_held_if_resume_file_changed_after_applying(repo):
-    conn = tracking.connect()
-    lead_id, _ = leads.capture(conn, url=JOB, jd="JD")
-    slap_mcp.slap_send(slap_mcp.slap_preview("recruiter", "ai", FIELDS, lead_id=lead_id,
-                                             hold_until_applied=True)["preview_id"])
-    leads.mark_applied(conn, url=JOB, resume="ai", resume_sha256=_sha(b"%PDF-1.4 real resume"))
-    (repo / "docs" / "ai.pdf").write_bytes(b"%PDF-1.4 edited after applying")
-    calls = []
-    _drain(calls)
-    assert calls == []
-    assert "changed since you applied" in slap_mcp.slap_leads()["held"][0]["reason"]
+def test_drop_before_applied_then_applying_stages_once(repo):
+    conn, lead_id = _capture()
+    out = slap_mcp.slap_save_drop(lead_id, DROP)
+    assert out["outreach"] == {"status": "not_applied"}
+    assert out["email"]["subject"] == "Your ml engineer opening at Acme"
+    assert "Hi Sam," in out["email"]["body"] and out["email"]["missing"] == []
+    assert _queued(conn) == []
+
+    assert _apply(conn) == {"status": "staged", "to": CONTACT}
+    (row,) = _queued(conn)
+    assert row["recipient"] == CONTACT and json.loads(row["meta"])["lead_id"] == lead_id
+    manifest = load_manifest(recipient_workdir("test-hm", CONTACT))
+    assert manifest["subject"] == out["email"]["subject"] and manifest["stage_bodies"] == ["Bump Sam", "Last Sam"]
+
+    assert _apply(conn)["status"] == "already_staged"
+    with pytest.raises(ToolError, match="already staged"):
+        slap_mcp.slap_save_drop(lead_id, DROP)
+    assert len(_queued(conn)) == 1
 
 
-def test_held_restaged_recipient_gets_no_followup_before_application(repo, monkeypatch):
-    # Already contacted in an earlier sequence (SMTP message_id on record), then
-    # re-staged with a hold: no follow-up may fire into the old thread.
-    from datetime import datetime, timedelta, timezone
-    from slap.tracking import append_event
-    conn = tracking.connect()
-    old = datetime.now(timezone.utc) - timedelta(days=30)
-    append_event(conn, type="queued", recipient="jane@acme.com", campaign="recruiter", stage=0,
-                 meta={"persona": "recruiter", "cadence": [2, 5]}, timestamp=old)
-    append_event(conn, type="sent", recipient="jane@acme.com", campaign="recruiter", stage=0,
-                 message_id="<old@slap>", timestamp=old)
-    lead_id, _ = leads.capture(conn, url=JOB, jd="JD")
-    p = slap_mcp.slap_preview("recruiter", "ai", FIELDS, lead_id=lead_id, hold_until_applied=True)
-    slap_mcp.slap_send(p["preview_id"], acknowledge_warnings=True)
-
-    calls = []
-    def send_message_fn(smtp_config, *, recipient, **kw):
-        calls.append(recipient)
-        return {"message_id": "<x@slap>", "raw": {}}
-    runner.drain(conn, load_global_config(), smtp.SmtpConfig(host="h", port=1, user="u", password="p"),
-                 sleep_fn=lambda s: None, send_message_fn=send_message_fn, log_fn=lambda s: None)
-    assert calls == []
-    assert [h["recipient"] for h in held_initials(conn)] == ["jane@acme.com"]
+def test_applied_first_then_saving_the_drop_stages(repo):
+    conn, lead_id = _capture()
+    assert _apply(conn) == {"status": "incomplete", "missing": ["why_line"]}
+    assert slap_mcp.slap_save_drop(lead_id, DROP)["outreach"] == {"status": "staged", "to": CONTACT}
 
 
-def test_pending_questions_roundtrip(repo):
-    conn = tracking.connect()
-    lead_id = leads.record_questions(conn, url=JOB, questions=[{"label": "Why Acme?", "kind": "textarea"}])
-    assert slap_mcp.slap_pending_questions()[0]["questions"][0]["label"] == "Why Acme?"
+def test_no_contact_waits_and_details_unblock_it(repo):
+    conn, lead_id = _capture(contact_email=None)
+    slap_mcp.slap_save_drop(lead_id, DROP)
+    assert _apply(conn) == {"status": "incomplete", "missing": ["contact email"]}
+    leads.set_details(conn, lead_id, contact_email=CONTACT)
+    assert outreach.stage(conn, load_global_config(), lead_id)["status"] == "staged"
+
+
+def test_already_contacted_needs_confirm(repo):
+    conn, lead_id = _capture()
+    tracking.append_event(conn, type="queued", recipient=CONTACT, campaign="old", stage=0, meta={"persona": "x"})
+    slap_mcp.slap_save_drop(lead_id, DROP)
+    out = _apply(conn)
+    assert out["status"] == "needs_confirm" and out["warnings"][0].startswith("Already contacted")
+    assert slap_mcp.slap_save_drop(lead_id, DROP, acknowledge_warnings=True)["outreach"]["status"] == "staged"
+
+
+def test_drop_rejects_unknown_fields_and_contact_keys(repo):
+    _, lead_id = _capture()
+    with pytest.raises(ToolError, match="not drop fields"):
+        slap_mcp.slap_save_drop(lead_id, {"email": "x@y.com"})
+    with pytest.raises(ToolError, match="not drop fields"):
+        slap_mcp.slap_save_drop(lead_id, {"why_lin": "typo"})
+
+
+def test_resume_edited_after_applying_is_refused(repo):
+    conn, lead_id = _capture()
+    slap_mcp.slap_save_drop(lead_id, DROP)
+    leads.mark_applied(conn, url=JOB, resume="resume-a", resume_sha256=outreach._sha256("docs/a.pdf"))
+    (repo / "docs" / "a.pdf").write_bytes(b"%PDF-1.4 edited")
+    with pytest.raises(outreach.OutreachError, match="changed since you applied"):
+        outreach.stage(conn, load_global_config(), lead_id)
+    assert _queued(conn) == []
+
+
+def test_applied_resume_is_the_one_attached(repo):
+    conn, lead_id = _capture()
+    slap_mcp.slap_save_drop(lead_id, DROP)
+    assert _apply(conn, resume="resume-b")["status"] == "staged"
+    manifest = load_manifest(recipient_workdir("test-hm", CONTACT))
+    assert manifest["attachment_source"].endswith("docs/b.pdf")
+
+
+def test_questions_roundtrip(repo):
+    conn, lead_id = _capture()
+    leads.record_questions(conn, url=JOB, questions=[{"label": "Why Acme?", "kind": "textarea"}])
+    assert slap_mcp.slap_application()["open_questions"][0]["label"] == "Why Acme?"
     slap_mcp.slap_answer_questions(lead_id, {"Why Acme?": "Agents."})
-    assert slap_mcp.slap_pending_questions() == []
+    assert slap_mcp.slap_application()["open_questions"] == []
     with pytest.raises(ToolError, match="not among"):
         slap_mcp.slap_answer_questions(lead_id, {"Typo?": "x"})
+
+
+def test_staged_reach_out_sends_on_the_next_drain(repo):
+    conn, lead_id = _capture()
+    slap_mcp.slap_save_drop(lead_id, DROP)
+    _apply(conn)
+    sent = []
+
+    def send_message_fn(smtp_config, *, recipient, attachment=None, **kw):
+        sent.append(recipient)
+        return {"message_id": "<1@slap>", "raw": {}}
+
+    runner.drain(conn, load_global_config(), smtp.SmtpConfig(host="h", port=1, user="u", password="p"),
+                 sleep_fn=lambda s: None, send_message_fn=send_message_fn, log_fn=lambda s: None)
+    assert sent == [CONTACT]
+    assert slap_mcp.slap_application(lead_id)["status"] == f"reach-out staged to {CONTACT}"
+
+
+def test_stars_pass_through_and_reject_unknown(repo):
+    assert slap_mcp.slap_stars(["s1"])[0]["core"] == "passes through"
+    with pytest.raises(ToolError, match="unknown STAR"):
+        slap_mcp.slap_stars(["nope"])

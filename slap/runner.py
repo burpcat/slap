@@ -43,7 +43,7 @@ from pathlib import Path
 from slap import doctor, imap, smtp, stages
 from slap.latex import WORKDIR_ROOT, recipient_workdir
 from slap.queue import (
-    due_for_followup, due_for_ooo_resend, due_for_remind, due_recipients, held_initials, load_manifest,
+    due_for_followup, due_for_ooo_resend, due_for_remind, due_recipients, load_manifest,
 )
 from slap.tracking import append_event
 
@@ -723,11 +723,7 @@ def drain(conn, global_config, smtp_config, *, now: date = None, sleep_fn=time.s
     # follow-up firing INTO drain (due_for_followup), and without this gate
     # --now would inherit the whole past-due cadence backlog (the surprising
     # "[N/130]" sweep). due_recipients is always drained — that IS the staged work.
-    held = {h["recipient"] for h in held_initials(conn)}
-    if held:
-        log_fn(f"holding {len(held)} staged send(s) until their application is recorded")
-    all_initial = due_recipients(conn)
-    due_initial = [row for row in all_initial if row["recipient"] not in held]
+    due_initial = due_recipients(conn)
     if staged_only:
         due_ooo = due_followup = due_remind = []
     else:
@@ -741,10 +737,7 @@ def drain(conn, global_config, smtp_config, *, now: date = None, sleep_fn=time.s
         # Reminds (one-shot manual nudges) fire on the same runner cadence —
         # just more rows in the same cap-bounded batch, via _send_remind.
         due_remind = due_for_remind(conn)
-    # Every staged-but-unsent initial — held ones included — wins over
-    # follow-up/OOO/remind: a held re-staged recipient must get nothing until
-    # its initial goes (else a follow-up's `sent` would erase the hold).
-    initial_recipients = {row["recipient"] for row in all_initial}
+    initial_recipients = {row["recipient"] for row in due_initial}
     ooo_recipients = {row["recipient"] for row in due_ooo}
     followup_recipients = {row["recipient"] for row in due_followup}
     due = ([(row, _send_one) for row in due_initial]
