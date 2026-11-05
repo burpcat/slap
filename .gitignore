@@ -42,6 +42,8 @@ runner.log
 runner.err.log
 sync.log
 sync.err.log
+dashboard.log
+dashboard.err.log
 
 # local marketing/screenshot mockups — real campaign names, never committed
 marketing_dashboard_sample.html
