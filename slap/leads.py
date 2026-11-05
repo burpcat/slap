@@ -10,15 +10,22 @@ from __future__ import annotations
 
 import hashlib
 import html
+import ipaddress
 import json
 import re
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+import socket
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import requests
 
 from slap.tracking import append_event
 
 BATCH_MAX = 25  # ponytail: per-call cap on fetched postings; batch again for more
+FETCH_MAX_BYTES = 5_000_000
+FETCH_MAX_REDIRECTS = 5
+# A step of a posting (apply form, confirmation) folds into the posting's own
+# URL. Keep in sync with extension/lib.js STEP.
+_STEP = re.compile(r"^(/.*[^/].*?)/(apply|application|confirmation|thanks|thank-you|submitted|success)(/.*)?$", re.I)
 _LD_SCRIPT = re.compile(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', re.S | re.I)
 
 STAGES = ("captured", "matched", "applied", "questions", "answered")
@@ -30,13 +37,18 @@ class LeadError(Exception):
 
 def normalize_url(url: str) -> str:
     """Same posting → same key: drop the fragment, tracking params (utm_*), a
-    trailing slash, and host case. Keeps other query params — some job sites put
-    the job id there (e.g. ?gh_jid=)."""
+    trailing slash, and host case; fold an apply/confirmation step (and its
+    query) into the posting URL. Keeps other query params on the posting itself
+    — some job sites put the job id there (e.g. ?gh_jid=)."""
     parts = urlsplit((url or "").strip())
     if parts.scheme not in ("http", "https") or not parts.netloc:
         raise LeadError(f"not an http(s) URL: {url!r}")
-    query = urlencode([(k, v) for k, v in parse_qsl(parts.query) if not k.lower().startswith("utm_")])
-    return urlunsplit((parts.scheme, parts.netloc.lower(), parts.path.rstrip("/") or "/", query, ""))
+    path, query = parts.path, parts.query
+    step = _STEP.match(path)
+    if step:
+        path, query = step.group(1), ""
+    query = urlencode([(k, v) for k, v in parse_qsl(query) if not k.lower().startswith("utm_")])
+    return urlunsplit((parts.scheme, parts.netloc.lower(), path.rstrip("/") or "/", query, ""))
 
 
 def lead_id_for(url: str) -> str:
@@ -213,7 +225,8 @@ def parse_job_posting(page_html: str) -> dict | None:
         for n in nodes:
             kind = n.get("@type") if isinstance(n, dict) else None
             if kind == "JobPosting" or (isinstance(kind, list) and "JobPosting" in kind):
-                jd = _html_to_text(n.get("description", ""))
+                desc = n.get("description")
+                jd = _html_to_text(desc) if isinstance(desc, str) else ""
                 if not jd:
                     continue
                 org = n.get("hiringOrganization")
@@ -222,7 +235,49 @@ def parse_job_posting(page_html: str) -> dict | None:
     return None
 
 
-def add_from_urls(conn, urls: list, *, get=requests.get) -> list:
+def _public_host(host: str) -> None:
+    """Refuse hosts that resolve to loopback/private/link-local/reserved
+    addresses: batch import fetches links Claude passes in, and a JD could
+    try to steer that at this machine or the LAN.
+    ponytail: resolves before connecting, so a DNS-rebinding race remains;
+    pin the resolved IP if that ever matters for a GET-only, JSON-LD-only fetch."""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as e:
+        raise LeadError(f"can't resolve {host!r} ({e})") from e
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if not ip.is_global:
+            raise LeadError(f"refusing to fetch {host!r}: it resolves to non-public address {ip}")
+
+
+def fetch_page(url: str, *, get=requests.get, check_host=_public_host) -> str:
+    """GET a public http(s) page as text: every redirect hop re-checked,
+    body capped at FETCH_MAX_BYTES, charset from the header else UTF-8."""
+    for _ in range(FETCH_MAX_REDIRECTS + 1):
+        parts = urlsplit(url)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise LeadError(f"not an http(s) URL: {url!r}")
+        check_host(parts.hostname)
+        resp = get(url, timeout=(5, 15), stream=True, allow_redirects=False,
+                   headers={"User-Agent": "Mozilla/5.0 (compatible; slap)"})
+        if resp.is_redirect:
+            url = urljoin(url, resp.headers.get("Location", ""))
+            resp.close()
+            continue
+        resp.raise_for_status()
+        body = b""
+        for chunk in resp.iter_content(64 * 1024):
+            body += chunk
+            if len(body) > FETCH_MAX_BYTES:
+                resp.close()
+                raise LeadError(f"page is larger than {FETCH_MAX_BYTES // 1_000_000} MB")
+        charset = "charset=" in resp.headers.get("Content-Type", "").lower() and resp.encoding
+        return body.decode(charset or "utf-8", errors="replace")
+    raise LeadError(f"more than {FETCH_MAX_REDIRECTS} redirects")
+
+
+def add_from_urls(conn, urls: list, *, fetch=fetch_page) -> list:
     """Fetch each posting and capture it as a lead. One result per URL —
     {url, lead_id, created, company, role} or {url, error}; one bad link
     never stops the rest."""
@@ -232,21 +287,24 @@ def add_from_urls(conn, urls: list, *, get=requests.get) -> list:
     for url in urls:
         try:
             normalize_url(url)
-            resp = get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0 (compatible; slap)"})
-            resp.raise_for_status()
-            job = parse_job_posting(resp.text)
+            job = parse_job_posting(fetch(url))
             if job is None:
                 raise LeadError("no JobPosting data in the page (it may render in the browser only) — "
                                 "open it and use the extension's Send to slap")
             lead_id, created = capture(conn, url=url, **job)
             results.append({"url": url, "lead_id": lead_id, "created": created,
                             "company": job["company"], "role": job["role"]})
-        except (LeadError, requests.RequestException) as e:
-            results.append({"url": url, "error": str(e)})
+        except Exception as e:  # reported per link, loudly; never aborts the batch
+            results.append({"url": url, "error": f"{type(e).__name__}: {e}" if not isinstance(e, LeadError) else str(e)})
     return results
 
 
-def all_ids(conn) -> list:
-    """Every lead_id, in first-seen order."""
-    return list(dict.fromkeys(r[0] for r in conn.execute(
-        "SELECT json_extract(meta, '$.lead_id') FROM events WHERE type = 'lead' ORDER BY id")))
+def all_leads(conn) -> list:
+    """[(lead, events)] for every lead, from ONE pass over lead events (the
+    per-lead get() rescans; this is for whole-table views like Companies)."""
+    by_id: dict = {}
+    for r in conn.execute("SELECT timestamp, meta FROM events WHERE type = 'lead' ORDER BY id"):
+        e = {"timestamp": r["timestamp"], **json.loads(r["meta"])}
+        by_id.setdefault(e["lead_id"], []).append(e)
+    drafted = _drafted(conn)
+    return [(_fold(i, evs, drafted.get(i, [])), evs) for i, evs in by_id.items()]

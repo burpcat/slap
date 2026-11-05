@@ -114,14 +114,74 @@ class _Resp:
 
 
 def test_add_from_urls_per_link_results(conn):
-    pages = {"https://jobs.lever.co/acme/1": _Resp(LD), "https://jobs.lever.co/acme/2": _Resp("", 404),
-             "https://acme.wd1.myworkdayjobs.com/x": _Resp("<html>spa</html>")}
-    out = leads.add_from_urls(conn, list(pages) + ["not a url"], get=lambda u, **kw: pages[u])
+    import requests
+
+    def fetch(url):
+        if url.endswith("/2"):
+            raise requests.HTTPError("404 error")
+        return {"https://jobs.lever.co/acme/1/apply?lever-source=x": LD,
+                "https://acme.wd1.myworkdayjobs.com/x": "<html>spa</html>",
+                "https://x.com/odd": LD.replace('"description":"', '"description":["list"],"x":"')}[url]
+
+    urls = ["https://jobs.lever.co/acme/1/apply?lever-source=x", "https://jobs.lever.co/acme/2",
+            "https://acme.wd1.myworkdayjobs.com/x", "https://x.com/odd", "not a url"]
+    out = leads.add_from_urls(conn, urls, fetch=fetch)
     assert out[0]["company"] == "Acme" and out[0]["created"] is True
     assert "404" in out[1]["error"]
     assert "Send to slap" in out[2]["error"]
-    assert "http(s)" in out[3]["error"]
+    assert "Send to slap" in out[3]["error"]  # non-string description: skipped, batch continues
+    assert "http(s)" in out[4]["error"]
+    # a pasted /apply link lands on the same lead the extension uses for the posting
     assert [l["url"] for l in leads.pending(conn)] == ["https://jobs.lever.co/acme/1"]
-    assert leads.add_from_urls(conn, ["https://jobs.lever.co/acme/1"], get=lambda u, **kw: pages[u])[0]["created"] is False
+    assert leads.add_from_urls(conn, urls[:1], fetch=fetch)[0]["created"] is False
     with pytest.raises(leads.LeadError, match="at most"):
         leads.add_from_urls(conn, ["https://x.com/j"] * (leads.BATCH_MAX + 1))
+
+
+def test_normalize_folds_step_pages_like_the_extension():
+    assert leads.normalize_url("https://x.com/jobs/1/success") == "https://x.com/jobs/1"
+    assert leads.normalize_url("https://example.com/apply/eng-123") == "https://example.com/apply/eng-123"
+    assert leads.normalize_url("https://acme.wd1.myworkdayjobs.com/c/job/B/ML_R1/apply/applyManually") == \
+        "https://acme.wd1.myworkdayjobs.com/c/job/B/ML_R1"
+
+
+class _Stream:
+    def __init__(self, body=b"", status=200, location=None, ctype="text/html", encoding="ISO-8859-1"):
+        self.body, self.status_code, self.encoding = body, status, encoding
+        self.headers = {"Content-Type": ctype, **({"Location": location} if location else {})}
+        self.is_redirect = location is not None
+
+    def raise_for_status(self):
+        pass
+
+    def iter_content(self, n):
+        for i in range(0, len(self.body), n):
+            yield self.body[i:i + n]
+
+    def close(self):
+        pass
+
+
+def test_fetch_page_refuses_private_hosts_including_via_redirect():
+    with pytest.raises(leads.LeadError, match="non-public"):
+        leads.fetch_page("http://127.0.0.1:5050/api/profile", get=lambda *a, **k: _Stream())
+    hops = {"https://jobs.example/1": _Stream(location="http://localhost/secret")}
+    checked = []
+
+    def check(host):
+        checked.append(host)
+        if host == "localhost":
+            raise leads.LeadError("refusing to fetch 'localhost': it resolves to non-public address 127.0.0.1")
+
+    with pytest.raises(leads.LeadError, match="non-public"):
+        leads.fetch_page("https://jobs.example/1", get=lambda u, **k: hops[u], check_host=check)
+    assert checked == ["jobs.example", "localhost"]
+
+
+def test_fetch_page_caps_size_and_decodes_utf8_without_charset():
+    ok = lambda h: None
+    big = _Stream(body=b"x" * (leads.FETCH_MAX_BYTES + 1))
+    with pytest.raises(leads.LeadError, match="larger than"):
+        leads.fetch_page("https://a.example/", get=lambda *a, **k: big, check_host=ok)
+    page = _Stream(body="Zürich — café".encode("utf-8"))  # no charset header; requests would guess latin-1
+    assert leads.fetch_page("https://a.example/", get=lambda *a, **k: page, check_host=ok) == "Zürich — café"
