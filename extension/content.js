@@ -193,6 +193,7 @@
   let plan = [];
   let preparedSig = "";
   let autoAsk = false;
+  let attachedTag = null;  // the résumé you put into this form's upload field
   const safeRender = () => render().catch((e) => status(String(e.message || e), true));
 
   chrome.storage.local.get("autoAskClaude").then((v) => { autoAsk = Boolean(v.autoAskClaude); $(".auto").checked = autoAsk; },
@@ -275,7 +276,7 @@
     const found = scanForm();
     $(".form").hidden = !found.length;
     $(".attach").hidden = !resumeInput();
-    const sig = found.map((q) => q.label).join("|");
+    const sig = [job.url, ...found.map((q) => q.label)].join("|"); // per posting: same form, other job = re-prepare
     if (found.length && sig !== preparedSig) await prepare(found, sig);
 
     $(".applied").hidden = staged;
@@ -359,6 +360,7 @@
     dt.items.add(new File([bytes], name, { type: "application/pdf" }));
     input.files = dt.files;
     for (const t of ["input", "change"]) input.dispatchEvent(new Event(t, { bubbles: true }));
+    attachedTag = tag;
     status(`Attached "${tag}" as ${name}.`);
   });
 
@@ -379,6 +381,9 @@
   async function markApplied(acknowledge) {
     const resume = $("#resume").value;
     if (!resume) return status("Pick the campaign and résumé you applied with.", true);
+    if (attachedTag && attachedTag !== resume) {
+      return status(`You attached "${attachedTag}" but the picker says "${resume}". Switch it back, or attach "${resume}" first.`, true);
+    }
     const saveDetails = async () => {
       const saved = lead ? await send({ type: "details", url: job.url, ...details() })
                          : await send({ type: "capture", job: { ...job, ...details() } });
@@ -408,6 +413,7 @@
       already_staged: `Already staged to ${o.to}.`,
       incomplete: `Applied with "${resume}". The reach-out stages once it has: ${(o.missing || []).join(", ")}.`,
       needs_confirm: "Applied. Check the warning above, then Stage anyway or leave it.",
+      busy: `Applied with "${resume}". Not staged: ${o.reason}.`,
     }[o.status] || `Applied (${o.status}).`);
     safeRender();
   }
@@ -424,7 +430,13 @@
 
   // SPA navigation (Workday pages): re-render when the URL changes.
   let last = location.href;
-  setInterval(() => { if (location.href !== last) { last = location.href; safeRender(); } }, 1000);
+  setInterval(() => {
+    if (location.href === last) return;
+    const samePosting = L.canonicalJobUrl(location.href) === L.canonicalJobUrl(last);
+    last = location.href;
+    if (!samePosting) { detailsDirty = false; attachedTag = null; preparedSig = ""; } // nothing carries to another job
+    safeRender();
+  }, 1000);
 
   safeRender();
 })();
