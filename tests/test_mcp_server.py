@@ -7,7 +7,8 @@ import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
 import slap_mcp
-from slap import runner, smtp, tracking
+from slap import leads, runner, smtp, tracking
+from slap.config import load_global_config
 from slap.latex import recipient_workdir
 from slap.queue import load_manifest
 
@@ -108,7 +109,7 @@ def test_preview_then_send_stages_exactly_the_preview_once(repo):
     assert "Hi Jane," in p["body"] and "{{" not in p["body"]  # empty optional signal line dropped
     assert p["warnings"] == [] and p["empty_required"] == []
 
-    assert slap_mcp.slap_send(p["preview_id"]) == {"staged": "jane@acme.com"}
+    assert slap_mcp.slap_send(p["preview_id"]) == {"staged": "jane@acme.com", "held_until_applied": False}
     assert len(_queued("jane@acme.com")) == 1
     manifest = load_manifest(recipient_workdir("recruiter", "jane@acme.com"))
     assert (manifest["subject"], manifest["body"]) == (p["subject"], p["body"])
@@ -154,3 +155,63 @@ def test_send_now_drains_staged_only(repo, monkeypatch):
     out = slap_mcp.slap_send(slap_mcp.slap_preview("recruiter", "ai", FIELDS)["preview_id"], now=True)
     assert out["drain"]["sent"] == 1
     assert calls["staged_only"] is True and calls["password"] == "app-password"
+
+
+# --- leads + hold-until-applied ----------------------------------------------
+
+JOB = "https://jobs.lever.co/acme/123"
+
+
+def _drain(calls):
+    def send_message_fn(smtp_config, *, recipient, **kw):
+        calls.append(recipient)
+        return {"message_id": f"<{len(calls)}@slap>", "raw": {}}
+    cfg = smtp.SmtpConfig(host="h", port=1, user="u", password="p")
+    return runner.drain(tracking.connect(), load_global_config(), cfg, sleep_fn=lambda s: None,
+                        send_message_fn=send_message_fn, staged_only=True, log_fn=lambda s: None)
+
+
+def test_held_email_sends_only_after_application(repo):
+    conn = tracking.connect()
+    lead_id, _ = leads.capture(conn, url=JOB, jd="Build agents", company="Acme")
+    assert [l["lead_id"] for l in slap_mcp.slap_leads()["pending"]] == [lead_id]
+    slap_mcp.slap_match_lead(lead_id, "ai", "recruiter")
+
+    p = slap_mcp.slap_preview("recruiter", "ai", FIELDS, lead_id=lead_id, hold_until_applied=True)
+    assert p["held_until_applied"] is True
+    assert slap_mcp.slap_send(p["preview_id"])["held_until_applied"] is True
+    inbox = slap_mcp.slap_leads()
+    assert inbox["pending"] == []
+    assert [(h["recipient"], h["lead_id"], h["reason"]) for h in inbox["held"]] == \
+        [("jane@acme.com", lead_id, "waiting for application")]
+
+    calls = []
+    _drain(calls)
+    assert calls == []  # held
+
+    leads.mark_applied(conn, url=JOB, resume="ai")
+    _drain(calls)
+    assert calls == ["jane@acme.com"]
+
+
+def test_applied_with_other_resume_stays_held_and_blocks_new_preview(repo):
+    conn = tracking.connect()
+    lead_id, _ = leads.capture(conn, url=JOB, jd="JD")
+    slap_mcp.slap_send(slap_mcp.slap_preview("recruiter", "ai", FIELDS, lead_id=lead_id,
+                                             hold_until_applied=True)["preview_id"])
+    leads.mark_applied(conn, url=JOB, resume="ds")
+    calls = []
+    _drain(calls)
+    assert calls == []
+    assert "applied with résumé 'ds'" in slap_mcp.slap_leads()["held"][0]["reason"]
+    with pytest.raises(ToolError, match="already applied"):
+        slap_mcp.slap_preview("recruiter", "ai", FIELDS, lead_id=lead_id)
+
+
+def test_hold_needs_lead_and_match_validates(repo):
+    with pytest.raises(ToolError, match="needs a lead_id"):
+        slap_mcp.slap_preview("recruiter", "ai", FIELDS, hold_until_applied=True)
+    with pytest.raises(ToolError, match="unknown lead"):
+        slap_mcp.slap_match_lead("nope", "ai", "recruiter")
+    with pytest.raises(ToolError, match="not a send_tag"):
+        slap_mcp.slap_match_lead("nope", "zzz", "recruiter")

@@ -7,7 +7,7 @@ skill), previews, and stages through these tools; the unattended runner
 composition of existing library functions — no new send logic lives here.
 
 Tools: slap_context · slap_stars · slap_resume_text · slap_save_derived ·
-slap_preview · slap_send. Only slap_send writes to the queue; leave it
+slap_leads · slap_match_lead · slap_preview · slap_send. Only slap_send writes to the queue; leave it
 un-allowlisted in Claude Code so its permission prompt is the human confirm.
 
 Register:  claude mcp add --scope user slap -- <repo>/.venv/bin/python <repo>/slap_mcp.py
@@ -26,9 +26,9 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from pypdf import PdfReader
 
-from slap import archive, doctor, domains, runner, smtp, tracking
+from slap import archive, doctor, domains, leads, runner, smtp, tracking
 from slap.config import ConfigError, discover_campaigns, load_campaign, load_global_config
-from slap.queue import stage_recipient
+from slap.queue import held_initials, stage_recipient
 from slap.templates import fill_template, merge_config_values
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -196,13 +196,48 @@ def slap_save_derived(name: str, source: str, text: str) -> str:
 
 
 @server.tool()
-def slap_preview(campaign: str, resume: str, fields: dict[str, str], followups: int | None = None) -> dict:
+def slap_leads() -> dict:
+    """Job postings captured from the browser that no email references yet
+    (each with its JD), plus staged emails still held for an application."""
+    conn = tracking.connect()
+    return {"pending": leads.pending(conn), "held": held_initials(conn)}
+
+
+@server.tool()
+def slap_match_lead(lead_id: str, resume: str, campaign: str) -> str:
+    """Record the résumé + campaign chosen for a lead, so the browser extension
+    uploads that résumé when the owner applies. Re-matching overrides."""
+    global_config = _config()
+    _resume_path(global_config, resume)
+    _campaign(campaign, global_config)
+    try:
+        leads.match(tracking.connect(), lead_id, resume=resume, campaign=campaign)
+    except leads.LeadError as e:
+        raise ToolError(str(e)) from e
+    return f"lead {lead_id}: résumé '{resume}', campaign '{campaign}'"
+
+
+@server.tool()
+def slap_preview(campaign: str, resume: str, fields: dict[str, str], followups: int | None = None,
+                 lead_id: str | None = None, hold_until_applied: bool = False) -> dict:
     """Render the exact email that would be staged, plus dedup warnings. Writes
     nothing. `fields` keys are the campaign's field keys; omitted = empty
     (an empty optional field drops its line). `followups` = how many of the
-    campaign's follow-up stages to send (default all). Returns a preview_id
-    for slap_send."""
+    campaign's follow-up stages to send (default all). `lead_id` links the
+    email to a captured posting; `hold_until_applied` (needs lead_id) keeps it
+    unsent until the owner applies there. Returns a preview_id for slap_send."""
     global_config = _config()
+    hold = False
+    if lead_id is not None:
+        lead = leads.get(tracking.connect(), lead_id)
+        if lead is None:
+            raise ToolError(f"unknown lead {lead_id!r}")
+        if lead["applied_resume"] and lead["applied_resume"] != resume:
+            raise ToolError(f"already applied to this posting with résumé '{lead['applied_resume']}' — "
+                            f"the email must attach that one")
+        hold = hold_until_applied and not lead["applied_resume"]
+    elif hold_until_applied:
+        raise ToolError("hold_until_applied needs a lead_id")
     camp = _campaign(campaign, global_config)
     if camp.latex_enabled:
         raise ToolError(f"campaign '{campaign}' is a LaTeX campaign — use `slap.py send {campaign}`")
@@ -251,11 +286,13 @@ def slap_preview(campaign: str, resume: str, fields: dict[str, str], followups: 
         "global_config": global_config, "campaign": camp, "recipient": recipient, "values": values,
         "subject": subject, "body": body, "stage_bodies": stage_bodies, "cadence": cadence,
         "attachment_path": attachment_path, "warnings": warnings,
+        "resume": resume, "lead_id": lead_id, "hold": hold,
     }
     return {
         "preview_id": preview_id, "to": recipient, "subject": subject, "body": body,
         "followups": [{"day": d, "body": b} for d, b in zip(cadence, stage_bodies)],
         "attachment": f"{camp.attachment_name} (résumé: {resume})",
+        "held_until_applied": hold,
         "warnings": warnings,
         "empty_required": [f.key for f in camp.fields if not f.optional and values[f.key] == ""],
     }
@@ -287,9 +324,12 @@ def slap_send(preview_id: str, acknowledge_warnings: bool = False, now: bool = F
         company=values.get("company", ""), role=values.get("role_catted", ""), req_id=values.get("req_id", ""),
         name=values.get(camp.name_field, "") if camp.name_field else "",
         archive_dir=archive.archive_dir_from_env(), field_values=values,
+        extra_meta={"resume": p["resume"],
+                    **({"lead_id": p["lead_id"]} if p["lead_id"] else {}),
+                    **({"hold": "applied"} if p["hold"] else {})},
     )
     del _previews[preview_id]  # one preview stages at most once
-    result = {"staged": p["recipient"]}
+    result = {"staged": p["recipient"], "held_until_applied": p["hold"]}
     if now:
         # Same transport config slap.py's _smtp_config builds (not importable: slap.py
         # is shadowed by the slap/ package name).
