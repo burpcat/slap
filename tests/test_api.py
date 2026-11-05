@@ -780,3 +780,32 @@ def test_api_check_suggests_resume_for_unmatched_lead(tmp_path, monkeypatch):
     url = "https://jobs.lever.co/acme/s1"
     c.post("/api/leads", json={"url": url, "jd": "Ship LLM agents with RAG and evals"})
     assert c.get("/api/check", query_string={"url": url}).get_json()["suggested_resume"]["tag"] == "ai"
+
+
+def test_api_companies_index_and_timeline(app):
+    from datetime import datetime, timedelta, timezone
+    from slap import leads
+    conn = connect(app.db_path)
+    t0 = datetime(2026, 11, 1, tzinfo=timezone.utc)
+    lead_id, _ = leads.capture(conn, url="https://jobs.lever.co/acme/1", jd="JD", company="Acme", role="ml eng")
+    leads.mark_applied(conn, url="https://jobs.lever.co/acme/1", resume="ai")
+    append_event(conn, type="queued", recipient="jane@acme.com", campaign="hm", stage=0,
+                 meta={"persona": "recruiter", "company": "acme"}, timestamp=t0 + timedelta(days=10))
+    append_event(conn, type="sent", recipient="jane@acme.com", campaign="hm", stage=0,
+                 message_id="<m@x>", timestamp=t0 + timedelta(days=11))
+    append_event(conn, type="reply", recipient="jane@acme.com", campaign="hm", timestamp=t0 + timedelta(days=12))
+    leads.capture(conn, url="https://x.com/jobs/2", jd="JD2", company="Other")
+
+    c = app.test_client()
+    index = {e["company"].lower(): e for e in c.get("/api/companies").get_json()["companies"]}
+    assert (index["acme"]["leads"], index["acme"]["applied"], index["acme"]["contacts"], index["acme"]["replied"]) \
+        == (1, 1, 1, 1)
+    assert index["other"]["contacts"] == 0
+
+    body = c.get("/api/companies/ACME").get_json()  # case-insensitive
+    assert body["company"] == "Acme" and body["leads"][0]["applied_resume"] == "ai"
+    kinds = [(n["kind"], n["label"]) for n in body["timeline"]]
+    assert kinds[:2] == [("lead", "Posting captured"), ("lead", "Applied")]
+    assert [k for k, _ in kinds[2:]] == ["email"] * (len(kinds) - 2)
+    assert all(n["recipient"] == "jane@acme.com" for n in body["timeline"][2:])
+    assert c.get("/api/companies/nobody").status_code == 404

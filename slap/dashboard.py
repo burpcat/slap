@@ -42,7 +42,7 @@ from pathlib import Path
 
 from flask import Flask, abort, g, send_file
 
-from slap import archive, display, domains, gmass_cache, reload, stages, tracking, ui_state
+from slap import archive, display, domains, gmass_cache, leads, reload, stages, tracking, ui_state
 from slap.config import discover_campaigns
 from slap.domains import check_recipient
 from slap.imap import ImapError
@@ -2325,3 +2325,86 @@ def create_app(db_path: Path, global_config, consumer_domains: set, imap_config:
     )
 
     return app
+
+
+# --- companies: leads + reach-outs per company (browser-extension era) -------
+
+_LEAD_NODE = {
+    "captured": ("Posting captured", "neutral"),
+    "matched": ("Résumé matched", "neutral"),
+    "applied": ("Applied", "good"),
+    "questions": ("Form questions sent to Claude", "neutral"),
+    "answered": ("Claude answered form questions", "neutral"),
+}
+
+
+def _company_key(name) -> str:
+    return (name or "").strip().lower()
+
+
+def companies_index(conn) -> list:
+    """Every company seen in a captured lead or a staged send, with counts,
+    most recent activity first. Derived live from the event log."""
+    by_key: dict = {}
+
+    def entry(name, at):
+        e = by_key.setdefault(_company_key(name), {"company": name.strip(), "leads": 0, "applied": 0,
+                                                   "contacts": 0, "replied": 0, "last_activity": at})
+        e["last_activity"] = max(e["last_activity"] or "", at or "") or None
+        return e
+
+    for lead_id in leads.all_ids(conn):
+        lead = leads.get(conn, lead_id)
+        if not _company_key(lead["company"]):
+            continue
+        last = max((ev["timestamp"] for ev in leads.lead_events(conn, lead_id)), default=None)
+        e = entry(lead["company"], last)
+        e["leads"] += 1
+        e["applied"] += bool(lead["applied_resume"])
+    seen = set()
+    for r in conn.execute("SELECT recipient, json_extract(meta, '$.company') AS company FROM events "
+                          "WHERE type = 'queued' ORDER BY id DESC"):
+        key = (_company_key(r["company"]), r["recipient"])
+        if not key[0] or key in seen:
+            continue
+        seen.add(key)
+        row = conn.execute("SELECT * FROM recipients WHERE recipient = ?", (r["recipient"],)).fetchone()
+        e = entry(r["company"], row["last_event_at"] if row else None)
+        e["contacts"] += 1
+        e["replied"] += bool(row and row["replied_at"])
+    return sorted(by_key.values(), key=lambda e: e["last_activity"] or "", reverse=True)
+
+
+def company_timeline(conn, company: str, *, global_config=None) -> dict | None:
+    """One company's whole story, oldest first: every lead event for postings
+    at that company plus every recorded event for each contact staged there.
+    None if the company is unknown."""
+    key = _company_key(company)
+    lead_rows = [leads.get(conn, i) for i in leads.all_ids(conn)]
+    company_leads = [l for l in lead_rows if _company_key(l["company"]) == key]
+    contacts = domains.contacts_at_company(conn, company)
+    if not company_leads and not contacts:
+        return None
+    nodes = []
+    for lead in company_leads:
+        for ev in leads.lead_events(conn, lead["lead_id"]):
+            label, chip = _LEAD_NODE.get(ev["stage"], (ev["stage"], "neutral"))
+            detail = {"captured": lead["role"], "matched": f"{ev.get('resume')} · {ev.get('campaign')}",
+                      "applied": f"with {ev.get('resume')}"}.get(ev["stage"], "")
+            nodes.append({"kind": "lead", "time": ev["timestamp"], "label": label, "chip": chip,
+                          "detail": detail, "lead_id": lead["lead_id"], "url": lead["url"], "recipient": None})
+    for c in contacts:
+        detail = recipient_timeline(conn, c.recipient, global_config=global_config) or {"timeline": []}
+        for n in detail["timeline"]:
+            if not n.get("inferred"):
+                nodes.append({"kind": "email", "time": n["time"], "label": n["label"], "chip": n["chip"],
+                              "detail": n.get("detail", ""), "lead_id": None, "url": None,
+                              "recipient": c.recipient})
+    nodes.sort(key=lambda n: n["time"] or "")
+    return {
+        "company": (company_leads[0]["company"] if company_leads else company).strip(),
+        "leads": [{k: l[k] for k in ("lead_id", "url", "role", "stage", "resume", "applied_resume")}
+                  for l in company_leads],
+        "contacts": [dataclasses.asdict(c) for c in contacts],
+        "timeline": nodes,
+    }

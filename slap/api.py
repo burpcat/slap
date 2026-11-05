@@ -442,6 +442,17 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, ima
             return jsonify({"error": "unknown recipient"}), 404
         return jsonify(data)
 
+    @app.route("/api/companies")
+    def api_companies():
+        return jsonify({"companies": dashboard.companies_index(get_conn())})
+
+    @app.route("/api/companies/<path:company>")
+    def api_company_timeline(company):
+        data = dashboard.company_timeline(get_conn(), company, global_config=global_config)
+        if data is None:
+            return jsonify({"error": "unknown company"}), 404
+        return jsonify(data)
+
     @app.route("/api/logs")
     def api_logs():
         # Mirrors logs_page() exactly -- same LIMIT-not-pagination

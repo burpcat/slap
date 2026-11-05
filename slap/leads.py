@@ -43,7 +43,7 @@ def lead_id_for(url: str) -> str:
     return hashlib.sha256(normalize_url(url).encode()).hexdigest()[:16]
 
 
-def _events(conn, lead_id: str) -> list:
+def lead_events(conn, lead_id: str) -> list:
     rows = conn.execute(
         "SELECT timestamp, meta FROM events WHERE type = 'lead' AND json_extract(meta, '$.lead_id') = ? "
         "ORDER BY id", (lead_id,),
@@ -87,7 +87,7 @@ def _drafted(conn) -> dict:
 
 
 def get(conn, lead_id: str) -> dict | None:
-    events = _events(conn, lead_id)
+    events = lead_events(conn, lead_id)
     return _fold(lead_id, events, _drafted(conn).get(lead_id, [])) if events else None
 
 
@@ -101,7 +101,7 @@ def capture(conn, *, url: str, jd: str, company: str = "", role: str = "") -> tu
     if not (jd or "").strip():
         raise LeadError("jd is empty — nothing to match a résumé against")
     lead_id = lead_id_for(url)
-    if any(e["stage"] == "captured" for e in _events(conn, lead_id)):
+    if any(e["stage"] == "captured" for e in lead_events(conn, lead_id)):
         return lead_id, False
     append_event(conn, type="lead", meta={"lead_id": lead_id, "stage": "captured", "url": normalize_url(url),
                                           "jd": jd.strip(), "company": company.strip(), "role": role.strip()})
@@ -137,7 +137,7 @@ def pending(conn) -> list:
     ids = [r[0] for r in conn.execute(
         "SELECT json_extract(meta, '$.lead_id') FROM events WHERE type = 'lead' "
         "AND json_extract(meta, '$.stage') = 'captured' ORDER BY id")]
-    return [_fold(i, _events(conn, i), []) for i in ids if i not in drafted]
+    return [_fold(i, lead_events(conn, i), []) for i in ids if i not in drafted]
 
 
 def record_questions(conn, *, url: str, questions: list) -> str:
@@ -244,3 +244,9 @@ def add_from_urls(conn, urls: list, *, get=requests.get) -> list:
         except (LeadError, requests.RequestException) as e:
             results.append({"url": url, "error": str(e)})
     return results
+
+
+def all_ids(conn) -> list:
+    """Every lead_id, in first-seen order."""
+    return list(dict.fromkeys(r[0] for r in conn.execute(
+        "SELECT json_extract(meta, '$.lead_id') FROM events WHERE type = 'lead' ORDER BY id")))
