@@ -719,6 +719,10 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, ima
                 return jsonify({"error": str(e)}), 400
         return jsonify(out)
 
+    @app.route("/api/resumes")
+    def api_resumes():
+        return jsonify({"resumes": [{"tag": t, "file": f} for t, f in global_config.send_tags.items()]})
+
     @app.route("/api/resumes/<string:tag>")
     def api_resume_file(tag):
         # The one résumé store (docs_dir + send_tags) — the extension uploads

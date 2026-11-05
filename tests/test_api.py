@@ -699,6 +699,8 @@ def test_api_resume_file_serves_send_tag_and_404s_unknown(tmp_path, monkeypatch)
     assert resp.status_code == 200 and resp.data == b"%PDF-1.4 ai" and resp.mimetype == "application/pdf"
     assert c.get("/api/resumes/nope").status_code == 404
     assert c.get("/api/resumes/gone").status_code == 404  # tag defined, file missing
+    assert c.get("/api/resumes").get_json() == {"resumes": [{"tag": "ai", "file": "ai.pdf"},
+                                                            {"tag": "gone", "file": "gone.pdf"}]}
 
 
 # --- local-only request guard (DNS rebinding + cross-site posts) --------------
