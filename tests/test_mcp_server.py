@@ -10,7 +10,7 @@ import slap_mcp
 from slap import leads, runner, smtp, tracking
 from slap.config import load_global_config
 from slap.latex import recipient_workdir
-from slap.queue import load_manifest
+from slap.queue import held_initials, load_manifest
 
 CONFIG = """
 sender: { from_email: everythingforgenius@gmail.com, from_name: Test Owner }
@@ -215,3 +215,57 @@ def test_hold_needs_lead_and_match_validates(repo):
         slap_mcp.slap_match_lead("nope", "ai", "recruiter")
     with pytest.raises(ToolError, match="not a send_tag"):
         slap_mcp.slap_match_lead("nope", "zzz", "recruiter")
+
+
+def test_two_previews_for_one_address_cannot_both_stage(repo):
+    a = slap_mcp.slap_preview("recruiter", "ai", FIELDS)
+    b = slap_mcp.slap_preview("recruiter", "ai", {**FIELDS, "signal": "revised"})
+    slap_mcp.slap_send(a["preview_id"])
+    with pytest.raises(ToolError, match="dedup state changed"):
+        slap_mcp.slap_send(b["preview_id"], acknowledge_warnings=True)
+    assert len(_queued("jane@acme.com")) == 1
+    with pytest.raises(ToolError, match="unknown preview_id"):  # stale preview is dropped
+        slap_mcp.slap_send(b["preview_id"], acknowledge_warnings=True)
+
+
+def _sha(b):
+    import hashlib
+    return hashlib.sha256(b).hexdigest()
+
+
+def test_held_email_stays_held_if_resume_file_changed_after_applying(repo):
+    conn = tracking.connect()
+    lead_id, _ = leads.capture(conn, url=JOB, jd="JD")
+    slap_mcp.slap_send(slap_mcp.slap_preview("recruiter", "ai", FIELDS, lead_id=lead_id,
+                                             hold_until_applied=True)["preview_id"])
+    leads.mark_applied(conn, url=JOB, resume="ai", resume_sha256=_sha(b"%PDF-1.4 real resume"))
+    (repo / "docs" / "ai.pdf").write_bytes(b"%PDF-1.4 edited after applying")
+    calls = []
+    _drain(calls)
+    assert calls == []
+    assert "changed since you applied" in slap_mcp.slap_leads()["held"][0]["reason"]
+
+
+def test_held_restaged_recipient_gets_no_followup_before_application(repo, monkeypatch):
+    # Already contacted in an earlier sequence (SMTP message_id on record), then
+    # re-staged with a hold: no follow-up may fire into the old thread.
+    from datetime import datetime, timedelta, timezone
+    from slap.tracking import append_event
+    conn = tracking.connect()
+    old = datetime.now(timezone.utc) - timedelta(days=30)
+    append_event(conn, type="queued", recipient="jane@acme.com", campaign="recruiter", stage=0,
+                 meta={"persona": "recruiter", "cadence": [2, 5]}, timestamp=old)
+    append_event(conn, type="sent", recipient="jane@acme.com", campaign="recruiter", stage=0,
+                 message_id="<old@slap>", timestamp=old)
+    lead_id, _ = leads.capture(conn, url=JOB, jd="JD")
+    p = slap_mcp.slap_preview("recruiter", "ai", FIELDS, lead_id=lead_id, hold_until_applied=True)
+    slap_mcp.slap_send(p["preview_id"], acknowledge_warnings=True)
+
+    calls = []
+    def send_message_fn(smtp_config, *, recipient, **kw):
+        calls.append(recipient)
+        return {"message_id": "<x@slap>", "raw": {}}
+    runner.drain(conn, load_global_config(), smtp.SmtpConfig(host="h", port=1, user="u", password="p"),
+                 sleep_fn=lambda s: None, send_message_fn=send_message_fn, log_fn=lambda s: None)
+    assert calls == []
+    assert [h["recipient"] for h in held_initials(conn)] == ["jane@acme.com"]

@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import sys
+import threading
 import uuid
 from dataclasses import asdict
 from pathlib import Path
@@ -45,6 +46,7 @@ server = MCPServer(
 # preview_id -> everything slap_send needs. In-memory on purpose: a restarted
 # server forgets previews, so a send can only ever stage what was just shown.
 _previews: dict = {}
+_send_lock = threading.Lock()
 
 
 def _config():
@@ -111,6 +113,23 @@ def _resume_path(global_config, tag) -> Path:
         raise ToolError(f"résumé '{tag}' is not a send_tag in {global_config.path} "
                         f"(known: {sorted(global_config.send_tags)})")
     return global_config.docs_dir / global_config.send_tags[tag]
+
+
+def _dedup_warnings(global_config, recipient) -> list:
+    try:
+        consumer = domains.load_consumer_domains(Path(global_config.consumer_domains_file))
+    except domains.DomainsError as e:
+        raise ToolError(str(e)) from e
+    dedup = domains.check_recipient(tracking.connect(), recipient, consumer)
+    warnings = []
+    if dedup.hard_warning:
+        w = dedup.hard_warning
+        warnings.append(f"HARD: {recipient} already contacted — campaign={w.campaign} status={w.status} "
+                        f"first_sent={w.first_sent_at} replied={'yes' if w.replied_at else 'no'}")
+    for c in dedup.soft_warning_contacts or []:
+        warnings.append(f"SOFT: same domain {dedup.soft_warning_domain} — {c.recipient} "
+                        f"campaign={c.campaign} status={c.status}")
+    return warnings
 
 
 @server.tool()
@@ -267,19 +286,7 @@ def slap_preview(campaign: str, resume: str, fields: dict[str, str], followups: 
     stage_bodies = [fill_template(s, fill_values, camp.fields) for s in camp.stage_bodies][:n]
     cadence = camp.cadence[:n]
 
-    try:
-        consumer = domains.load_consumer_domains(Path(global_config.consumer_domains_file))
-    except domains.DomainsError as e:
-        raise ToolError(str(e)) from e
-    dedup = domains.check_recipient(tracking.connect(), recipient, consumer)
-    warnings = []
-    if dedup.hard_warning:
-        w = dedup.hard_warning
-        warnings.append(f"HARD: {recipient} already contacted — campaign={w.campaign} status={w.status} "
-                        f"first_sent={w.first_sent_at} replied={'yes' if w.replied_at else 'no'}")
-    for c in dedup.soft_warning_contacts or []:
-        warnings.append(f"SOFT: same domain {dedup.soft_warning_domain} — {c.recipient} "
-                        f"campaign={c.campaign} status={c.status}")
+    warnings = _dedup_warnings(global_config, recipient)
 
     preview_id = uuid.uuid4().hex[:12]
     _previews[preview_id] = {
@@ -301,16 +308,28 @@ def slap_preview(campaign: str, resume: str, fields: dict[str, str], followups: 
 @server.tool()
 def slap_send(preview_id: str, acknowledge_warnings: bool = False, now: bool = False) -> dict:
     """Stage exactly what slap_preview rendered. Refuses while the preview has
-    dedup warnings unless acknowledge_warnings=true (ask the owner first).
-    now=true fires queued initial sends immediately; otherwise the scheduled
-    runner sends at its next window."""
+    dedup warnings unless acknowledge_warnings=true (ask the owner first), and
+    refuses outright if the dedup picture changed since the preview (e.g. this
+    address was staged in the meantime) — re-preview then. now=true fires
+    queued initial sends immediately; otherwise the scheduled runner sends at
+    its next window."""
+    with _send_lock:  # one stage at a time: no two sends race the same preview/recipient
+        return _send(preview_id, acknowledge_warnings, now)
+
+
+def _send(preview_id, acknowledge_warnings, now):
     p = _previews.get(preview_id)
     if p is None:
         raise ToolError(f"unknown preview_id '{preview_id}' — call slap_preview again")
-    if p["warnings"] and not acknowledge_warnings:
-        raise ToolError("preview has dedup warnings — confirm with the owner, then pass "
-                        "acknowledge_warnings=true:\n" + "\n".join(p["warnings"]))
     global_config, camp, values = p["global_config"], p["campaign"], p["values"]
+    current = _dedup_warnings(global_config, p["recipient"])
+    if current != p["warnings"]:
+        _previews.pop(preview_id)
+        raise ToolError("dedup state changed since this preview — call slap_preview again:\n"
+                        + "\n".join(current or ["(no warnings now)"]))
+    if current and not acknowledge_warnings:
+        raise ToolError("preview has dedup warnings — confirm with the owner, then pass "
+                        "acknowledge_warnings=true:\n" + "\n".join(current))
 
     failures = [r for r in doctor.run_global_checks(global_config) + doctor.run_campaign_checks(camp) if not r.ok]
     if failures:
@@ -324,7 +343,7 @@ def slap_send(preview_id: str, acknowledge_warnings: bool = False, now: bool = F
         company=values.get("company", ""), role=values.get("role_catted", ""), req_id=values.get("req_id", ""),
         name=values.get(camp.name_field, "") if camp.name_field else "",
         archive_dir=archive.archive_dir_from_env(), field_values=values,
-        extra_meta={"resume": p["resume"],
+        extra_meta={"resume": p["resume"], "resume_file": str(Path(p["attachment_path"]).resolve()),
                     **({"lead_id": p["lead_id"]} if p["lead_id"] else {}),
                     **({"hold": "applied"} if p["hold"] else {})},
     )
