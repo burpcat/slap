@@ -13,7 +13,6 @@ un-allowlisted in Claude Code so its permission prompt is the human confirm.
 
 Register:  claude mcp add --scope user slap -- <repo>/.venv/bin/python <repo>/slap_mcp.py
 """
-import hashlib
 import json
 import os
 import sys
@@ -22,21 +21,18 @@ import uuid
 from dataclasses import asdict
 from pathlib import Path
 
-import yaml
 from dotenv import load_dotenv
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from pypdf import PdfReader
 
-from slap import archive, doctor, domains, leads, runner, smtp, tracking
+from slap import archive, derived, doctor, domains, leads, runner, smtp, tracking
 from slap.config import ConfigError, discover_campaigns, load_campaign, load_global_config
 from slap.queue import held_initials, stage_recipient
 from slap.templates import fill_template, merge_config_values
 
 REPO_ROOT = Path(__file__).resolve().parent
 STAR_FILE = "star.json"          # inside config.yaml references_dir
-DERIVED_FILE = "derived.yaml"    # inside docs_dir: distilled text + source hash
-CARD_PREFIX = "card:"            # derived entry name for a résumé card: card:<send_tag>
 
 server = MCPServer(
     "slap",
@@ -64,27 +60,11 @@ def _campaign(name, global_config):
         raise ToolError(str(e)) from e
 
 
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _derived_path(global_config) -> Path:
-    return global_config.docs_dir / DERIVED_FILE
-
-
-def _load_derived(global_config) -> dict:
-    path = _derived_path(global_config)
-    if not path.exists():
-        return {}
-    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    if not isinstance(data, dict):
-        raise ToolError(f"{path} must be a mapping of name -> {{source, sha256, text}}")
-    return data
-
-
-def _is_stale(entry: dict) -> bool:
-    source = Path(entry.get("source", ""))
-    return not source.is_file() or _sha256(source) != entry.get("sha256")
+def _derived_or_fail(fn, *args):
+    try:
+        return fn(*args)
+    except derived.DerivedError as e:
+        raise ToolError(str(e)) from e
 
 
 def _load_stars(global_config) -> list:
@@ -153,15 +133,10 @@ def slap_context() -> dict:
             "fields": [{"key": f.key, "optional": f.optional, "hint": f.hint} for f in c.fields],
         })
 
-    derived = _load_derived(global_config)
-    resumes = []
-    for tag, filename in global_config.send_tags.items():
-        entry = derived.get(CARD_PREFIX + tag) or {}
-        pdf = global_config.docs_dir / filename
-        stale = not entry or str(pdf) != entry.get("source") or _is_stale(entry)
-        resumes.append({"tag": tag, "file": filename, "card": entry.get("text"), "stale": stale})
-    references = {name: {"text": e.get("text"), "stale": _is_stale(e)}
-                  for name, e in derived.items() if not name.startswith(CARD_PREFIX)}
+    resumes = _derived_or_fail(derived.resume_cards, global_config)
+    references = {name: {"text": e.get("text"), "stale": derived.is_stale(e)}
+                  for name, e in _derived_or_fail(derived.load_derived, global_config).items()
+                  if not name.startswith(derived.CARD_PREFIX)}
 
     try:
         stars = [{"id": s["id"], "title": s["title"], "tags": s["tags"]} for s in _load_stars(global_config)]
@@ -206,12 +181,7 @@ def slap_save_derived(name: str, source: str, text: str) -> str:
         src = _resume_path(global_config, source.removeprefix("resume:"))
     else:
         src = Path(source).expanduser()
-    if not src.is_file():
-        raise ToolError(f"source {src} not found")
-    derived = _load_derived(global_config)
-    derived[name] = {"source": str(src), "sha256": _sha256(src), "text": text}
-    path = _derived_path(global_config)
-    path.write_text(yaml.safe_dump(derived, sort_keys=True, allow_unicode=True), encoding="utf-8")
+    path = _derived_or_fail(derived.save_derived, global_config, name, src, text)
     return f"saved {name} to {path}"
 
 
