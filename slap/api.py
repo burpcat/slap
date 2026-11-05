@@ -676,6 +676,8 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, ima
         """Campaign / résumé / contact from the panel, with names checked
         against the real campaigns and send_tags (LeadError on a bad one)."""
         details = {k: data[k] for k in leads.DETAIL_KEYS if data.get(k)}
+        if details.get("campaign") and details["campaign"] not in discover_campaigns():
+            raise leads.LeadError(f"unknown campaign {details['campaign']!r}")
         if details.get("campaign"):
             try:
                 camp = load_campaign(details["campaign"], global_config)
@@ -777,7 +779,7 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, ima
     def api_check():
         # One call backs the on-page badge: exact-recipient + same-domain warns
         # (when an email is known), same-company contacts (when only the company
-        # is), and this posting's lead state (matched/applied résumé). Warn-only.
+        # is), and this posting's lead state + its email preview. Warn-only.
         conn = get_conn()
         email, company, url = (request.args.get(k, "").strip() for k in ("email", "company", "url"))
         out = {"recipient": None, "company_contacts": [], "lead": None, "email": None, "email_warnings": []}

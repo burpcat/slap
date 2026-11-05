@@ -72,8 +72,8 @@ def _fold(lead_id: str, events: list, staged_to: list) -> dict:
     for e in events:
         stage = e["stage"]
         lead["last_activity"] = e["timestamp"]
-        if stage in ("captured", "applied"):  # the lifecycle the panel shows
-            lead["stage"] = stage
+        if stage == "applied" or (stage == "captured" and lead["stage"] != "applied"):
+            lead["stage"] = stage  # the lifecycle the panel shows; capturing after applying keeps "applied"
         if stage == "captured":
             lead.update(url=e["url"], jd=e["jd"], company=e.get("company", ""), role=e.get("role", ""),
                         captured_at=e["timestamp"])
@@ -176,6 +176,9 @@ def mark_applied(conn, *, url: str, resume: str, resume_sha256: str = None) -> s
     lead = get(conn, lead_id)
     if lead and lead["applied_resume"] == resume.strip() and lead["applied_sha256"] == resume_sha256:
         return lead_id
+    if lead and lead["staged_to"]:
+        raise LeadError(f"the reach-out is already staged with résumé '{lead['applied_resume']}'; "
+                        f"it can't switch to '{resume.strip()}' now")
     append_event(conn, type="lead", meta={"lead_id": lead_id, "stage": "applied", "url": normalize_url(url),
                                           "resume": resume.strip(), "resume_sha256": resume_sha256})
     return lead_id

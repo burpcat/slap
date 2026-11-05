@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import shutil
 from pathlib import Path
 
 from slap import archive, doctor, domains, leads
 from slap.config import ConfigError, load_campaign
-from slap.latex import WORKDIR_ROOT
-from slap.queue import stage_recipient
+from slap.latex import WORKDIR_ROOT, recipient_workdir
+from slap.queue import due_recipients, stage_recipient
 from slap.templates import fill_template, merge_config_values
 
 LOCK_FILE = ".stage.lock"  # inside WORKDIR_ROOT
@@ -78,7 +79,7 @@ def render(lead, global_config) -> dict:
     if camp.name_field:
         values[camp.name_field] = lead["contact_name"] or values.get(camp.name_field) or "there"
     missing = [] if lead["contact_email"] else ["contact email"]
-    missing += [f.key for f in drop_fields(camp) if not f.optional and not values.get(f.key)]
+    missing += [f.key for f in drop_fields(camp) if not f.optional and not values.get(f.key, "").strip()]
 
     resume = lead["applied_resume"] or lead["resume"] or next(iter(camp.resume_paths), None)
     if resume not in camp.resume_paths:
@@ -105,7 +106,9 @@ def stage(conn, global_config, lead_id: str, *, acknowledge_warnings: bool = Fal
           workdir_root: Path = WORKDIR_ROOT) -> dict:
     """Stage this lead's reach-out if it's ready. Returns {"status": ...}:
     staged | already_staged | not_applied | incomplete (+missing) |
-    needs_confirm (+warnings). Never stages twice."""
+    busy (+reason) | needs_confirm (+warnings). Never stages twice, and
+    snapshots the applied résumé's bytes so a later edit in docs/ can't
+    change what the company receives."""
     workdir_root.mkdir(parents=True, exist_ok=True)
     with open(workdir_root / LOCK_FILE, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)  # dashboard + MCP server are separate processes
@@ -119,6 +122,9 @@ def stage(conn, global_config, lead_id: str, *, acknowledge_warnings: bool = Fal
         r = render(lead, global_config)
         if r["missing"]:
             return {"status": "incomplete", "missing": r["missing"]}
+        if r["to"] in {row["recipient"] for row in due_recipients(conn)}:
+            return {"status": "busy", "reason": f"{r['to']} already has an unsent reach-out queued; "
+                                                f"stage this one after that sends"}
         warnings = dedup_warnings(conn, global_config, r["to"])
         if warnings and not acknowledge_warnings:
             return {"status": "needs_confirm", "warnings": warnings, "email": public(r)}
@@ -128,9 +134,16 @@ def stage(conn, global_config, lead_id: str, *, acknowledge_warnings: bool = Fal
         if failures:
             raise OutreachError("doctor preflight failed: " + "; ".join(f"{c.name}: {c.detail}" for c in failures))
         attachment = camp.resume_paths[r["resume"]]
-        if lead["applied_sha256"] and _sha256(attachment) != lead["applied_sha256"]:
+        if not lead["applied_sha256"]:
+            raise OutreachError("this application has no recorded résumé hash; click Applied again in the panel")
+        if _sha256(attachment) != lead["applied_sha256"]:
             raise OutreachError(f"résumé file {attachment} changed since you applied; the email would attach "
                                 f"a different PDF than the company got")
+        # Snapshot the exact bytes you applied with: the runner reads this copy at
+        # send time, not docs/, which you may re-export before the next drain.
+        snapshot = recipient_workdir(camp.name, r["to"], root=workdir_root) / "applied-resume.pdf"
+        shutil.copyfile(attachment, snapshot)
+        attachment = snapshot
         stage_recipient(
             conn, campaign=camp.name, recipient=r["to"], persona=camp.persona, cadence=camp.cadence,
             subject=r["subject"], body=r["body"], stage_bodies=[f["body"] for f in r["followups"]],

@@ -151,7 +151,7 @@ EVENT_TYPES = {
 RUN_LEVEL_TYPES = {"run_started", "run_completed", "run_failed"}
 # Event types that carry no recipient and never touch the recipients cache.
 # `lead` is a captured job posting (slap.leads) — it exists before any
-# contact address does; meta = {"lead_id", "stage": captured|matched|applied, ...}.
+# contact address does; meta = {"lead_id", "stage": captured|details|drafted|questions|answered|applied, ...}.
 RECIPIENTLESS_TYPES = RUN_LEVEL_TYPES | {"lead"}
 
 # Kept as its own constant (not inlined into _SCHEMA) so

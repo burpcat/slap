@@ -126,6 +126,8 @@ def slap_save_drop(lead_id: str, fields: dict[str, str], acknowledge_warnings: b
     rendered email. If the owner already applied, this also stages the
     reach-out; with dedup warnings it refuses until acknowledge_warnings=true
     (ask the owner first)."""
+    if not lead_id:
+        raise ToolError("lead_id is required; take it from slap_application")
     global_config = _config()
     conn = tracking.connect()
     lead = _lead(conn, lead_id)
@@ -153,6 +155,8 @@ def slap_answer_questions(lead_id: str, answers: dict[str, str]) -> str:
     open_questions. Keep every claim inside star.json. For a select/radio
     question, answer with one of its options verbatim. The extension fills
     them in after the owner reviews."""
+    if not lead_id:
+        raise ToolError("lead_id is required; take it from slap_application")
     try:
         leads.answer_questions(tracking.connect(), lead_id, answers)
     except leads.LeadError as e:

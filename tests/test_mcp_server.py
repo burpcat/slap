@@ -145,6 +145,7 @@ def test_no_contact_waits_and_details_unblock_it(repo):
 def test_already_contacted_needs_confirm(repo):
     conn, lead_id = _capture()
     tracking.append_event(conn, type="queued", recipient=CONTACT, campaign="old", stage=0, meta={"persona": "x"})
+    tracking.append_event(conn, type="sent", recipient=CONTACT, campaign="old", stage=0, message_id="<o@x>")
     slap_mcp.slap_save_drop(lead_id, DROP)
     out = _apply(conn)
     assert out["status"] == "needs_confirm" and out["warnings"][0].startswith("Already contacted")
@@ -174,7 +175,50 @@ def test_applied_resume_is_the_one_attached(repo):
     slap_mcp.slap_save_drop(lead_id, DROP)
     assert _apply(conn, resume="resume-b")["status"] == "staged"
     manifest = load_manifest(recipient_workdir("test-hm", CONTACT))
-    assert manifest["attachment_source"].endswith("docs/b.pdf")
+    snapshot = manifest["attachment_source"]
+    assert snapshot.endswith("applied-resume.pdf")
+    assert open(snapshot, "rb").read() == b"%PDF-1.4 resume b"
+
+
+def test_editing_docs_after_staging_doesnt_change_what_is_sent(repo):
+    conn, lead_id = _capture()
+    slap_mcp.slap_save_drop(lead_id, DROP)
+    _apply(conn)
+    (repo / "docs" / "a.pdf").write_bytes(b"%PDF-1.4 re-exported for another job")
+    attached = []
+
+    def send_message_fn(smtp_config, *, recipient, attachment=None, **kw):
+        attached.append(attachment)
+        return {"message_id": "<1@slap>", "raw": {}}
+
+    runner.drain(conn, load_global_config(), smtp.SmtpConfig(host="h", port=1, user="u", password="p"),
+                 sleep_fn=lambda s: None, send_message_fn=send_message_fn, log_fn=lambda s: None)
+    ((name, data, mime),) = attached
+    assert (name, data) == ("Resume.pdf", b"%PDF-1.4 resume a")  # the applied bytes, not the re-export
+
+
+def test_contact_with_an_unsent_reach_out_is_busy(repo):
+    conn, lead_id = _capture()
+    tracking.append_event(conn, type="queued", recipient=CONTACT, campaign="other", stage=0, meta={"persona": "x"})
+    slap_mcp.slap_save_drop(lead_id, DROP)
+    out = _apply(conn)
+    assert out["status"] == "busy" and "already has an unsent reach-out" in out["reason"]
+
+
+def test_staged_application_cant_switch_resume(repo):
+    conn, lead_id = _capture()
+    slap_mcp.slap_save_drop(lead_id, DROP)
+    _apply(conn)
+    with pytest.raises(leads.LeadError, match="already staged"):
+        leads.mark_applied(conn, url=JOB, resume="resume-b", resume_sha256=outreach._sha256("docs/b.pdf"))
+
+
+def test_empty_lead_id_is_refused_for_writes(repo):
+    _capture()
+    with pytest.raises(ToolError, match="lead_id is required"):
+        slap_mcp.slap_save_drop("", DROP)
+    with pytest.raises(ToolError, match="lead_id is required"):
+        slap_mcp.slap_answer_questions("", {"x": "y"})
 
 
 def test_questions_roundtrip(repo):
