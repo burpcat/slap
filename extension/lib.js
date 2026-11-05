@@ -60,8 +60,9 @@
       const jd = htmlToText(job.description);
       if (!jd) continue;
       return {
-        role: String(job.title || "").trim(),
-        company: String((org && (org.name || (typeof org === "string" ? org : ""))) || "").trim(),
+        // Titles are HTML-escaped too on some sites (Workday: "AI &amp; Agentic").
+        role: htmlToText(job.title).replace(/\n/g, " "),
+        company: htmlToText((org && (org.name || (typeof org === "string" ? org : ""))) || "").replace(/\n/g, " "),
         jd,
       };
     }
@@ -172,7 +173,19 @@
     });
   }
 
-  const api = { canonicalJobUrl, isStepPage, htmlToText, parseJobPosting, isConfirmation, badgeLines,
+  /** Short form of a field label for display. The full text stays the
+   *  question's key (matching, Claude). Drops a trailing required "*", and
+   *  cuts long help-text labels to the first question or sentence. */
+  function displayLabel(text) {
+    const t = String(text || "").replace(/\s*\*\s*$/, "").trim();
+    if (t.length <= 90) return t;
+    const q = t.indexOf("?");
+    if (q > 0 && q < 140) return t.slice(0, q + 1);
+    const dot = t.search(/[.:](\s|$)/);
+    return (dot > 0 && dot < 90 ? t.slice(0, dot + 1) : t.slice(0, 87).trimEnd() + "…");
+  }
+
+  const api = { canonicalJobUrl, displayLabel, isStepPage, htmlToText, parseJobPosting, isConfirmation, badgeLines,
                 matchOption, planFill };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.slapLib = api;

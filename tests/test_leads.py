@@ -97,6 +97,12 @@ LD = ('<html><script type="application/ld+json">{"@graph":[{"@type":"Org"},{"@ty
       '"description":"&lt;p&gt;Build &amp;amp; ship&lt;/p&gt;<ul><li>LLMs</li></ul>"}]}</script></html>')
 
 
+def test_parse_job_posting_decodes_escaped_title():
+    page = ('<script type="application/ld+json">{"@type":"JobPosting","title":"AI &amp; Agentic",'
+            '"hiringOrganization":{"name":"A &amp; B"},"description":"x"}</script>')
+    assert leads.parse_job_posting(page) == {"role": "AI & Agentic", "company": "A & B", "jd": "x"}
+
+
 def test_parse_job_posting_handles_graph_entities_and_junk():
     assert leads.parse_job_posting(LD) == {"role": "ML Engineer", "company": "Acme", "jd": "Build & ship\n- LLMs"}
     assert leads.parse_job_posting("<script type='application/ld+json'>{not json</script>") is None

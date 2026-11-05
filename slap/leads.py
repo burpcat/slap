@@ -231,7 +231,8 @@ def parse_job_posting(page_html: str) -> dict | None:
                     continue
                 org = n.get("hiringOrganization")
                 company = org.get("name", "") if isinstance(org, dict) else (org if isinstance(org, str) else "")
-                return {"role": str(n.get("title", "")).strip(), "company": str(company).strip(), "jd": jd}
+                one_line = lambda v: " ".join(_html_to_text(str(v or "")).split())  # titles are escaped too
+                return {"role": one_line(n.get("title")), "company": one_line(company), "jd": jd}
     return None
 
 

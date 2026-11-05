@@ -19,6 +19,8 @@ const html = `<!doctype html><html><body>
     <label><input type="radio" name="auth" value="y">Yes</label><label><input type="radio" name="auth" value="n">No</label></fieldset>
   <label for="g">Gender</label><select id="g"><option value="">-</option><option value="w">Woman</option></select>
   <label for="exp">Describe a hard bug you fixed</label><textarea id="exp"></textarea>
+  <div class="ashby-application-form-field-entry"><label class="ashby-label">Location</label>
+    <div><input name="loc" placeholder="Start typing..."></div></div>
   <label for="cv">Resume/CV</label><input id="cv" type="file" name="resume">
 </form></body></html>`;
 
@@ -35,7 +37,9 @@ const replies = {
   profile: { ok: true, data: { fields: { first_name: "Ada", email: "ada@x.com", phone: "555", sponsorship: "No", work_authorization: "Yes" }, answers: [] } },
   questions: { ok: true, data: { lead_id: "L" } },
 };
-w.chrome = { runtime: { sendMessage: async (m) => { sent.push(m); return replies[m.type]; } } };
+const listeners = [];
+w.chrome = { runtime: { sendMessage: async (m) => { sent.push(m); return replies[m.type]; },
+                        onMessage: { addListener: (fn) => listeners.push(fn) } } };
 // React-style controlled input tracking: count native-setter writes seen by an 'input' listener.
 let inputEvents = 0;
 w.document.getElementById("fn").addEventListener("input", () => inputEvents++);
@@ -52,6 +56,7 @@ w.eval(fs.readFileSync(EXT + "content.js", "utf8"));
 const tick = () => new Promise((r) => setTimeout(r, 50));
 
 test("panel: extract, badge, prepare, fill, ask Claude, résumé pick persists", async () => {
+  try {
 
   await tick();
   assert.equal(w.document.documentElement.lastElementChild.shadowRoot, null); // closed to the page
@@ -70,17 +75,20 @@ test("panel: extract, badge, prepare, fill, ask Claude, résumé pick persists",
   assert.equal($(".fill").hidden, false);
 
   $(".prep").click(); await tick();
-  const rows = [...root.querySelectorAll(".row")].map((r) => [r.querySelector("b").textContent, r.querySelector(".v").value, r.querySelector(".src").textContent, r.querySelector("input[type=checkbox]").checked]);
+  const rows = [...root.querySelectorAll(".row")].map((r) => [r.querySelector("b").title, r.querySelector(".v").value, r.querySelector(".src").textContent, r.querySelector("input[type=checkbox]").checked]);
   const by = Object.fromEntries(rows.map(([l, v, s, c]) => [l, [v, s, c]]));
   assert.deepEqual(by["First Name*"], ["Ada", "profile", true]);
+  assert.ok([...root.querySelectorAll(".row b")].some((b) => b.textContent === "First Name")); // shown without "*"
   assert.deepEqual(by["Email"], ["ada@x.com", "profile", true]);
   assert.deepEqual(by["Phone"], ["555", "profile", true]);
   assert.deepEqual(by["Why Acme?"], ["Your agent platform.", "Claude", true]);
   assert.deepEqual(by["Will you require visa sponsorship?"], ["No", "profile", true]);
   assert.deepEqual(by["Are you legally authorized to work in the US?"], ["Yes", "profile", true]);
   assert.equal(by["Gender"][1], "self-ID: your call, never auto-filled");
+  assert.ok("Location" in by, "unlinked container label found instead of the placeholder");
+  assert.ok(!("Start typing..." in by));
   assert.deepEqual(by["Describe a hard bug you fixed"], ["", "no answer yet", false]);
-  assert.equal($(".ask").textContent, "Ask Claude (1)");
+  assert.equal($(".ask").textContent, "Ask Claude (2)");
 
   $(".go").click(); await tick();
   const d = w.document;
@@ -95,12 +103,21 @@ test("panel: extract, badge, prepare, fill, ask Claude, résumé pick persists",
 
   $(".ask").click(); await tick();
   const q = sent.find((m) => m.type === "questions");
-  assert.deepEqual(JSON.parse(JSON.stringify(q.questions)), [{ label: "Describe a hard bug you fixed", kind: "textarea", options: [] }]);
+  assert.deepEqual(JSON.parse(JSON.stringify(q.questions)).map((x) => x.label), ["Describe a hard bug you fixed", "Location"]);
   assert.equal(q.url, "https://boards.greenhouse.io/acme/jobs/9");
+
+  // ✕ hides; the toolbar icon's "show" message brings it back
+  const host = w.document.documentElement.lastElementChild;
+  $(".x").click();
+  assert.equal(host.style.display, "none");
+  listeners.forEach((fn) => fn({ type: "show" }));
+  assert.equal(host.style.display, "");
 
   // résumé pick survives a re-render
   const sel = $(".res select"); sel.value = "ds"; sel.dispatchEvent(new w.Event("change"));
   w.document.dispatchEvent(new w.Event("submit")); await new Promise((r) => setTimeout(r, 2200));
   assert.equal($(".res select").value, "ds");
-  for (const id of intervals) w.clearInterval(id);
+  } finally {
+    for (const id of intervals) w.clearInterval(id); // never leave the panel's timers holding node open
+  }
 });

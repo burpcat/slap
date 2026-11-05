@@ -68,7 +68,12 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
   return true; // async reply
 });
 
-// Any other site: click the toolbar icon to open the panel there.
-chrome.action.onClicked.addListener((tab) => {
-  chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["lib.js", "content.js"] });
+// Toolbar icon: re-show the panel if it's on this page (closed or not), or
+// inject it on any other site.
+chrome.action.onClicked.addListener(async (tab) => {
+  try {
+    await chrome.tabs.sendMessage(tab.id, { type: "show" });
+  } catch {
+    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["lib.js", "content.js"] });
+  }
 });

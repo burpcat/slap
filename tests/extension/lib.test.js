@@ -48,6 +48,19 @@ test("parseJobPosting finds JobPosting in arrays and @graph, skips junk", () => 
   assert.equal(L.parseJobPosting([]), null);
 });
 
+test("displayLabel trims required marks and long help text", () => {
+  assert.equal(L.displayLabel("Email*"), "Email");
+  assert.equal(L.displayLabel("Why us? " + "x".repeat(120)), "Why us?");
+  assert.equal(L.displayLabel("Your use of LinkedIn is entirely voluntary. " + "More text ".repeat(20)),
+    "Your use of LinkedIn is entirely voluntary.");
+});
+
+test("parseJobPosting decodes escaped titles", () => {
+  const job = { "@type": "JobPosting", title: "Architect, AI &amp; Agentic", hiringOrganization: { name: "A &amp; B" },
+    description: "<p>x</p>" };
+  assert.deepEqual(L.parseJobPosting([JSON.stringify(job)]), { role: "Architect, AI & Agentic", company: "A & B", jd: "x" });
+});
+
 test("isConfirmation by URL or page text", () => {
   assert.ok(L.isConfirmation("https://boards.greenhouse.io/acme/jobs/9/confirmation", ""));
   assert.ok(L.isConfirmation("https://jobs.lever.co/acme/1/thanks", ""));

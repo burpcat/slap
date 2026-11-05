@@ -29,11 +29,23 @@
 
   // textContent, not innerText: no forced layout, and it reads labels whose
   // text is visually hidden (screen-reader-only spans).
+  // The field's own wrapper on common job sites (Ashby/Greenhouse/Lever class
+  // names, Workday automation ids), where an unlinked <label> usually lives.
+  const FIELD_BOX = '[data-automation-id^="formField"], fieldset, [class*="field" i], [class*="question" i], [class*="form-group" i]';
+
+  function containerLabel(el) {
+    const box = el.parentElement && el.parentElement.closest(FIELD_BOX);
+    if (!box) return "";
+    const head = [...box.querySelectorAll('label, legend, [class*="label" i]')]
+      .find((h) => !h.contains(el) && !h.querySelector("input, select, textarea") && clean(h.textContent));
+    return head ? clean(head.textContent) : "";
+  }
+
   function labelOf(el) {
     const ids = el.getAttribute("aria-labelledby");
     return clean((el.labels && el.labels[0] && el.labels[0].textContent) || el.getAttribute("aria-label")
       || (ids && ids.split(/\s+/).map((id) => (document.getElementById(id) || {}).textContent || "").join(" "))
-      || (el.closest("label") || {}).textContent || el.placeholder || el.name);
+      || (el.closest("label") || {}).textContent || containerLabel(el) || el.placeholder || el.name);
   }
 
   function groupLabel(radio) {
@@ -141,7 +153,11 @@
       Promise.resolve(fn(e)).catch((err) => status(String(err.message || err), true));
     };
   };
-  onClick(".x", () => host.remove());
+  onClick(".x", () => { host.style.display = "none"; });
+  // The toolbar icon brings a closed panel back (background.js sends "show").
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (msg && msg.type === "show") { host.style.display = ""; safeRender(); }
+  });
   document.documentElement.appendChild(host);
 
   const status = (text, isErr) => { $(".status").textContent = text || ""; $(".status").className = isErr ? "status err" : "status"; };
@@ -238,7 +254,7 @@
              ...q.options.map((o) => new Option(o, o, false, o === p.value)))
         : el("input", { className: "v", value: p.value || "", disabled: locked });
       value.oninput = value.onchange = () => { box.checked = Boolean(value.value); };
-      return el("div", { className: "row" }, el("label", {}, box, " ", el("b", { textContent: p.label })),
+      return el("div", { className: "row" }, el("label", {}, box, " ", el("b", { textContent: L.displayLabel(p.label), title: p.label })),
                 value, el("div", { className: "src", textContent: SOURCE_NOTE[p.source] }));
     }));
     const open = plan.filter((p) => p.source === null).length;
