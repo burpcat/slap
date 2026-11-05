@@ -125,6 +125,12 @@ CONTROL_SHEET.md, revisit when steps 6/9/10 wire in real callers):
   Cache-inert (`_apply_event_to_cache` bumps only last_event_at, like `click`)
   — never a status transition, so it needs no changes to any active-only query;
   its current-state is derived live from the log by dashboard read helpers.
+- `lead` (post-MCP: browser-extension job capture, `slap.leads`). One new
+  CHECK literal for the whole lead lifecycle, discriminated by
+  `meta["stage"]` ∈ {captured, matched, applied} and keyed by
+  `meta["lead_id"]` (the `interaction`/`channel` precedent). Recipientless
+  (a lead exists before any contact address does) and cache-inert; current
+  lead state is the latest event per lead_id, derived live by slap.leads.
 """
 from __future__ import annotations
 
@@ -138,11 +144,15 @@ DB_PATH = Path("slap.db")
 EVENT_TYPES = {
     "queued", "draft_created", "sent", "click", "reply", "bounce", "ooo_tagged",
     "requeued", "reply_reviewed", "run_started", "run_completed", "send_failed", "run_failed",
-    "stopped", "interaction", "linkedin_gate",
+    "stopped", "interaction", "linkedin_gate", "lead",
 }
 # Event types describing a runner/drain's own lifecycle, not a specific
 # recipient — appended to the log but never applied to the recipients cache.
 RUN_LEVEL_TYPES = {"run_started", "run_completed", "run_failed"}
+# Event types that carry no recipient and never touch the recipients cache.
+# `lead` is a captured job posting (slap.leads) — it exists before any
+# contact address does; meta = {"lead_id", "stage": captured|matched|applied, ...}.
+RECIPIENTLESS_TYPES = RUN_LEVEL_TYPES | {"lead"}
 
 # Kept as its own constant (not inlined into _SCHEMA) so
 # _migrate_events_check_constraint() can rebuild an old `events` table
@@ -158,7 +168,7 @@ CREATE TABLE IF NOT EXISTS events (
     type TEXT NOT NULL CHECK (type IN (
         'queued','draft_created','sent','click','reply','bounce','ooo_tagged','requeued',
         'reply_reviewed','run_started','run_completed','send_failed','run_failed','stopped',
-        'interaction','linkedin_gate'
+        'interaction','linkedin_gate','lead'
     )),
     stage INTEGER,
     gmass_campaign_id TEXT,
@@ -215,9 +225,9 @@ class TrackingError(Exception):
 def _migrate_events_check_constraint(conn: sqlite3.Connection) -> None:
     """One-time additive migration for the CHECK-constraint literals `events.type`
     accepts. Originally added for the `stopped` event type (Stop outreach); the
-    guard literal is now `'linkedin_gate'` (the newest CHECK value — the LinkedIn
-    reply-gate that halts GMass outreach), so a db still on any older constraint —
-    INCLUDING one already migrated for `stopped` or `interaction` — is rebuilt to
+    guard literal is now `'lead'` (the newest CHECK value — captured job postings,
+    slap.leads), so a db still on any older constraint —
+    INCLUDING one already migrated for `stopped`/`interaction`/`linkedin_gate` — is rebuilt to
     the current shape. The rebuild is generic (every row
     copied verbatim against `_EVENTS_TABLE_SQL`), so bumping the literal is all a
     new additive type needs here. See this module's own docstring for why these
@@ -281,7 +291,7 @@ def _migrate_events_check_constraint(conn: sqlite3.Connection) -> None:
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'"
     ).fetchone()
-    if row is None or row[0] is None or "'linkedin_gate'" in row[0]:
+    if row is None or row[0] is None or "'lead'" in row[0]:
         return  # fresh db (nothing to migrate yet) or already migrated
     conn.execute("BEGIN")
     try:
@@ -289,9 +299,9 @@ def _migrate_events_check_constraint(conn: sqlite3.Connection) -> None:
         conn.execute(_EVENTS_TABLE_SQL)  # a single CREATE TABLE statement — execute(), never executescript()
         conn.execute(
             "INSERT INTO events (id, timestamp, recipient, campaign, type, stage, "
-            "gmass_campaign_id, gmass_draft_id, meta) "
+            "gmass_campaign_id, gmass_draft_id, message_id, meta) "
             "SELECT id, timestamp, recipient, campaign, type, stage, gmass_campaign_id, "
-            "gmass_draft_id, meta FROM events_pre_stopped_migration"
+            "gmass_draft_id, message_id, meta FROM events_pre_stopped_migration"
         )
         conn.execute("DROP TABLE events_pre_stopped_migration")
         conn.commit()
@@ -338,11 +348,8 @@ def _migrate_add_message_id_columns(conn: sqlite3.Connection) -> None:
     creates the tables moments later already including `message_id`. An
     already-existing db missing the column on either table gets it added here.
 
-    Note: `_migrate_events_check_constraint`'s INSERT...SELECT deliberately does
-    NOT copy `message_id` — it only ever runs on dbs predating `linkedin_gate`,
-    which necessarily also predate `message_id`, so there is nothing to copy.
-    When a FUTURE event-type literal bumps that migration's guard, its
-    INSERT...SELECT must be extended to carry `message_id` across."""
+    Runs BEFORE `_migrate_events_check_constraint` (see connect()), so that
+    migration's INSERT...SELECT can always copy `message_id` across."""
     for table in ("events", "recipients"):
         cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
         if not cols or "message_id" in cols:
@@ -355,9 +362,11 @@ def connect(path: Path = DB_PATH) -> sqlite3.Connection:
     """Open (creating if needed) the tracking DB with the schema applied."""
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
+    # message_id first: the check-constraint rebuild copies that column, so it
+    # must already exist on any pre-SMTP db before the rebuild runs.
+    _migrate_add_message_id_columns(conn)
     _migrate_events_check_constraint(conn)
     _migrate_recipients_cadence_column(conn)
-    _migrate_add_message_id_columns(conn)
     conn.executescript(_SCHEMA)
     conn.commit()
     return conn
@@ -378,7 +387,7 @@ def append_event(conn: sqlite3.Connection, *, type: str, recipient: str = None,
     callers; new SMTP sends populate message_id instead."""
     if type not in EVENT_TYPES:
         raise TrackingError(f"unknown event type {type!r} — must be one of {sorted(EVENT_TYPES)}")
-    if type not in RUN_LEVEL_TYPES and not recipient:
+    if type not in RECIPIENTLESS_TYPES and not recipient:
         raise TrackingError(f"event type {type!r} requires a recipient")
     if timestamp is not None and timestamp.tzinfo is None:
         raise TrackingError(
@@ -503,7 +512,7 @@ def _apply_event_to_cache(conn: sqlite3.Connection, event: dict) -> None:
     Called by both append_event (incrementally) and rebuild (by replay) with
     identical logic, so a rebuilt cache is guaranteed to equal the live one.
     """
-    if event["type"] in RUN_LEVEL_TYPES:
+    if event["type"] in RECIPIENTLESS_TYPES:
         return
 
     recipient, campaign, ts = event["recipient"], event["campaign"], event["timestamp"]

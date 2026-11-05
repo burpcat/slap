@@ -904,3 +904,30 @@ def test_message_id_migration_is_idempotent(tmp_path):
 
     connect(path).close()
     connect(path).close()  # second connect on an already-migrated db must not raise
+
+
+# --- 'lead' event type (browser-extension job capture) ------------------------
+
+def test_lead_is_recipientless_and_cache_inert(conn):
+    append_event(conn, type="lead", meta={"lead_id": "L1", "stage": "captured", "url": "https://x/job"})
+    assert all_recipients(conn) == {}
+    rebuild(conn)
+    assert all_recipients(conn) == {}
+
+
+def test_lead_migration_preserves_message_id(tmp_path):
+    # A real post-SMTP slap.db: linkedin_gate constraint + message_id column with data.
+    path = tmp_path / "post_smtp.db"
+    raw = sqlite3.connect(path)
+    raw.executescript(_pre_linkedin_gate_events_table_sql().replace(
+        "'interaction'\n", "'interaction','linkedin_gate'\n").replace(
+        "meta TEXT", "message_id TEXT,\n        meta TEXT"))
+    raw.execute("INSERT INTO events (timestamp, recipient, campaign, type, message_id) VALUES (?,?,?,?,?)",
+                ("2026-01-01T00:00:00+00:00", "a@x.com", "c", "sent", "<m1@slap>"))
+    raw.commit()
+    raw.close()
+
+    migrated = connect(path)
+    assert [r["message_id"] for r in all_events(migrated)] == ["<m1@slap>"]
+    append_event(migrated, type="lead", meta={"lead_id": "L1", "stage": "captured"})
+    connect(path).close()  # idempotent
