@@ -2,6 +2,7 @@
 # (the .example templates ARE committed)
 .env
 config.yaml
+profile.yaml
 
 # personal campaign content (real outreach copy, not source/example data)
 campaigns/

@@ -14,7 +14,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from slap.tracking import append_event
 
-STAGES = ("captured", "matched", "applied")
+STAGES = ("captured", "matched", "applied", "questions", "answered")
 
 
 class LeadError(Exception):
@@ -47,15 +47,22 @@ def _events(conn, lead_id: str) -> list:
 def _fold(lead_id: str, events: list, drafted_recipients: list) -> dict:
     lead = {"lead_id": lead_id, "stage": None, "url": "", "jd": "", "company": "", "role": "",
             "captured_at": None, "resume": None, "campaign": None, "applied_resume": None,
-            "applied_sha256": None, "applied_at": None, "drafted_for": drafted_recipients}
+            "applied_sha256": None, "applied_at": None, "drafted_for": drafted_recipients,
+            "questions": [], "answers": {}}
     for e in events:
         stage = e["stage"]
-        lead["stage"] = stage
+        if stage in ("captured", "matched", "applied"):  # lifecycle; questions/answers don't move it
+            lead["stage"] = stage
         if stage == "captured":
             lead.update(url=e["url"], jd=e["jd"], company=e.get("company", ""), role=e.get("role", ""),
                         captured_at=e["timestamp"])
         elif stage == "matched":
             lead.update(resume=e["resume"], campaign=e["campaign"])
+        elif stage == "questions":  # the latest set the extension couldn't fill
+            lead["questions"] = e["questions"]
+            lead["url"] = lead["url"] or e["url"]
+        elif stage == "answered":
+            lead["answers"].update(e["answers"])
         elif stage == "applied":
             lead.update(applied_resume=e["resume"], applied_sha256=e.get("resume_sha256"),
                         applied_at=e["timestamp"])
@@ -124,3 +131,54 @@ def pending(conn) -> list:
         "SELECT json_extract(meta, '$.lead_id') FROM events WHERE type = 'lead' "
         "AND json_extract(meta, '$.stage') = 'captured' ORDER BY id")]
     return [_fold(i, _events(conn, i), []) for i in ids if i not in drafted]
+
+
+def record_questions(conn, *, url: str, questions: list) -> str:
+    """Form questions the extension couldn't fill from the profile/answer bank,
+    queued for Claude Code (slap_pending_questions). Each: {label, kind, options?}.
+    The latest set replaces earlier ones. Returns the lead_id."""
+    if not isinstance(questions, list) or not questions:
+        raise LeadError("questions must be a non-empty list")
+    clean = []
+    for q in questions:
+        label = (q.get("label") if isinstance(q, dict) else "") or ""
+        if not label.strip():
+            raise LeadError(f"each question needs a label — got {q!r}")
+        options = q.get("options") or []
+        if not isinstance(options, list) or not all(isinstance(o, str) for o in options):
+            raise LeadError(f"question {label!r}: options must be a list of strings")
+        clean.append({"label": label.strip(), "kind": str(q.get("kind") or "text"), "options": options})
+    lead_id = lead_id_for(url)
+    append_event(conn, type="lead", meta={"lead_id": lead_id, "stage": "questions",
+                                          "url": normalize_url(url), "questions": clean})
+    return lead_id
+
+
+def answer_questions(conn, lead_id: str, answers: dict) -> None:
+    """Claude's answers, keyed by question label exactly as queued. Unknown
+    labels are refused so a typo can't silently never fill."""
+    lead = get(conn, lead_id)
+    if lead is None:
+        raise LeadError(f"unknown lead {lead_id!r}")
+    asked = {q["label"] for q in lead["questions"]}
+    unknown = sorted(set(answers) - asked)
+    if unknown:
+        raise LeadError(f"not among this lead's queued questions: {unknown} (asked: {sorted(asked)})")
+    if not all(isinstance(v, str) and v.strip() for v in answers.values()):
+        raise LeadError("every answer must be a non-empty string")
+    append_event(conn, type="lead", meta={"lead_id": lead_id, "stage": "answered", "answers": answers})
+
+
+def pending_questions(conn) -> list:
+    """Leads with queued questions that still lack an answer."""
+    ids = dict.fromkeys(r[0] for r in conn.execute(
+        "SELECT json_extract(meta, '$.lead_id') FROM events WHERE type = 'lead' "
+        "AND json_extract(meta, '$.stage') = 'questions' ORDER BY id"))
+    out = []
+    for i in ids:
+        lead = get(conn, i)
+        open_qs = [q for q in lead["questions"] if q["label"] not in lead["answers"]]
+        if open_qs:
+            out.append({"lead_id": i, "url": lead["url"], "company": lead["company"], "role": lead["role"],
+                        "jd": lead["jd"], "resume": lead["resume"], "questions": open_qs})
+    return out

@@ -269,3 +269,13 @@ def test_held_restaged_recipient_gets_no_followup_before_application(repo, monke
                  sleep_fn=lambda s: None, send_message_fn=send_message_fn, log_fn=lambda s: None)
     assert calls == []
     assert [h["recipient"] for h in held_initials(conn)] == ["jane@acme.com"]
+
+
+def test_pending_questions_roundtrip(repo):
+    conn = tracking.connect()
+    lead_id = leads.record_questions(conn, url=JOB, questions=[{"label": "Why Acme?", "kind": "textarea"}])
+    assert slap_mcp.slap_pending_questions()[0]["questions"][0]["label"] == "Why Acme?"
+    slap_mcp.slap_answer_questions(lead_id, {"Why Acme?": "Agents."})
+    assert slap_mcp.slap_pending_questions() == []
+    with pytest.raises(ToolError, match="not among"):
+        slap_mcp.slap_answer_questions(lead_id, {"Typo?": "x"})

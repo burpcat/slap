@@ -7,7 +7,8 @@ skill), previews, and stages through these tools; the unattended runner
 composition of existing library functions — no new send logic lives here.
 
 Tools: slap_context · slap_stars · slap_resume_text · slap_save_derived ·
-slap_leads · slap_match_lead · slap_preview · slap_send. Only slap_send writes to the queue; leave it
+slap_leads · slap_match_lead · slap_pending_questions · slap_answer_questions ·
+slap_preview · slap_send. Only slap_send writes to the queue; leave it
 un-allowlisted in Claude Code so its permission prompt is the human confirm.
 
 Register:  claude mcp add --scope user slap -- <repo>/.venv/bin/python <repo>/slap_mcp.py
@@ -234,6 +235,26 @@ def slap_match_lead(lead_id: str, resume: str, campaign: str) -> str:
     except leads.LeadError as e:
         raise ToolError(str(e)) from e
     return f"lead {lead_id}: résumé '{resume}', campaign '{campaign}'"
+
+
+@server.tool()
+def slap_pending_questions() -> list:
+    """Application-form questions the browser extension couldn't fill from
+    profile.yaml, per lead (with its JD and matched résumé). Answer each with
+    slap_answer_questions; the extension fills them in after you review."""
+    return leads.pending_questions(tracking.connect())
+
+
+@server.tool()
+def slap_answer_questions(lead_id: str, answers: dict[str, str]) -> str:
+    """Answers keyed by the exact question label from slap_pending_questions.
+    Keep every claim inside star.json. For a select/radio question, answer with
+    one of its options verbatim."""
+    try:
+        leads.answer_questions(tracking.connect(), lead_id, answers)
+    except leads.LeadError as e:
+        raise ToolError(str(e)) from e
+    return f"lead {lead_id}: {len(answers)} answer(s) saved"
 
 
 @server.tool()

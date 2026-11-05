@@ -750,3 +750,14 @@ def test_api_applied_pins_resume_sha(tmp_path, monkeypatch):
     lead = c.get("/api/leads", query_string={"url": url}).get_json()
     assert lead["applied_resume"] == "ai"
     assert lead["applied_sha256"] == hashlib.sha256(b"%PDF-1.4 ai").hexdigest()
+
+
+def test_api_questions_and_profile(app, tmp_path):
+    c = app.test_client()
+    url = "https://jobs.lever.co/acme/q1"
+    assert c.get("/api/profile").status_code == 500  # no profile.yaml yet: fail loud
+    (tmp_path / "profile.yaml").write_text("fields: {first_name: Ada}\n")
+    assert c.get("/api/profile").get_json()["fields"] == {"first_name": "Ada"}
+    assert c.post("/api/leads/questions", json={"url": url, "questions": []}).status_code == 400
+    assert c.post("/api/leads/questions", json={"url": url, "questions": [{"label": "Why us?"}]}).status_code == 200
+    assert c.get("/api/leads", query_string={"url": url}).get_json()["questions"][0]["label"] == "Why us?"

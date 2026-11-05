@@ -61,3 +61,32 @@ def test_contacts_at_company_matches_queued_company_name(conn):
                  meta={"persona": "recruiter", "company": "Acme "})
     assert [c.recipient for c in contacts_at_company(conn, "acme")] == ["jane@acme.com"]
     assert contacts_at_company(conn, "Other") == [] and contacts_at_company(conn, "") == []
+
+
+def test_questions_answers_lifecycle(conn):
+    lead_id, _ = leads.capture(conn, url=URL, jd="JD", company="Acme")
+    leads.mark_applied(conn, url=URL, resume="ai")
+    leads.record_questions(conn, url=URL, questions=[
+        {"label": "Why Acme?", "kind": "textarea"},
+        {"label": "Years with Python?", "kind": "select", "options": ["0-2", "3-5", "6+"]}])
+    (pending,) = leads.pending_questions(conn)
+    assert [q["label"] for q in pending["questions"]] == ["Why Acme?", "Years with Python?"]
+    assert pending["jd"] == "JD"
+
+    leads.answer_questions(conn, lead_id, {"Why Acme?": "Your agent platform."})
+    assert [q["label"] for q in leads.pending_questions(conn)[0]["questions"]] == ["Years with Python?"]
+    leads.answer_questions(conn, lead_id, {"Years with Python?": "3-5"})
+    assert leads.pending_questions(conn) == []
+    lead = leads.get(conn, lead_id)
+    assert lead["stage"] == "applied"  # questions/answers never move the lifecycle stage
+    assert lead["answers"] == {"Why Acme?": "Your agent platform.", "Years with Python?": "3-5"}
+
+
+def test_answer_questions_refuses_unknown_label_and_empty(conn):
+    lead_id = leads.record_questions(conn, url=URL, questions=[{"label": "Why us?"}])
+    with pytest.raises(leads.LeadError, match="not among"):
+        leads.answer_questions(conn, lead_id, {"Why u?": "x"})
+    with pytest.raises(leads.LeadError, match="non-empty"):
+        leads.answer_questions(conn, lead_id, {"Why us?": " "})
+    with pytest.raises(leads.LeadError, match="label"):
+        leads.record_questions(conn, url=URL, questions=[{"kind": "text"}])

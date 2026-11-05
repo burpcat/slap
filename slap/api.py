@@ -57,6 +57,7 @@ from slap.color import campaign_colors
 from slap.config import discover_campaigns
 from slap.domains import check_recipient, contacts_at_company
 from slap.followups import FollowupError, discover_followups, load_followup, save_followup
+from slap.profile import ProfileError, load_profile
 from slap.queue import QueueError, resend_bounced
 
 LOCAL_HOSTNAMES = {"127.0.0.1", "localhost", "::1"}
@@ -696,6 +697,22 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, ima
         except leads.LeadError as e:
             return jsonify({"error": str(e)}), 400
         return jsonify({"lead_id": lead_id})
+
+    @app.route("/api/leads/questions", methods=["POST"])
+    def api_lead_questions():
+        data = request.get_json(silent=True) or {}
+        try:
+            lead_id = leads.record_questions(get_conn(), url=data.get("url", ""), questions=data.get("questions"))
+        except leads.LeadError as e:
+            return jsonify({"error": str(e)}), 400
+        return jsonify({"lead_id": lead_id})
+
+    @app.route("/api/profile")
+    def api_profile():
+        try:
+            return jsonify(load_profile())
+        except ProfileError as e:
+            return jsonify({"error": str(e)}), 500
 
     @app.route("/api/check")
     def api_check():
