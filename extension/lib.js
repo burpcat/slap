@@ -107,6 +107,8 @@
   const PROFILE_RULES = [
     ["sponsorship", /sponsor/i],
     ["work_authorization", /authori[sz]ed to work|legally (eligible|authori[sz]ed|permitted)|work authori[sz]ation|right to work/i],
+    ["current_company", /current (company|employer)|present employer|most recent (company|employer)|^company( name)?\*?$/i],
+    ["current_title", /current (job )?(title|role|position)|^job title\*?$|^title\*?$/i],
     ["linkedin", /linkedin/i],
     ["github", /github/i],
     ["website", /website|portfolio|personal (site|url|page)/i],
@@ -149,7 +151,7 @@
       try {
         return { re: new RegExp(a.match, "i"), answer: a.answer };
       } catch (e) {
-        throw new Error(`profile.yaml answers[${i}].match ${JSON.stringify(a.match)} is not a valid JavaScript regex: ${e.message}`);
+        throw new Error(`config.yaml profile.answers[${i}].match ${JSON.stringify(a.match)} is not a valid JavaScript regex: ${e.message}`);
       }
     });
     return questions.map((q) => {

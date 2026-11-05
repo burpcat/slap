@@ -61,6 +61,37 @@ send_tags:
 # refused; localhost pages, curl and the MCP server are always allowed.
 # extension_id: abcdefghijklmnopabcdefghijklmnop
 
+
+# Optional — application-form profile for the browser extension. It fills
+# standard fields from this, always after you review every value. It never
+# fills passwords, payment or government-ID fields, or EEO self-identification
+# questions; you answer those yourself.
+profile:
+  # Matched to form labels by name (first name, email, current company, ...).
+  fields:
+    first_name: Ada
+    last_name: Lovelace
+    email: ada@example.com
+    phone: "+1 555 0100"
+    linkedin: https://www.linkedin.com/in/example/
+    github: https://github.com/example
+    website: https://example.com
+    location: Boston, MA
+    current_company: Example Corp
+    current_title: Software Engineer
+    work_authorization: "Yes"     # "Are you legally authorized to work in ...?"
+    sponsorship: "No"             # "Will you now or in the future require sponsorship?"
+    resume_filename: Ada_Lovelace_Resume.pdf   # name the uploaded résumé gets (default: <tag>.pdf)
+
+  # Answer bank: `match` is a case-insensitive regex tested against the question's
+  # label. First match wins. Claude Code can generate these from star.json; keep
+  # every claim inside what star.json supports.
+  answers:
+    - match: "notice period|earliest start|when can you start"
+      answer: "Two weeks from offer."
+    - match: "how did you hear"
+      answer: "Company careers page."
+
 # Optional — the command `slap.py send custom` (and `remind --new`) uses to open
 # a scratch file for authoring. Defaults to "code --wait" if omitted. Use a FULL
 # command: GUI editors need a blocking flag (VS Code: `code --wait`, Sublime:

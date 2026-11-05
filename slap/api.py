@@ -57,7 +57,6 @@ from slap.color import campaign_colors
 from slap.config import discover_campaigns
 from slap.domains import check_recipient, contacts_at_company
 from slap.followups import FollowupError, discover_followups, load_followup, save_followup
-from slap.profile import ProfileError, load_profile
 from slap.queue import QueueError, resend_bounced
 
 LOCAL_HOSTNAMES = {"127.0.0.1", "localhost", "::1"}
@@ -720,10 +719,10 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, ima
 
     @app.route("/api/profile")
     def api_profile():
-        try:
-            return jsonify(load_profile())
-        except ProfileError as e:
-            return jsonify({"error": str(e)}), 500
+        if not global_config.profile["fields"]:
+            return jsonify({"error": f"no profile fields — add a `profile:` section to {global_config.path} "
+                                     f"(see config.yaml.example)"}), 500
+        return jsonify(global_config.profile)
 
     @app.route("/api/check")
     def api_check():

@@ -606,3 +606,13 @@ def test_extension_id_optional_and_validated(tmp_path):
     path.write_text(path.read_text().replace("a" * 32, "not-an-id"))
     with pytest.raises(ConfigError, match="extension_id"):
         load_global_config(path)
+
+
+def test_profile_section_parsed_and_validated(tmp_path):
+    path = write_global_config(tmp_path)
+    assert load_global_config(path).profile == {"fields": {}, "answers": []}
+    path.write_text(path.read_text() + "profile:\n  fields: {first_name: Ada}\n")
+    assert load_global_config(path).profile["fields"] == {"first_name": "Ada"}
+    path.write_text(path.read_text() + "  answers: [{match: '(', answer: x}]\n")
+    with pytest.raises(ConfigError, match="profile"):
+        load_global_config(path)

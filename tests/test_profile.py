@@ -1,25 +1,22 @@
 import pytest
 
-from slap.profile import ProfileError, load_profile
+from slap.profile import ProfileError, parse_profile
 
 
-def test_load_profile_valid(tmp_path):
-    p = tmp_path / "profile.yaml"
-    p.write_text("fields: {first_name: Ada, phone: 5550100}\nanswers:\n  - {match: 'notice|start', answer: Two weeks}\n")
-    assert load_profile(p) == {"fields": {"first_name": "Ada", "phone": "5550100"},
-                               "answers": [{"match": "notice|start", "answer": "Two weeks"}]}
+def test_parse_profile_valid_and_absent():
+    assert parse_profile({"fields": {"first_name": "Ada", "phone": 5550100},
+                          "answers": [{"match": "notice|start", "answer": "Two weeks"}]}) == \
+        {"fields": {"first_name": "Ada", "phone": "5550100"},
+         "answers": [{"match": "notice|start", "answer": "Two weeks"}]}
+    assert parse_profile(None) == {"fields": {}, "answers": []}
 
 
-@pytest.mark.parametrize("text,msg", [
-    (None, "not found"),
-    ("- a\n- b\n", "mapping"),
-    ("fields: {a: [1]}\n", "plain values"),
-    ("answers: [{match: x}]\n", r"answers\[0\]"),
-    ("answers: [{match: '(', answer: y}]\n", "valid regex"),
+@pytest.mark.parametrize("raw,msg", [
+    (["a"], "mapping"),
+    ({"fields": {"a": [1]}}, "plain values"),
+    ({"answers": [{"match": "x"}]}, r"answers\[0\]"),
+    ({"answers": [{"match": "(", "answer": "y"}]}, "valid regex"),
 ])
-def test_load_profile_fails_loud(tmp_path, text, msg):
-    p = tmp_path / "profile.yaml"
-    if text is not None:
-        p.write_text(text)
+def test_parse_profile_fails_loud(raw, msg):
     with pytest.raises(ProfileError, match=msg):
-        load_profile(p)
+        parse_profile(raw)

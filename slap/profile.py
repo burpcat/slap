@@ -1,30 +1,26 @@
-"""The owner's application-form profile (profile.yaml, gitignored): standard
-field values plus an answer bank the browser extension fills forms from.
-Read-only here; the owner (or Claude Code) edits the file.
+"""The owner's application-form profile: config.yaml's optional `profile:`
+section, which the browser extension fills forms from (always after review).
 
-    fields:   {first_name: Ada, email: ..., linkedin: ..., work_authorization: ...}
-    answers:  [{match: "notice period|start date", answer: "Two weeks"}, ...]
+    profile:
+      fields:   {first_name: Ada, email: ..., current_company: ..., work_authorization: ...}
+      answers:  [{match: "notice period|start date", answer: "Two weeks"}, ...]
 
-`match` is a case-insensitive regex tested against a form question's label.
+`match` is a case-insensitive regex tested against a form question's label
+(the extension runs it as a JavaScript regex).
 """
 from __future__ import annotations
 
 import re
-from pathlib import Path
-
-import yaml
-
-PROFILE_PATH = Path("profile.yaml")
-
 
 class ProfileError(Exception):
-    """profile.yaml is missing or malformed (fail loud, never fill from a guess)."""
+    """A malformed profile (fail loud, never fill from a guess)."""
 
 
-def load_profile(path: Path = PROFILE_PATH) -> dict:
-    if not path.exists():
-        raise ProfileError(f"{path} not found — copy profile.yaml.example to {path} and fill it in")
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+def parse_profile(raw, path="config.yaml") -> dict:
+    """Validate config.yaml's `profile:` section. Absent -> empty profile."""
+    if raw is None:
+        return {"fields": {}, "answers": []}
+    path = f"{path}: profile"
     if not isinstance(raw, dict):
         raise ProfileError(f"{path} must be a mapping with 'fields' and 'answers'")
     fields = raw.get("fields") or {}

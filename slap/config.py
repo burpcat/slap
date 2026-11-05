@@ -14,6 +14,8 @@ from pathlib import Path
 
 import yaml
 
+from slap.profile import ProfileError, parse_profile
+
 from slap.templates import CONFIG_SOURCED_KEYS, extract_placeholder_keys, find_malformed_placeholders
 
 CONFIG_PATH = Path("config.yaml")
@@ -172,6 +174,8 @@ class GlobalConfig:
     # Chrome extension ID allowed to call the local API (Origin
     # chrome-extension://<id>). None -> no extension origin is accepted.
     extension_id: str | None = None
+    # Form-fill profile for the browser extension (slap.profile.parse_profile).
+    profile: dict = field(default_factory=lambda: {"fields": {}, "answers": []})
 
 
 @dataclass
@@ -343,6 +347,11 @@ def load_global_config(path: Path = CONFIG_PATH) -> GlobalConfig:
         raise ConfigError(f"{path}: 'extension_id' must be a 32-letter Chrome extension ID (a-p) — "
                           f"got {extension_id!r}")
 
+    try:
+        profile = parse_profile(raw.get("profile"), path)
+    except ProfileError as e:
+        raise ConfigError(str(e)) from e
+
     return GlobalConfig(
         from_email=from_email,
         from_name=from_name,
@@ -360,6 +369,7 @@ def load_global_config(path: Path = CONFIG_PATH) -> GlobalConfig:
         send_tags=send_tags,
         references_dir=references_dir,
         extension_id=extension_id,
+        profile=profile,
     )
 
 
