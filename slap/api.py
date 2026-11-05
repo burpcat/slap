@@ -47,13 +47,13 @@ import re
 from datetime import date, datetime
 from pathlib import Path
 
-from flask import jsonify, request
+from flask import jsonify, request, send_file
 from flask.json.provider import DefaultJSONProvider
 
-from slap import archive, gmass_cache, tracking, ui_state
+from slap import archive, gmass_cache, leads, tracking, ui_state
 from slap.color import campaign_colors
 from slap.config import discover_campaigns
-from slap.domains import check_recipient
+from slap.domains import check_recipient, contacts_at_company
 from slap.followups import FollowupError, discover_followups, load_followup, save_followup
 from slap.queue import QueueError, resend_bounced
 
@@ -629,3 +629,68 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, ima
             return jsonify({"ok": False, "reason": "redis_unavailable"})
         dashboard._spawn_background_refresh(db_path, imap_config, consumer_domains, redis_client)
         return jsonify({"ok": True})
+
+    # --- leads: browser extension -> slap (slap.leads) -------------------
+
+    @app.route("/api/leads", methods=["POST"])
+    def api_lead_capture():
+        data = request.get_json(silent=True) or {}
+        try:
+            lead_id, created = leads.capture(get_conn(), url=data.get("url", ""), jd=data.get("jd", ""),
+                                             company=data.get("company", ""), role=data.get("role", ""))
+        except leads.LeadError as e:
+            return jsonify({"error": str(e)}), 400
+        return jsonify({"lead_id": lead_id, "created": created}), 201 if created else 200
+
+    @app.route("/api/leads")
+    def api_lead_by_url():
+        try:
+            lead = leads.by_url(get_conn(), request.args.get("url", ""))
+        except leads.LeadError as e:
+            return jsonify({"error": str(e)}), 400
+        if lead is None:
+            return jsonify({"error": "no lead for this url"}), 404
+        return jsonify(lead)
+
+    @app.route("/api/leads/applied", methods=["POST"])
+    def api_lead_applied():
+        data = request.get_json(silent=True) or {}
+        try:
+            lead_id = leads.mark_applied(get_conn(), url=data.get("url", ""), resume=data.get("resume", ""))
+        except leads.LeadError as e:
+            return jsonify({"error": str(e)}), 400
+        return jsonify({"lead_id": lead_id})
+
+    @app.route("/api/check")
+    def api_check():
+        # One call backs the on-page badge: exact-recipient + same-domain warns
+        # (when an email is known), same-company contacts (when only the company
+        # is), and this posting's lead state (matched/applied résumé). Warn-only.
+        conn = get_conn()
+        email, company, url = (request.args.get(k, "").strip() for k in ("email", "company", "url"))
+        out = {"recipient": None, "company_contacts": [], "lead": None}
+        if email:
+            dedup = check_recipient(conn, email, consumer_domains)
+            out["recipient"] = {"hard": dedup.hard_warning,
+                                "soft_domain": dedup.soft_warning_domain,
+                                "soft": dedup.soft_warning_contacts or []}
+        if company:
+            out["company_contacts"] = contacts_at_company(conn, company)
+        if url:
+            try:
+                out["lead"] = leads.by_url(conn, url)
+            except leads.LeadError as e:
+                return jsonify({"error": str(e)}), 400
+        return jsonify(out)
+
+    @app.route("/api/resumes/<string:tag>")
+    def api_resume_file(tag):
+        # The one résumé store (docs_dir + send_tags) — the extension uploads
+        # exactly the file the email will attach.
+        filename = global_config.send_tags.get(tag)
+        if filename is None:
+            return jsonify({"error": f"unknown résumé tag {tag!r}", "known": sorted(global_config.send_tags)}), 404
+        path = (Path(global_config.docs_dir) / filename).resolve()
+        if not path.is_file():
+            return jsonify({"error": f"{path} not found"}), 404
+        return send_file(path, mimetype="application/pdf", download_name=filename)

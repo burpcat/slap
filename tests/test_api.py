@@ -658,3 +658,45 @@ def test_api_home_companies_include_all_companies_roster(app):
     # shape as top_companies, just not truncated to 5.
     assert "all_companies" in companies
     assert isinstance(companies["all_companies"], list)
+
+
+# --- leads / check / résumé file (browser extension routes) ------------------
+
+def test_api_lead_capture_lookup_and_applied(app):
+    c = app.test_client()
+    url = "https://jobs.lever.co/acme/abc"
+    resp = c.post("/api/leads", json={"url": url, "jd": "Build agents", "company": "Acme", "role": "ml eng"})
+    assert resp.status_code == 201 and resp.get_json()["created"] is True
+    assert c.post("/api/leads", json={"url": url, "jd": "Build agents"}).status_code == 200  # idempotent
+    assert c.get("/api/leads", query_string={"url": url}).get_json()["company"] == "Acme"
+    assert c.get("/api/leads", query_string={"url": "https://jobs.lever.co/other"}).status_code == 404
+    assert c.post("/api/leads/applied", json={"url": url, "resume": "ai-eng"}).status_code == 200
+    assert c.get("/api/leads", query_string={"url": url}).get_json()["applied_resume"] == "ai-eng"
+    assert c.post("/api/leads", json={"url": "ftp://x", "jd": "j"}).status_code == 400
+
+
+def test_api_check_combines_recipient_company_and_lead(app):
+    conn = connect(app.db_path)
+    seed_sent_recipient(conn, recipient="jane@acme.com", company="Acme")
+    c = app.test_client()
+    body = c.get("/api/check", query_string={"email": "jane@acme.com", "company": "acme",
+                                             "url": "https://x.com/jobs/1"}).get_json()
+    assert body["recipient"]["hard"]["recipient"] == "jane@acme.com"
+    assert [x["recipient"] for x in body["company_contacts"]] == ["jane@acme.com"]
+    assert body["lead"] is None
+
+
+def test_api_resume_file_serves_send_tag_and_404s_unknown(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "ai.pdf").write_bytes(b"%PDF-1.4 ai")
+    cfg = make_global_config()
+    cfg.docs_dir, cfg.send_tags = tmp_path / "docs", {"ai": "ai.pdf", "gone": "gone.pdf"}
+    db_path = tmp_path / "test.db"
+    connect(db_path).close()
+    c = create_app(db_path, cfg, consumer_domains=set(), imap_config="fake-imap",
+                   redis_client=FakeRedis()).test_client()
+    resp = c.get("/api/resumes/ai")
+    assert resp.status_code == 200 and resp.data == b"%PDF-1.4 ai" and resp.mimetype == "application/pdf"
+    assert c.get("/api/resumes/nope").status_code == 404
+    assert c.get("/api/resumes/gone").status_code == 404  # tag defined, file missing

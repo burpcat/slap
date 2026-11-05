@@ -86,6 +86,21 @@ def check_recipient(conn, recipient: str, consumer_domains: set) -> DedupResult:
     )
 
 
+def contacts_at_company(conn, company: str) -> list:
+    """Recipients staged under this company name (a `queued` event's
+    meta.company, case-insensitive). The dedup signal when only the company is
+    known — a job page on a hosted ATS domain, not the company's email domain.
+    Warn-only, like check_recipient."""
+    name = (company or "").strip().lower()
+    if not name:
+        return []
+    staged = {r[0] for r in conn.execute(
+        "SELECT DISTINCT recipient FROM events WHERE type = 'queued' "
+        "AND lower(trim(json_extract(meta, '$.company'))) = ?", (name,))}
+    rows = conn.execute("SELECT * FROM recipients ORDER BY recipient")
+    return [_to_context(dict(r)) for r in rows if r["recipient"] in staged]
+
+
 def domain_index(conn) -> dict:
     """Group all known recipients by domain — the read-only report backing
     the `domains` command. Regenerated from `recipients` every time; never
