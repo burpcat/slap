@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased — Claude Code (MCP) + browser extension
+
+Prep moves from pasting drops into `slap.py send` to Claude Code (via MCP) plus
+a Chrome extension. The send engine (queue, runner, SMTP/IMAP, follow-ups,
+stop-on-reply) is unchanged except for the hold described below.
+
+### Added
+
+- **`slap_mcp.py` — MCP server for Claude Code** (stdio, `mcp` SDK 2.x). Tools:
+  `slap_context`, `slap_stars`, `slap_resume_text`, `slap_save_derived`,
+  `slap_leads`, `slap_add_leads`, `slap_match_lead`, `slap_pending_questions`,
+  `slap_answer_questions`, `slap_preview`, `slap_send`. `slap_send` stages only an
+  exact previewed payload, once, re-checking dedup at send time. Register with
+  `claude mcp add --scope user slap -- <repo>/.venv/bin/python <repo>/slap_mcp.py`.
+- **Leads** (`slap/leads.py`): one new recipientless `lead` event type, with
+  `meta.stage` ∈ captured / matched / applied / questions / answered, keyed by a
+  URL-derived `lead_id`. The migration copies `message_id` across.
+- **Hold until applied**: a send staged with `hold_until_applied` waits until the
+  lead's `applied` event exists, recorded with the same résumé tag and the same PDF
+  bytes. Held recipients get no follow-up, OOO or remind sends either.
+- **Local API routes**: `POST/GET /api/leads`, `POST /api/leads/applied`,
+  `POST /api/leads/questions`, `GET /api/check`, `GET /api/resumes`,
+  `GET /api/resumes/<tag>`, `GET /api/profile`, `GET /api/companies`,
+  `GET /api/companies/<name>`.
+- **Local-only guard** on every dashboard route: a non-localhost `Host` (DNS
+  rebinding) or a foreign `Origin` (cross-site posts from any open tab) gets 403.
+  The extension is allowed through `extension_id` in config.yaml.
+- **Chrome extension** (`extension/`): capture postings, an on-page "already
+  contacted" badge, a local résumé suggestion, attaching the matched résumé,
+  review-first form filling from `profile.yaml`, "Ask Claude" for unanswered
+  questions, and Mark applied. It never submits a form and never fills
+  sensitive or EEO fields.
+- **Companies dashboard page**: one timeline per company, merging leads and
+  reach-outs.
+- **Config**: campaign field `hint:`; `resumes:` may be omitted (= all
+  `send_tags`); `references_dir`; `extension_id`. New gitignored `profile.yaml`.
+- **`slap.py plist --job dashboard`** keeps the API always on (see LAUNCHD.md).
+
 ## Unreleased — Transport migration: GMass API → local Gmail SMTP + IMAP
 
 `slap` no longer depends on the GMass API. It sends directly through the owner's
