@@ -163,6 +163,10 @@ class GlobalConfig:
     # reason above; a campaign that references a tag not defined here fails loud
     # in load_campaign (the persona cross-ref pattern).
     send_tags: dict = field(default_factory=dict)
+    # Folder holding the generation reference files (star.json etc.) the MCP
+    # server serves to Claude. Optional: None -> slap_mcp's reference tools
+    # fail loud when called; nothing else reads it.
+    references_dir: Path | None = None
 
 
 @dataclass
@@ -170,6 +174,7 @@ class CampaignField:
     key: str
     label: str
     optional: bool = False
+    hint: str = ""  # per-field generation rule for the MCP/skill; never rendered
 
 
 @dataclass
@@ -323,6 +328,11 @@ def load_global_config(path: Path = CONFIG_PATH) -> GlobalConfig:
             raise ConfigError(f"{path}: send_tags.{tag} must be a non-empty filename string — got {filename!r}")
         send_tags[tag] = filename
 
+    references_dir_raw = raw.get("references_dir")
+    if references_dir_raw is not None and (not isinstance(references_dir_raw, str) or not references_dir_raw.strip()):
+        raise ConfigError(f"{path}: 'references_dir' must be a non-empty string — got {references_dir_raw!r}")
+    references_dir = Path(references_dir_raw).expanduser() if references_dir_raw else None
+
     return GlobalConfig(
         from_email=from_email,
         from_name=from_name,
@@ -338,6 +348,7 @@ def load_global_config(path: Path = CONFIG_PATH) -> GlobalConfig:
         editor=editor,
         docs_dir=docs_dir,
         send_tags=send_tags,
+        references_dir=references_dir,
     )
 
 
@@ -396,11 +407,14 @@ def load_campaign(name: str, global_config: GlobalConfig, campaigns_dir: Path = 
         )
     resume_paths = {}
     if not latex_enabled:
-        resumes_raw = raw.get("resumes")
+        # Omitted `resumes:` = the whole send_tags pool (the MCP flow picks per
+        # recipient). Present must still be a non-empty list.
+        resumes_raw = raw.get("resumes", list(global_config.send_tags))
         if not isinstance(resumes_raw, list) or not resumes_raw:
             raise ConfigError(
-                f"{yaml_path}: latex.enabled is false, so 'resumes' is required — a non-empty list "
-                f"of send_tags from config.yaml (first is the default), e.g. [default]"
+                f"{yaml_path}: latex.enabled is false, so it needs résumés — list send_tags under "
+                f"'resumes:' (first is the default), or omit it to offer every send_tag in "
+                f"{global_config.path} (currently none defined)"
             )
         for tag in resumes_raw:
             if not isinstance(tag, str):
@@ -419,7 +433,11 @@ def load_campaign(name: str, global_config: GlobalConfig, campaigns_dir: Path = 
     for f in fields_raw:
         if not isinstance(f, dict) or "key" not in f or "label" not in f:
             raise ConfigError(f"{yaml_path}: each field needs 'key' and 'label' — got {f!r}")
-        fields.append(CampaignField(key=f["key"], label=f["label"], optional=bool(f.get("optional", False))))
+        hint = f.get("hint", "")
+        if not isinstance(hint, str):
+            raise ConfigError(f"{yaml_path}: field '{f['key']}' hint must be a string — got {hint!r}")
+        fields.append(CampaignField(key=f["key"], label=f["label"], optional=bool(f.get("optional", False)),
+                                    hint=hint))
     if not any(f.key == "email" for f in fields):
         raise ConfigError(f"{yaml_path}: 'fields' must include a field with key 'email' — send needs it")
     # 'campaign' is reserved as the unified-mode selector — reject it as BOTH a

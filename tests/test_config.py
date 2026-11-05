@@ -2,6 +2,8 @@
 valid load; missing stage file for a defined cadence fails loud; initial.txt
 without Subject/blank-line fails loud; auto-discovery finds folders.
 """
+from pathlib import Path
+
 import pytest
 
 from slap.config import ConfigError, discover_campaigns, load_campaign, load_global_config
@@ -473,13 +475,37 @@ STATIC_CAMPAIGN_YAML = VALID_CAMPAIGN_YAML.replace(
 )
 
 
-def test_load_campaign_latex_disabled_requires_resumes(tmp_path):
-    # latex.enabled: false with no `resumes:` list → fail loud (the résumé must
-    # come from somewhere; it's now a docs/ send_tag, not a per-campaign file).
+def test_load_campaign_omitted_resumes_offers_every_send_tag(tmp_path):
     global_config = load_global_config(write_global_config(tmp_path))
+    campaigns_dir, _ = write_campaign(tmp_path, campaign_yaml=STATIC_CAMPAIGN_YAML)
+    campaign = load_campaign("coldpost", global_config, campaigns_dir)
+    assert list(campaign.resume_paths) == list(global_config.send_tags)
+
+
+def test_load_campaign_omitted_resumes_with_no_send_tags_fails_loud(tmp_path):
+    global_config = load_global_config(write_global_config(tmp_path))
+    global_config.send_tags = {}
     campaigns_dir, _ = write_campaign(tmp_path, campaign_yaml=STATIC_CAMPAIGN_YAML)
     with pytest.raises(ConfigError, match="resumes"):
         load_campaign("coldpost", global_config, campaigns_dir)
+
+
+def test_load_campaign_reads_field_hint(tmp_path):
+    global_config = load_global_config(write_global_config(tmp_path))
+    hinted = STATIC_CAMPAIGN_YAML.replace(
+        "  - { key: email,        label: Email }\n",
+        "  - { key: email,        label: Email, hint: exactly as pasted }\n",
+    )
+    campaigns_dir, _ = write_campaign(tmp_path, campaign_yaml=hinted)
+    campaign = load_campaign("coldpost", global_config, campaigns_dir)
+    assert next(f for f in campaign.fields if f.key == "email").hint == "exactly as pasted"
+
+
+def test_references_dir_optional_and_expanded(tmp_path):
+    path = write_global_config(tmp_path)
+    assert load_global_config(path).references_dir is None
+    path.write_text(path.read_text() + "references_dir: ~/refs\n")
+    assert load_global_config(path).references_dir == Path("~/refs").expanduser()
 
 
 def test_load_campaign_static_resolves_resume_tag_to_docs_path(tmp_path):
