@@ -9,10 +9,17 @@ event carries its lead_id in meta (slap_mcp stages it that way).
 from __future__ import annotations
 
 import hashlib
+import html
 import json
+import re
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+import requests
+
 from slap.tracking import append_event
+
+BATCH_MAX = 25  # ponytail: per-call cap on fetched postings; batch again for more
+_LD_SCRIPT = re.compile(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', re.S | re.I)
 
 STAGES = ("captured", "matched", "applied", "questions", "answered")
 
@@ -182,3 +189,58 @@ def pending_questions(conn) -> list:
             out.append({"lead_id": i, "url": lead["url"], "company": lead["company"], "role": lead["role"],
                         "jd": lead["jd"], "resume": lead["resume"], "questions": open_qs})
     return out
+
+
+def _html_to_text(markup: str) -> str:
+    # Decode first: many job sites HTML-escape the description inside JSON-LD (&lt;p&gt;).
+    text = re.sub(r"<(br|/p|/li|/div|/h[1-6]|/tr)\b[^>]*>", "\n", html.unescape(markup or ""), flags=re.I)
+    text = re.sub(r"<li\b[^>]*>", "\n- ", text, flags=re.I)
+    text = html.unescape(re.sub(r"<[^>]+>", "", text))
+    return "\n".join(line for line in (" ".join(l.split()) for l in text.split("\n")) if line)
+
+
+def parse_job_posting(page_html: str) -> dict | None:
+    """{role, company, jd} from a page's schema.org JobPosting JSON-LD, or None.
+    Mirrors extension/lib.js parseJobPosting for server-side batch import."""
+    for raw in _LD_SCRIPT.findall(page_html or ""):
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        nodes = []
+        for n in data if isinstance(data, list) else [data]:
+            nodes.extend(n.get("@graph", [n]) if isinstance(n, dict) else [])
+        for n in nodes:
+            kind = n.get("@type") if isinstance(n, dict) else None
+            if kind == "JobPosting" or (isinstance(kind, list) and "JobPosting" in kind):
+                jd = _html_to_text(n.get("description", ""))
+                if not jd:
+                    continue
+                org = n.get("hiringOrganization")
+                company = org.get("name", "") if isinstance(org, dict) else (org if isinstance(org, str) else "")
+                return {"role": str(n.get("title", "")).strip(), "company": str(company).strip(), "jd": jd}
+    return None
+
+
+def add_from_urls(conn, urls: list, *, get=requests.get) -> list:
+    """Fetch each posting and capture it as a lead. One result per URL —
+    {url, lead_id, created, company, role} or {url, error}; one bad link
+    never stops the rest."""
+    if len(urls) > BATCH_MAX:
+        raise LeadError(f"at most {BATCH_MAX} links per batch — got {len(urls)}")
+    results = []
+    for url in urls:
+        try:
+            normalize_url(url)
+            resp = get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0 (compatible; slap)"})
+            resp.raise_for_status()
+            job = parse_job_posting(resp.text)
+            if job is None:
+                raise LeadError("no JobPosting data in the page (it may render in the browser only) — "
+                                "open it and use the extension's Send to slap")
+            lead_id, created = capture(conn, url=url, **job)
+            results.append({"url": url, "lead_id": lead_id, "created": created,
+                            "company": job["company"], "role": job["role"]})
+        except (LeadError, requests.RequestException) as e:
+            results.append({"url": url, "error": str(e)})
+    return results

@@ -90,3 +90,38 @@ def test_answer_questions_refuses_unknown_label_and_empty(conn):
         leads.answer_questions(conn, lead_id, {"Why us?": " "})
     with pytest.raises(leads.LeadError, match="label"):
         leads.record_questions(conn, url=URL, questions=[{"kind": "text"}])
+
+
+LD = ('<html><script type="application/ld+json">{"@graph":[{"@type":"Org"},{"@type":"JobPosting",'
+      '"title":" ML Engineer ","hiringOrganization":{"name":"Acme"},'
+      '"description":"&lt;p&gt;Build &amp;amp; ship&lt;/p&gt;<ul><li>LLMs</li></ul>"}]}</script></html>')
+
+
+def test_parse_job_posting_handles_graph_entities_and_junk():
+    assert leads.parse_job_posting(LD) == {"role": "ML Engineer", "company": "Acme", "jd": "Build & ship\n- LLMs"}
+    assert leads.parse_job_posting("<script type='application/ld+json'>{not json</script>") is None
+    assert leads.parse_job_posting("<html>no data</html>") is None
+
+
+class _Resp:
+    def __init__(self, text, status=200):
+        self.text, self.status = text, status
+
+    def raise_for_status(self):
+        if self.status >= 400:
+            import requests
+            raise requests.HTTPError(f"{self.status} error")
+
+
+def test_add_from_urls_per_link_results(conn):
+    pages = {"https://jobs.lever.co/acme/1": _Resp(LD), "https://jobs.lever.co/acme/2": _Resp("", 404),
+             "https://acme.wd1.myworkdayjobs.com/x": _Resp("<html>spa</html>")}
+    out = leads.add_from_urls(conn, list(pages) + ["not a url"], get=lambda u, **kw: pages[u])
+    assert out[0]["company"] == "Acme" and out[0]["created"] is True
+    assert "404" in out[1]["error"]
+    assert "Send to slap" in out[2]["error"]
+    assert "http(s)" in out[3]["error"]
+    assert [l["url"] for l in leads.pending(conn)] == ["https://jobs.lever.co/acme/1"]
+    assert leads.add_from_urls(conn, ["https://jobs.lever.co/acme/1"], get=lambda u, **kw: pages[u])[0]["created"] is False
+    with pytest.raises(leads.LeadError, match="at most"):
+        leads.add_from_urls(conn, ["https://x.com/j"] * (leads.BATCH_MAX + 1))

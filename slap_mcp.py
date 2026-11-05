@@ -7,7 +7,7 @@ skill), previews, and stages through these tools; the unattended runner
 composition of existing library functions — no new send logic lives here.
 
 Tools: slap_context · slap_stars · slap_resume_text · slap_save_derived ·
-slap_leads · slap_match_lead · slap_pending_questions · slap_answer_questions ·
+slap_leads · slap_add_leads · slap_match_lead · slap_pending_questions · slap_answer_questions ·
 slap_preview · slap_send. Only slap_send writes to the queue; leave it
 un-allowlisted in Claude Code so its permission prompt is the human confirm.
 
@@ -191,6 +191,16 @@ def slap_leads() -> dict:
     (each with its JD), plus staged emails still held for an application."""
     conn = tracking.connect()
     return {"pending": leads.pending(conn), "held": held_initials(conn)}
+
+
+@server.tool()
+def slap_add_leads(urls: list[str]) -> list[dict]:
+    """Capture job postings from links in one go (fetched by slap, so the JDs
+    never pass through you). Per-link result or error; follow with slap_leads."""
+    try:
+        return leads.add_from_urls(tracking.connect(), urls)
+    except leads.LeadError as e:
+        raise ToolError(str(e)) from e
 
 
 @server.tool()
