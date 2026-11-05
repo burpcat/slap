@@ -52,7 +52,7 @@ from urllib.parse import urlsplit
 from flask import jsonify, request, send_file
 from flask.json.provider import DefaultJSONProvider
 
-from slap import archive, gmass_cache, leads, tracking, ui_state
+from slap import archive, derived, gmass_cache, leads, tracking, ui_state
 from slap.color import campaign_colors
 from slap.config import discover_campaigns
 from slap.domains import check_recipient, contacts_at_company
@@ -721,7 +721,7 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, ima
         # is), and this posting's lead state (matched/applied résumé). Warn-only.
         conn = get_conn()
         email, company, url = (request.args.get(k, "").strip() for k in ("email", "company", "url"))
-        out = {"recipient": None, "company_contacts": [], "lead": None}
+        out = {"recipient": None, "company_contacts": [], "lead": None, "suggested_resume": None}
         if email:
             dedup = check_recipient(conn, email, consumer_domains)
             out["recipient"] = {"hard": dedup.hard_warning,
@@ -734,6 +734,13 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, ima
                 out["lead"] = leads.by_url(conn, url)
             except leads.LeadError as e:
                 return jsonify({"error": str(e)}), 400
+            lead = out["lead"]
+            if lead and lead["jd"] and not lead["resume"]:
+                try:  # zero-token hint from up-to-date cards; Claude still decides
+                    cards = {c["tag"]: c["card"] for c in derived.resume_cards(global_config) if not c["stale"]}
+                except derived.DerivedError as e:
+                    return jsonify({"error": str(e)}), 500
+                out["suggested_resume"] = derived.suggest_resume(lead["jd"], cards)
         return jsonify(out)
 
     @app.route("/api/resumes")

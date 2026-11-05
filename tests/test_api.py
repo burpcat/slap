@@ -761,3 +761,22 @@ def test_api_questions_and_profile(app, tmp_path):
     assert c.post("/api/leads/questions", json={"url": url, "questions": []}).status_code == 400
     assert c.post("/api/leads/questions", json={"url": url, "questions": [{"label": "Why us?"}]}).status_code == 200
     assert c.get("/api/leads", query_string={"url": url}).get_json()["questions"][0]["label"] == "Why us?"
+
+
+def test_api_check_suggests_resume_for_unmatched_lead(tmp_path, monkeypatch):
+    from slap import derived
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "ai.pdf").write_bytes(b"%PDF ai")
+    (tmp_path / "docs" / "ds.pdf").write_bytes(b"%PDF ds")
+    cfg = make_global_config()
+    cfg.docs_dir, cfg.send_tags = tmp_path / "docs", {"ai": "ai.pdf", "ds": "ds.pdf"}
+    derived.save_derived(cfg, "card:ai", cfg.docs_dir / "ai.pdf", "LLM agents RAG evals")
+    derived.save_derived(cfg, "card:ds", cfg.docs_dir / "ds.pdf", "causal inference SQL dashboards")
+    db_path = tmp_path / "test.db"
+    connect(db_path).close()
+    c = create_app(db_path, cfg, consumer_domains=set(), imap_config="fake-imap",
+                   redis_client=FakeRedis()).test_client()
+    url = "https://jobs.lever.co/acme/s1"
+    c.post("/api/leads", json={"url": url, "jd": "Ship LLM agents with RAG and evals"})
+    assert c.get("/api/check", query_string={"url": url}).get_json()["suggested_resume"]["tag"] == "ai"

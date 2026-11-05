@@ -48,6 +48,8 @@ test("badgeLines summarizes lead state and prior contacts", () => {
     ['Matched résumé: "ai" (hiring-manager)', "Already contacted jane@acme.com (active, replied)"]);
   assert.deepEqual(L.badgeLines({ lead: { resume: "ai", applied_resume: "ds" }, company_contacts: [] }),
     ['Applied with "ds"']);
+  assert.deepEqual(L.badgeLines({ lead: { jd: "x" }, company_contacts: [], suggested_resume: { tag: "ai" } }),
+    ["Captured, not matched yet: run slap_leads in Claude Code", 'Likely résumé: "ai" (local guess)']);
 });
 
 const PROFILE = {

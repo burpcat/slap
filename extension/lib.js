@@ -71,7 +71,10 @@
     const lead = check.lead;
     if (lead && lead.applied_resume) lines.push(`Applied with "${lead.applied_resume}"`);
     else if (lead && lead.resume) lines.push(`Matched résumé: "${lead.resume}" (${lead.campaign})`);
-    else if (lead) lines.push("Captured, not matched yet: run slap_leads in Claude Code");
+    else if (lead) {
+      lines.push("Captured, not matched yet: run slap_leads in Claude Code");
+      if (check.suggested_resume) lines.push(`Likely résumé: "${check.suggested_resume.tag}" (local guess)`);
+    }
     for (const c of check.company_contacts || []) {
       lines.push(`Already contacted ${c.recipient} (${c.status}${c.replied_at ? ", replied" : ""})`);
     }
