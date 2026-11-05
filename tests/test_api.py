@@ -670,8 +670,7 @@ def test_api_lead_capture_lookup_and_applied(app):
     assert c.post("/api/leads", json={"url": url, "jd": "Build agents"}).status_code == 200  # idempotent
     assert c.get("/api/leads", query_string={"url": url}).get_json()["company"] == "Acme"
     assert c.get("/api/leads", query_string={"url": "https://jobs.lever.co/other"}).status_code == 404
-    assert c.post("/api/leads/applied", json={"url": url, "resume": "ai-eng"}).status_code == 200
-    assert c.get("/api/leads", query_string={"url": url}).get_json()["applied_resume"] == "ai-eng"
+    assert c.post("/api/leads/applied", json={"url": url, "resume": "ai-eng"}).status_code == 400  # not a send_tag
     assert c.post("/api/leads", json={"url": "ftp://x", "jd": "j"}).status_code == 400
 
 
@@ -731,3 +730,21 @@ def test_guard_refuses_cross_site_write_before_it_runs(app):
     assert connect(app.db_path).execute("SELECT COUNT(*) FROM events WHERE type='lead'").fetchone()[0] == 0
     assert c.get("/api/check", headers={"Host": "evil.example"}).status_code == 403
     assert c.get("/api/check").status_code == 200
+
+
+def test_api_applied_pins_resume_sha(tmp_path, monkeypatch):
+    import hashlib
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "ai.pdf").write_bytes(b"%PDF-1.4 ai")
+    cfg = make_global_config()
+    cfg.docs_dir, cfg.send_tags = tmp_path / "docs", {"ai": "ai.pdf"}
+    db_path = tmp_path / "test.db"
+    connect(db_path).close()
+    c = create_app(db_path, cfg, consumer_domains=set(), imap_config="fake-imap",
+                   redis_client=FakeRedis()).test_client()
+    url = "https://jobs.lever.co/acme/abc"
+    assert c.post("/api/leads/applied", json={"url": url, "resume": "ai"}).status_code == 200
+    lead = c.get("/api/leads", query_string={"url": url}).get_json()
+    assert lead["applied_resume"] == "ai"
+    assert lead["applied_sha256"] == hashlib.sha256(b"%PDF-1.4 ai").hexdigest()

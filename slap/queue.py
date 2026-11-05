@@ -42,6 +42,7 @@ whole feature that isn't fully proven.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 from datetime import date, datetime
@@ -386,16 +387,22 @@ def held_initials(conn) -> list:
         meta = json.loads(ev["meta"] or "{}")
         if meta.get("hold") != "applied":
             continue
-        lead = leads.get(conn, meta["lead_id"])
+        lead = leads.get(conn, meta["lead_id"]) if meta.get("lead_id") else None
         applied = lead and lead["applied_resume"]
-        if not applied:
+        file = Path(meta.get("resume_file") or "")
+        if not meta.get("lead_id"):
+            reason = "held, but the queued event has no lead_id — re-stage this email"
+        elif not applied:
             reason = "waiting for application"
         elif applied != meta.get("resume"):
             reason = (f"applied with résumé '{applied}' but this email attaches '{meta.get('resume')}' "
                       f"— re-preview with '{applied}'")
+        elif lead["applied_sha256"] and (not file.is_file()
+                                         or hashlib.sha256(file.read_bytes()).hexdigest() != lead["applied_sha256"]):
+            reason = f"résumé file {file} changed since you applied — re-preview so the email matches"
         else:
             continue
-        held.append({"recipient": row["recipient"], "lead_id": meta["lead_id"], "reason": reason,
+        held.append({"recipient": row["recipient"], "lead_id": meta.get("lead_id"), "reason": reason,
                      "queued_at": ev["timestamp"]})
     return held
 

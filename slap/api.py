@@ -42,6 +42,7 @@ changes zero existing template output.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import re
 from datetime import date, datetime
@@ -683,8 +684,15 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, ima
     @app.route("/api/leads/applied", methods=["POST"])
     def api_lead_applied():
         data = request.get_json(silent=True) or {}
+        tag = data.get("resume", "")
+        if tag not in global_config.send_tags:
+            return jsonify({"error": f"unknown résumé tag {tag!r}", "known": sorted(global_config.send_tags)}), 400
+        path = Path(global_config.docs_dir) / global_config.send_tags[tag]
+        if not path.is_file():
+            return jsonify({"error": f"{path} not found"}), 400
         try:
-            lead_id = leads.mark_applied(get_conn(), url=data.get("url", ""), resume=data.get("resume", ""))
+            lead_id = leads.mark_applied(get_conn(), url=data.get("url", ""), resume=tag,
+                                         resume_sha256=hashlib.sha256(path.read_bytes()).hexdigest())
         except leads.LeadError as e:
             return jsonify({"error": str(e)}), 400
         return jsonify({"lead_id": lead_id})

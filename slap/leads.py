@@ -47,7 +47,7 @@ def _events(conn, lead_id: str) -> list:
 def _fold(lead_id: str, events: list, drafted_recipients: list) -> dict:
     lead = {"lead_id": lead_id, "stage": None, "url": "", "jd": "", "company": "", "role": "",
             "captured_at": None, "resume": None, "campaign": None, "applied_resume": None,
-            "applied_at": None, "drafted_for": drafted_recipients}
+            "applied_sha256": None, "applied_at": None, "drafted_for": drafted_recipients}
     for e in events:
         stage = e["stage"]
         lead["stage"] = stage
@@ -57,7 +57,8 @@ def _fold(lead_id: str, events: list, drafted_recipients: list) -> dict:
         elif stage == "matched":
             lead.update(resume=e["resume"], campaign=e["campaign"])
         elif stage == "applied":
-            lead.update(applied_resume=e["resume"], applied_at=e["timestamp"])
+            lead.update(applied_resume=e["resume"], applied_sha256=e.get("resume_sha256"),
+                        applied_at=e["timestamp"])
             lead["url"] = lead["url"] or e["url"]
     return lead
 
@@ -102,15 +103,17 @@ def match(conn, lead_id: str, *, resume: str, campaign: str) -> None:
                                           "resume": resume, "campaign": campaign})
 
 
-def mark_applied(conn, *, url: str, resume: str) -> str:
-    """Record that the owner submitted an application with `resume`. Works for
-    a never-captured posting too (apply-first): the applied event alone creates
-    the lead. Returns the lead_id."""
+def mark_applied(conn, *, url: str, resume: str, resume_sha256: str = None) -> str:
+    """Record that the owner submitted an application with `resume` (a
+    send_tag; the caller validates it). `resume_sha256` pins the exact PDF
+    bytes uploaded, so a held email is never released with an edited file.
+    Works for a never-captured posting too (apply-first): the applied event
+    alone creates the lead. Returns the lead_id."""
     if not (resume or "").strip():
         raise LeadError("resume is empty — record which résumé was actually uploaded")
     lead_id = lead_id_for(url)
-    append_event(conn, type="lead", meta={"lead_id": lead_id, "stage": "applied",
-                                          "url": normalize_url(url), "resume": resume.strip()})
+    append_event(conn, type="lead", meta={"lead_id": lead_id, "stage": "applied", "url": normalize_url(url),
+                                          "resume": resume.strip(), "resume_sha256": resume_sha256})
     return lead_id
 
 
