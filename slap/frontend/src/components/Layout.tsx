@@ -13,6 +13,7 @@ const NAV_ITEMS = [
   { to: '/pipeline', label: 'Pipeline' },
   { to: '/reachouts', label: 'Reach-outs' },
   { to: '/lifecycle', label: 'Lifecycle' },
+  { to: '/companies', label: 'Companies' },
   { to: '/commands', label: 'Commands' },
 ];
 

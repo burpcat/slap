@@ -459,3 +459,36 @@ export interface OkResponse {
 export interface ErrorResponse {
   error: string;
 }
+
+// --- /api/companies (leads + reach-outs per company) --------------------------
+
+export interface CompanySummary {
+  company: string;
+  leads: number;
+  applied: number;
+  contacts: number;
+  replied: number;
+  last_activity: string | null;
+}
+
+export interface CompaniesResponse {
+  companies: CompanySummary[];
+}
+
+export interface CompanyNode {
+  kind: 'lead' | 'email';
+  time: string;
+  label: string;
+  chip: string;
+  detail: string;
+  lead_id: string | null;
+  url: string | null;
+  recipient: string | null;
+}
+
+export interface CompanyTimeline {
+  company: string;
+  leads: { lead_id: string; url: string; role: string; stage: string | null; resume: string | null; applied_resume: string | null }[];
+  contacts: { recipient: string; campaign: string; status: string; replied_at: string | null }[];
+  timeline: CompanyNode[];
+}

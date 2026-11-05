@@ -17,6 +17,7 @@ const Engagement = lazy(() => import('./pages/Engagement'));
 const Pipeline = lazy(() => import('./pages/Pipeline'));
 const Reachouts = lazy(() => import('./pages/Reachouts'));
 const Lifecycle = lazy(() => import('./pages/Lifecycle'));
+const Companies = lazy(() => import('./pages/Companies'));
 const Commands = lazy(() => import('./pages/Commands'));
 const Logs = lazy(() => import('./pages/Logs'));
 const TemplateFailures = lazy(() => import('./pages/TemplateFailures'));
@@ -46,6 +47,7 @@ function RoutedPages() {
           <Route path="/pipeline" element={<Pipeline />} />
           <Route path="/reachouts" element={<Reachouts />} />
           <Route path="/lifecycle" element={<Lifecycle />} />
+          <Route path="/companies" element={<Companies />} />
           <Route path="/commands" element={<Commands />} />
           <Route path="/logs" element={<Logs />} />
           <Route path="/template-failures" element={<TemplateFailures />} />

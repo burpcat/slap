@@ -8,6 +8,8 @@ import type {
   CampaignsResponse,
   CampaignSlice,
   CommandsResponse,
+  CompaniesResponse,
+  CompanyTimeline,
   EngagementResponse,
   HomeResponse,
   LifecycleDetail,
@@ -61,6 +63,18 @@ export function useLifecycleDetail(recipient: string | null) {
     queryKey: ['lifecycle', recipient],
     queryFn: () => apiGet<LifecycleDetail>(`/api/lifecycle/${encodeURIComponent(recipient as string)}`),
     enabled: recipient !== null,
+  });
+}
+
+export function useCompanies() {
+  return useQuery({ queryKey: ['companies'], queryFn: () => apiGet<CompaniesResponse>('/api/companies') });
+}
+
+export function useCompanyTimeline(company: string | null) {
+  return useQuery({
+    queryKey: ['company', company],
+    queryFn: () => apiGet<CompanyTimeline>(`/api/companies/${encodeURIComponent(company as string)}`),
+    enabled: company !== null,
   });
 }
 
