@@ -2353,11 +2353,10 @@ def companies_index(conn) -> list:
         e["last_activity"] = max(e["last_activity"] or "", at or "") or None
         return e
 
-    for lead_id in leads.all_ids(conn):
-        lead = leads.get(conn, lead_id)
+    for lead, events in leads.all_leads(conn):
         if not _company_key(lead["company"]):
             continue
-        last = max((ev["timestamp"] for ev in leads.lead_events(conn, lead_id)), default=None)
+        last = max((ev["timestamp"] for ev in events), default=None)
         e = entry(lead["company"], last)
         e["leads"] += 1
         e["applied"] += bool(lead["applied_resume"])
@@ -2380,14 +2379,13 @@ def company_timeline(conn, company: str, *, global_config=None) -> dict | None:
     at that company plus every recorded event for each contact staged there.
     None if the company is unknown."""
     key = _company_key(company)
-    lead_rows = [leads.get(conn, i) for i in leads.all_ids(conn)]
-    company_leads = [l for l in lead_rows if _company_key(l["company"]) == key]
+    company_leads = [(l, evs) for l, evs in leads.all_leads(conn) if _company_key(l["company"]) == key]
     contacts = domains.contacts_at_company(conn, company)
     if not company_leads and not contacts:
         return None
     nodes = []
-    for lead in company_leads:
-        for ev in leads.lead_events(conn, lead["lead_id"]):
+    for lead, events in company_leads:
+        for ev in events:
             label, chip = _LEAD_NODE.get(ev["stage"], (ev["stage"], "neutral"))
             detail = {"captured": lead["role"], "matched": f"{ev.get('resume')} · {ev.get('campaign')}",
                       "applied": f"with {ev.get('resume')}"}.get(ev["stage"], "")
@@ -2402,9 +2400,9 @@ def company_timeline(conn, company: str, *, global_config=None) -> dict | None:
                               "recipient": c.recipient})
     nodes.sort(key=lambda n: n["time"] or "")
     return {
-        "company": (company_leads[0]["company"] if company_leads else company).strip(),
+        "company": (company_leads[0][0]["company"] if company_leads else company).strip(),
         "leads": [{k: l[k] for k in ("lead_id", "url", "role", "stage", "resume", "applied_resume")}
-                  for l in company_leads],
+                  for l, _ in company_leads],
         "contacts": [dataclasses.asdict(c) for c in contacts],
         "timeline": nodes,
     }

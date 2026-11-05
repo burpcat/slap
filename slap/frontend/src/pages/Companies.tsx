@@ -51,7 +51,7 @@ export default function Companies() {
   const { data, isLoading, error } = useCompanies();
   const [selected, setSelected] = useState<string | null>(null);
   const [query, setQuery] = useState('');
-  const { data: detail, isLoading: detailLoading } = useCompanyTimeline(selected);
+  const { data: detail, isLoading: detailLoading, error: detailError } = useCompanyTimeline(selected);
 
   if (isLoading) return <p>Loading…</p>;
   if (error || !data) return <p>Could not load companies.</p>;
@@ -97,6 +97,8 @@ export default function Companies() {
         <div className={styles.charter}>
           {!selected ? (
             <p className={styles.empty}>Select a company to see its whole story.</p>
+          ) : detailError ? (
+            <p className={styles.empty}>Could not load this company's timeline: {String(detailError)}</p>
           ) : detailLoading || !detail ? (
             <p className={styles.empty}>Loading timeline…</p>
           ) : (
