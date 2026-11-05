@@ -22,6 +22,9 @@ test("isStepPage spots apply/confirmation steps only", () => {
 test("htmlToText keeps structure and decodes entities", () => {
   assert.equal(L.htmlToText("<p>Build &amp; ship</p><ul><li>LLMs</li><li>RAG&#39;s</li></ul>"),
     "Build & ship\n- LLMs\n- RAG's");
+  // escaped markup, as Greenhouse puts it inside JSON-LD
+  assert.equal(L.htmlToText("&lt;p&gt;Build &amp;amp; ship&lt;/p&gt;&lt;ul&gt;&lt;li&gt;LLMs&lt;/li&gt;&lt;/ul&gt;"),
+    "Build & ship\n- LLMs");
 });
 
 test("parseJobPosting finds JobPosting in arrays and @graph, skips junk", () => {

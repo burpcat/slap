@@ -20,15 +20,17 @@
 
   const ENTITIES = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", "#39": "'", nbsp: " " };
 
+  const decode = (s) => s.replace(/&(#\d+|#x[0-9a-f]+|\w+);/gi, (m, e) => {
+    if (e[0] === "#") return String.fromCodePoint(e[1].toLowerCase() === "x" ? parseInt(e.slice(2), 16) : +e.slice(1));
+    return ENTITIES[e.toLowerCase()] ?? m;
+  });
+
   function htmlToText(html) {
-    return String(html || "")
+    // Decode first: many job sites HTML-escape the description inside JSON-LD (&lt;p&gt;).
+    return decode(decode(String(html || ""))
       .replace(/<(br|\/p|\/li|\/div|\/h[1-6]|\/tr)\b[^>]*>/gi, "\n")
       .replace(/<li\b[^>]*>/gi, "\n- ")
-      .replace(/<[^>]+>/g, "")
-      .replace(/&(#\d+|#x[0-9a-f]+|\w+);/gi, (m, e) => {
-        if (e[0] === "#") return String.fromCodePoint(e[1].toLowerCase() === "x" ? parseInt(e.slice(2), 16) : +e.slice(1));
-        return ENTITIES[e.toLowerCase()] ?? m;
-      })
+      .replace(/<[^>]+>/g, ""))
       .split("\n").map((l) => l.replace(/\s+/g, " ").trim()).filter(Boolean).join("\n");
   }
 
