@@ -43,6 +43,10 @@ w.document.getElementById("fn").addEventListener("input", () => inputEvents++);
 const intervals = [];
 const realSetInterval = w.setInterval.bind(w);
 w.setInterval = (fn, ms) => { const id = realSetInterval(fn, ms); intervals.push(id); return id; };
+// The panel's shadow root is closed; capture it for the test.
+let panelRoot = null;
+const realAttach = w.Element.prototype.attachShadow;
+w.Element.prototype.attachShadow = function (init) { return (panelRoot = realAttach.call(this, init)); };
 w.eval(fs.readFileSync(EXT + "lib.js", "utf8"));
 w.eval(fs.readFileSync(EXT + "content.js", "utf8"));
 const tick = () => new Promise((r) => setTimeout(r, 50));
@@ -50,8 +54,14 @@ const tick = () => new Promise((r) => setTimeout(r, 50));
 test("panel: extract, badge, prepare, fill, ask Claude, résumé pick persists", async () => {
 
   await tick();
-  const root = w.document.documentElement.lastElementChild.shadowRoot;
+  assert.equal(w.document.documentElement.lastElementChild.shadowRoot, null); // closed to the page
+  const root = panelRoot;
   const $ = (s) => root.querySelector(s);
+
+  // A page script's synthetic click is ignored: nothing gets prepared or filled.
+  $(".prep").click(); await tick();
+  assert.equal(root.querySelectorAll(".row").length, 0);
+  w.__slapTrustSyntheticClicksForTests = true; // jsdom can't make trusted clicks
   assert.equal($(".job").textContent, "Acme · ML Engineer");
   assert.match($(".lines").textContent, /Matched résumé: "ai"/);
   assert.equal($(".res select").value, "ai");

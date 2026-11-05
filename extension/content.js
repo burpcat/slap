@@ -94,7 +94,8 @@
   // --- panel (shadow DOM: page CSS can't touch it, ours can't leak) ---------
   const host = document.createElement("div");
   host.style.cssText = "position:fixed;right:16px;bottom:16px;z-index:2147483647";
-  const root = host.attachShadow({ mode: "open" });
+  // Closed: the job page's scripts (and session-replay tools) can't reach in.
+  const root = host.attachShadow({ mode: "closed" });
   root.innerHTML = `
     <style>
       .p{font:13px/1.4 system-ui,sans-serif;background:#fff;color:#1a1a1a;border:1px solid #d0d0d0;
@@ -129,7 +130,18 @@
       <div class="status"></div>
     </div>`;
   const $ = (sel) => root.querySelector(sel);
-  $(".x").onclick = () => host.remove();
+  // Only a real click from you counts. A page script calling .click() makes an
+  // untrusted event, and filling a form or recording an application (which can
+  // release a held email) must never happen on the page's say-so. The test hook
+  // is safe in Chrome: content scripts run in an isolated world, so the page
+  // can't set globals the extension reads.
+  const onClick = (sel, fn) => {
+    $(sel).onclick = (e) => {
+      if (!e.isTrusted && globalThis.__slapTrustSyntheticClicksForTests !== true) return;
+      Promise.resolve(fn(e)).catch((err) => status(String(err.message || err), true));
+    };
+  };
+  onClick(".x", () => host.remove());
   document.documentElement.appendChild(host);
 
   const status = (text, isErr) => { $(".status").textContent = text || ""; $(".status").className = isErr ? "status err" : "status"; };
@@ -151,7 +163,8 @@
       send({ type: "rememberJob", job });
     } else { // apply/confirmation step: reuse the posting this tab came from
       const recalled = (await send({ type: "recallJob" })).data;
-      job = recalled && recalled.url === url ? recalled : (job || { url, role: "", company: "", jd: "" });
+      job = recalled && recalled.url === url ? recalled
+        : job && job.url === url ? job : { url, role: "", company: "", jd: "" };
     }
     $(".job").textContent = [job.company, job.role].filter(Boolean).join(" · ") || job.url;
 
@@ -159,7 +172,10 @@
       send({ type: "check", company: job.company, url: job.url }), send({ type: "resumes" })]);
     if (!check.ok) return status(check.error, true);
     lead = check.data.lead;
-    $(".lines").replaceChildren(...L.badgeLines(check.data).map((t) => el("div", { textContent: t })));
+    const lines = L.badgeLines(check.data);
+    if (!page && !lead) lines.unshift(`Not tied to a captured posting: anything you record here goes to ${job.url}`);
+    $(".lines").replaceChildren(...lines.map((t) => el("div", { textContent: t })));
+    if (!resumes.ok) status(resumes.error, true);
 
     $(".capture").hidden = Boolean(lead && lead.jd) || !job.jd;
     const tags = resumes.ok ? resumes.data.resumes.map((r) => r.tag) : [];
@@ -172,26 +188,28 @@
     $(".confirm").hidden = !(L.isConfirmation(location.href, document.body.innerText) && !(lead && lead.applied_resume));
   }
 
-  $(".capture").onclick = async () => {
+  onClick(".capture", async () => {
     const r = await send({ type: "capture", job });
     r.ok ? status(r.data.created ? "Captured. Run slap_leads in Claude Code to match and draft." : "Already captured.")
          : status(r.error, true);
     safeRender();
-  };
+  });
 
-  $(".mark").onclick = async () => {
+  onClick(".mark", async () => {
     const resume = $(".res select").value;
     const r = await send({ type: "applied", url: job.url, resume });
     r.ok ? status(`Recorded: applied with "${resume}".`) : status(r.error, true);
     safeRender();
-  };
+  });
 
-  $(".attach").onclick = async () => {
+  onClick(".attach", async () => {
     const input = resumeInput();
+    if (!input) return status("The résumé upload field is gone from the page.", true);
     const tag = $(".res select").value;
     const [file, profile] = await Promise.all([send({ type: "resumeFile", tag }), send({ type: "profile" })]);
     if (!file.ok) return status(file.error, true);
-    const name = (profile.ok && profile.data.fields.resume_filename) || file.data.filename;
+    if (!profile.ok) return status(profile.error, true);
+    const name = profile.data.fields.resume_filename || file.data.filename;
     const bytes = Uint8Array.from(atob(file.data.base64), (c) => c.charCodeAt(0));
     const dt = new DataTransfer();
     dt.items.add(new File([bytes], name, { type: "application/pdf" }));
@@ -199,13 +217,14 @@
     for (const t of ["input", "change"]) input.dispatchEvent(new Event(t, { bubbles: true }));
     chosenTag = tag;
     status(`Attached "${tag}" as ${name}. Mark applied with the same résumé after you submit.`);
-  };
+  });
 
   const SOURCE_NOTE = { claude: "Claude", bank: "answer bank", profile: "profile",
                         sensitive: "sensitive: fill it yourself", eeo: "self-ID: your call, never auto-filled",
                         null: "no answer yet" };
 
-  $(".prep").onclick = async () => {
+  onClick(".prep", async () => {
+    await render(); // fresh lead: picks up answers Claude saved since the last render
     const profile = await send({ type: "profile" });
     if (!profile.ok) return status(profile.error, true);
     questions = scanForm();
@@ -227,9 +246,9 @@
     $(".ask").hidden = !open || !job.url;
     $(".ask").textContent = `Ask Claude (${open})`;
     status("Review every value, then Fill checked. You submit the form yourself.");
-  };
+  });
 
-  $(".go").onclick = () => {
+  onClick(".go", () => {
     let filled = 0;
     root.querySelectorAll(".row").forEach((row, i) => {
       const box = row.querySelector("input[type=checkbox]");
@@ -237,15 +256,15 @@
       if (box.checked && !box.disabled && value && fillOne(questions[i], value)) filled++;
     });
     status(`Filled ${filled} field(s). Check the form, then submit it yourself.`);
-  };
+  });
 
-  $(".ask").onclick = async () => {
+  onClick(".ask", async () => {
     const open = questions.filter((q, i) => plan[i].source === null)
       .map((q) => ({ label: q.label, kind: q.kind, options: q.options || [] }));
     const r = await send({ type: "questions", url: job.url, questions: open });
     r.ok ? status(`Sent ${open.length} question(s). In Claude Code, run slap_pending_questions, then Prepare answers again.`)
          : status(r.error, true);
-  };
+  });
 
   // After a submit click, single-page sites (Ashby, Workday) swap in their
   // confirmation without navigating: re-check for a minute.

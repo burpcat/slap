@@ -2,19 +2,28 @@
 (function (root) {
   "use strict";
 
-  // Path tails that are steps of the same posting, not a different job.
-  const STEP_TAIL = /\/(apply|application|confirmation|thanks|thank-you|submitted)(\/.*)?$/i;
+  // A step of a posting (apply form, confirmation), not a different job. The
+  // posting's own path must come first, so /apply/eng-123 (a site whose job
+  // pages live under /apply) is NOT mistaken for a step of "/".
+  // Keep in sync with slap/leads.py STEP_TAIL.
+  const STEP = /^(\/.*[^/].*?)\/(apply|application|confirmation|thanks|thank-you|submitted|success)(\/.*)?$/i;
 
   /** Is this an apply/confirmation step of a posting rather than the posting itself? */
   function isStepPage(href) {
-    return STEP_TAIL.test(new URL(href).pathname);
+    return STEP.test(new URL(href).pathname);
   }
 
-  /** One URL per posting, so the apply/confirmation pages find the captured lead. */
+  /** One URL per posting, so the apply/confirmation pages find the captured lead.
+   *  A step page drops its query too (?lever-source=..., tracking). */
   function canonicalJobUrl(href) {
     const u = new URL(href);
     u.hash = "";
-    u.pathname = u.pathname.replace(STEP_TAIL, "").replace(/\/+$/, "") || "/";
+    const m = u.pathname.match(STEP);
+    if (m) {
+      u.pathname = m[1];
+      u.search = "";
+    }
+    u.pathname = u.pathname.replace(/\/+$/, "") || "/";
     return u.toString();
   }
 
@@ -89,7 +98,9 @@
   // Never filled, never sent anywhere: credentials, payment, government ID.
   const SENSITIVE = /password|passcode|\bssn\b|social security|passport|driver'?s? licen[cs]e|national id|tax id|card number|\bcvv\b|\biban\b|routing number|bank account|date of birth|\bdob\b/i;
   // Voluntary self-identification: yours to answer, never guessed or sent to Claude.
-  const EEO = /gender|\brace\b|ethnic|veteran|disabilit|sexual orientation|pronoun|transgender|hispanic|latino/i;
+  const EEO = /gender|\bsex\b|\brace\b|ethnic|veteran|disabilit|sexual orientation|lgbt|pronoun|transgender|hispanic|latino|religio|\bage\b/i;
+  // A choice question offering "decline to identify" is self-ID whatever its label says.
+  const EEO_OPTION = /decline to (self[- ])?identify|prefer not to (say|answer|disclose)|don'?t wish to (answer|identify)/i;
 
   // Label -> profile field. Order matters: specific before general.
   const PROFILE_RULES = [
@@ -119,7 +130,9 @@
   function matchOption(options, value) {
     const v = String(value).trim().toLowerCase();
     const opts = options.map((o) => [o, o.trim().toLowerCase()]);
-    const hit = opts.find(([, o]) => o === v) || opts.find(([, o]) => o && (o.startsWith(v) || v.startsWith(o)));
+    // Exact, else an option that starts with the answer ("Yes" -> "Yes, I am
+    // authorized"). Never the reverse: "None" must not pick "No".
+    const hit = opts.find(([, o]) => o === v) || (v && opts.find(([, o]) => o.startsWith(v)));
     return hit ? hit[0] : null;
   }
 
@@ -131,11 +144,20 @@
    * matches one of their options.
    */
   function planFill(questions, profile, leadAnswers) {
+    const bankRules = (profile.answers || []).map((a, i) => {
+      try {
+        return { re: new RegExp(a.match, "i"), answer: a.answer };
+      } catch (e) {
+        throw new Error(`profile.yaml answers[${i}].match ${JSON.stringify(a.match)} is not a valid JavaScript regex: ${e.message}`);
+      }
+    });
     return questions.map((q) => {
       const label = q.label;
       if (SENSITIVE.test(label)) return { label, value: null, source: "sensitive" };
-      if (EEO.test(label)) return { label, value: null, source: "eeo" };
-      const bank = (profile.answers || []).find((a) => new RegExp(a.match, "i").test(label));
+      if (EEO.test(label) || (q.options || []).some((o) => EEO_OPTION.test(o))) {
+        return { label, value: null, source: "eeo" };
+      }
+      const bank = bankRules.find((r) => r.re.test(label));
       const candidates = [
         [(leadAnswers || {})[label], "claude"],
         [bank && bank.answer, "bank"],

@@ -6,10 +6,21 @@ const L = require("../../extension/lib.js");
 test("canonicalJobUrl folds apply/confirmation steps into the posting URL", () => {
   assert.equal(L.canonicalJobUrl("https://jobs.lever.co/acme/abc-123/apply"), "https://jobs.lever.co/acme/abc-123");
   assert.equal(L.canonicalJobUrl("https://jobs.ashbyhq.com/acme/uuid/application?src=x#top"),
-    "https://jobs.ashbyhq.com/acme/uuid?src=x");
+    "https://jobs.ashbyhq.com/acme/uuid");
   assert.equal(L.canonicalJobUrl("https://boards.greenhouse.io/acme/jobs/9/confirmation"),
     "https://boards.greenhouse.io/acme/jobs/9");
   assert.equal(L.canonicalJobUrl("https://x.com/"), "https://x.com/");
+});
+
+test("step pages keep their posting path, drop step queries, and never collapse to /", () => {
+  assert.equal(L.canonicalJobUrl("https://jobs.lever.co/acme/abc/apply?lever-source=LinkedIn"),
+    "https://jobs.lever.co/acme/abc");
+  assert.equal(L.canonicalJobUrl("https://x.com/jobs/1/success"), "https://x.com/jobs/1");
+  assert.equal(L.canonicalJobUrl("https://acme.wd1.myworkdayjobs.com/en-US/c/job/Boston/ML_R12/apply/applyManually"),
+    "https://acme.wd1.myworkdayjobs.com/en-US/c/job/Boston/ML_R12");
+  assert.equal(L.canonicalJobUrl("https://example.com/apply/eng-123"), "https://example.com/apply/eng-123");
+  assert.notEqual(L.canonicalJobUrl("https://example.com/apply/eng-123"), L.canonicalJobUrl("https://example.com/apply/pm-456"));
+  assert.equal(L.canonicalJobUrl("https://boards.greenhouse.io/acme/jobs/9?gh_jid=9"), "https://boards.greenhouse.io/acme/jobs/9?gh_jid=9");
 });
 
 test("isStepPage spots apply/confirmation steps only", () => {
@@ -65,6 +76,8 @@ test("matchOption: exact, then prefix either way, else null", () => {
   assert.equal(L.matchOption(["Yes", "No"], "yes"), "Yes");
   assert.equal(L.matchOption(["Yes, I am authorized", "No"], "Yes"), "Yes, I am authorized");
   assert.equal(L.matchOption(["0-2", "3-5"], "10+"), null);
+  assert.equal(L.matchOption(["No", "Yes"], "None"), null);            // never the reverse prefix
+  assert.equal(L.matchOption(["No", "Yes"], "Not required"), null);
 });
 
 test("planFill precedence and exclusions", () => {
@@ -89,4 +102,15 @@ test("planFill precedence and exclusions", () => {
   assert.deepEqual(by["Gender"], [null, "eeo"]);
   assert.deepEqual(by["Social Security Number"], [null, "sensitive"]);
   assert.deepEqual(by["Years of Python"], [null, null]); // Claude's answer fits no option: left for you/Claude
+});
+
+test("planFill: self-ID by option text or broader label; bad bank regex fails loud", () => {
+  const plan = L.planFill([
+    { label: "question_123", options: ["Yes", "No", "I decline to self-identify"] },
+    { label: "Sex", options: ["F", "M"] },
+    { label: "Religion" },
+  ], PROFILE, {});
+  assert.deepEqual(plan.map((p) => p.source), ["eeo", "eeo", "eeo"]);
+  assert.throws(() => L.planFill([{ label: "x" }], { answers: [{ match: "(?P<n>x)", answer: "y" }] }),
+    /answers\[0\]\.match .* not a valid JavaScript regex/);
 });
