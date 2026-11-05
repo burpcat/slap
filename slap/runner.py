@@ -43,7 +43,7 @@ from pathlib import Path
 from slap import doctor, imap, smtp, stages
 from slap.latex import WORKDIR_ROOT, recipient_workdir
 from slap.queue import (
-    due_for_followup, due_for_ooo_resend, due_for_remind, due_recipients, load_manifest,
+    due_for_followup, due_for_ooo_resend, due_for_remind, due_recipients, held_initials, load_manifest,
 )
 from slap.tracking import append_event
 
@@ -723,7 +723,10 @@ def drain(conn, global_config, smtp_config, *, now: date = None, sleep_fn=time.s
     # follow-up firing INTO drain (due_for_followup), and without this gate
     # --now would inherit the whole past-due cadence backlog (the surprising
     # "[N/130]" sweep). due_recipients is always drained — that IS the staged work.
-    due_initial = due_recipients(conn)
+    held = {h["recipient"] for h in held_initials(conn)}
+    if held:
+        log_fn(f"holding {len(held)} staged send(s) until their application is recorded")
+    due_initial = [row for row in due_recipients(conn) if row["recipient"] not in held]
     if staged_only:
         due_ooo = due_followup = due_remind = []
     else:

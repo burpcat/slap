@@ -47,7 +47,7 @@ import shutil
 from datetime import date, datetime
 from pathlib import Path
 
-from slap import archive, display, stages
+from slap import archive, display, leads, stages
 from slap.latex import WORKDIR_ROOT, recipient_workdir
 from slap.tracking import append_event
 
@@ -369,6 +369,35 @@ def due_recipients(conn) -> list:
         """
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def held_initials(conn) -> list:
+    """Staged initial sends the runner must NOT fire yet. slap_mcp stages an
+    email with queued meta {"hold": "applied", "lead_id", "resume"} when it
+    should only go out after the owner applies to that posting. Held while
+    the lead has no `applied` event, or while it was applied with a different
+    résumé than this email attaches (never mail a résumé the company didn't
+    get — the owner re-previews to fix). A subset of due_recipients(); that
+    query itself is unchanged, so reload/queue-depth still see held sends."""
+    held = []
+    for row in due_recipients(conn):
+        ev = conn.execute("SELECT timestamp, meta FROM events WHERE recipient = ? AND type = 'queued' "
+                          "ORDER BY id DESC LIMIT 1", (row["recipient"],)).fetchone()
+        meta = json.loads(ev["meta"] or "{}")
+        if meta.get("hold") != "applied":
+            continue
+        lead = leads.get(conn, meta["lead_id"])
+        applied = lead and lead["applied_resume"]
+        if not applied:
+            reason = "waiting for application"
+        elif applied != meta.get("resume"):
+            reason = (f"applied with résumé '{applied}' but this email attaches '{meta.get('resume')}' "
+                      f"— re-preview with '{applied}'")
+        else:
+            continue
+        held.append({"recipient": row["recipient"], "lead_id": meta["lead_id"], "reason": reason,
+                     "queued_at": ev["timestamp"]})
+    return held
 
 
 def tag_ooo(conn, recipient: str, resume_date: date) -> None:
