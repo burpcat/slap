@@ -21,6 +21,21 @@ async function api(path, init = {}) {
 
 const post = (path, body) => api(path, { method: "POST", body: JSON.stringify(body) });
 
+// Résumé PDF bytes as base64 (extension messages carry JSON only).
+async function resumeFile(tag) {
+  let resp;
+  try {
+    resp = await fetch(`${API}/api/resumes/${encodeURIComponent(tag)}`);
+  } catch {
+    return { ok: false, error: DOWN };
+  }
+  if (!resp.ok) return { ok: false, error: (await resp.json().catch(() => ({}))).error || `HTTP ${resp.status}` };
+  const bytes = new Uint8Array(await resp.arrayBuffer());
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return { ok: true, data: { base64: btoa(bin), filename: `${tag}.pdf` } };
+}
+
 async function handle(msg, sender) {
   const tabKey = `tab:${sender.tab && sender.tab.id}`;
   switch (msg.type) {
@@ -30,6 +45,12 @@ async function handle(msg, sender) {
       return api("/api/resumes");
     case "capture":
       return post("/api/leads", msg.job);
+    case "profile":
+      return api("/api/profile");
+    case "questions":
+      return post("/api/leads/questions", { url: msg.url, questions: msg.questions });
+    case "resumeFile":
+      return resumeFile(msg.tag);
     case "applied":
       return post("/api/leads/applied", { url: msg.url, resume: msg.resume });
     case "rememberJob": // the posting this tab is applying to, for its later apply/confirmation pages

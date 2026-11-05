@@ -1,0 +1,7 @@
+{
+  "name": "slap-extension",
+  "private": true,
+  "description": "Dev-only test deps for ../../extension, which itself has no dependencies.",
+  "scripts": { "test": "node --test *.test.js" },
+  "devDependencies": { "jsdom": "25.0.1" }
+}

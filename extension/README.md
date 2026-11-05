@@ -22,5 +22,6 @@ The ID of an unpacked extension stays the same as long as you load it from the s
 
 ## Develop
 
-- `lib.js` holds the pure logic (JSON-LD job parsing, URL canonicalising, confirmation detection, badge text). Test it with `node --test extension/*.test.js`.
+- `lib.js` holds the pure logic: job parsing, URL canonicalising, confirmation detection, badge text, and the form-fill plan.
+- Tests live in `tests/extension/`, outside this folder, so Chrome never loads test dependencies. Run `npm --prefix tests/extension install && node --test tests/extension/*.test.js`. `content.test.js` drives the whole panel in jsdom against a mock application form.
 - `background.js` is the only code that talks to `http://127.0.0.1:5050`. `content.js` is the page panel.

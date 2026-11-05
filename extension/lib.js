@@ -79,7 +79,74 @@
     return lines;
   }
 
-  const api = { canonicalJobUrl, isStepPage, htmlToText, parseJobPosting, isConfirmation, badgeLines };
+  // --- form filling ---------------------------------------------------------
+
+  // Never filled, never sent anywhere: credentials, payment, government ID.
+  const SENSITIVE = /password|passcode|\bssn\b|social security|passport|driver'?s? licen[cs]e|national id|tax id|card number|\bcvv\b|\biban\b|routing number|bank account|date of birth|\bdob\b/i;
+  // Voluntary self-identification: yours to answer, never guessed or sent to Claude.
+  const EEO = /gender|\brace\b|ethnic|veteran|disabilit|sexual orientation|pronoun|transgender|hispanic|latino/i;
+
+  // Label -> profile field. Order matters: specific before general.
+  const PROFILE_RULES = [
+    ["sponsorship", /sponsor/i],
+    ["work_authorization", /authori[sz]ed to work|legally (eligible|authori[sz]ed|permitted)|work authori[sz]ation|right to work/i],
+    ["linkedin", /linkedin/i],
+    ["github", /github/i],
+    ["website", /website|portfolio|personal (site|url|page)/i],
+    ["email", /e-?mail/i],
+    ["phone", /phone|mobile|\btel\b/i],
+    ["first_name", /first name|given name|^first$/i],
+    ["last_name", /last name|surname|family name|^last$/i],
+    ["full_name", /^(full |legal )?name\*?$|your name|full name/i],
+    ["location", /^location|current location|city|where are you (based|located)/i],
+  ];
+
+  function profileValue(label, fields) {
+    for (const [key, re] of PROFILE_RULES) {
+      if (!re.test(label)) continue;
+      if (key === "full_name") return fields.full_name || [fields.first_name, fields.last_name].filter(Boolean).join(" ") || null;
+      return fields[key] || null;
+    }
+    return null;
+  }
+
+  /** The option a select/radio should take for `value`, or null if none fits. */
+  function matchOption(options, value) {
+    const v = String(value).trim().toLowerCase();
+    const opts = options.map((o) => [o, o.trim().toLowerCase()]);
+    const hit = opts.find(([, o]) => o === v) || opts.find(([, o]) => o && (o.startsWith(v) || v.startsWith(o)));
+    return hit ? hit[0] : null;
+  }
+
+  /**
+   * Proposed value per question: [{label, value, source}], where source is
+   * "claude" | "bank" | "profile" | "sensitive" | "eeo" | null (unanswered).
+   * Precedence: exclusions, then Claude's answers for THIS posting, then the
+   * answer bank, then profile fields. Choice questions only take a value that
+   * matches one of their options.
+   */
+  function planFill(questions, profile, leadAnswers) {
+    return questions.map((q) => {
+      const label = q.label;
+      if (SENSITIVE.test(label)) return { label, value: null, source: "sensitive" };
+      if (EEO.test(label)) return { label, value: null, source: "eeo" };
+      const bank = (profile.answers || []).find((a) => new RegExp(a.match, "i").test(label));
+      const candidates = [
+        [(leadAnswers || {})[label], "claude"],
+        [bank && bank.answer, "bank"],
+        [profileValue(label, profile.fields || {}), "profile"],
+      ];
+      for (const [raw, source] of candidates) {
+        if (raw == null || raw === "") continue;
+        const value = q.options && q.options.length ? matchOption(q.options, raw) : raw;
+        if (value != null) return { label, value, source };
+      }
+      return { label, value: null, source: null };
+    });
+  }
+
+  const api = { canonicalJobUrl, isStepPage, htmlToText, parseJobPosting, isConfirmation, badgeLines,
+                matchOption, planFill };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.slapLib = api;
 })(globalThis);

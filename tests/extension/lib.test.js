@@ -1,7 +1,7 @@
-// Run: node --test extension/*.test.js
+// Run: node --test tests/extension/*.test.js   (content.test.js also needs: npm --prefix tests/extension install)
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const L = require("./lib.js");
+const L = require("../../extension/lib.js");
 
 test("canonicalJobUrl folds apply/confirmation steps into the posting URL", () => {
   assert.equal(L.canonicalJobUrl("https://jobs.lever.co/acme/abc-123/apply"), "https://jobs.lever.co/acme/abc-123");
@@ -48,4 +48,40 @@ test("badgeLines summarizes lead state and prior contacts", () => {
     ['Matched résumé: "ai" (hiring-manager)', "Already contacted jane@acme.com (active, replied)"]);
   assert.deepEqual(L.badgeLines({ lead: { resume: "ai", applied_resume: "ds" }, company_contacts: [] }),
     ['Applied with "ds"']);
+});
+
+const PROFILE = {
+  fields: { first_name: "Ada", last_name: "Lovelace", email: "ada@x.com", work_authorization: "Yes",
+            sponsorship: "No", linkedin: "https://linkedin.com/in/ada" },
+  answers: [{ match: "notice period|start", answer: "Two weeks" }],
+};
+
+test("matchOption: exact, then prefix either way, else null", () => {
+  assert.equal(L.matchOption(["Yes", "No"], "yes"), "Yes");
+  assert.equal(L.matchOption(["Yes, I am authorized", "No"], "Yes"), "Yes, I am authorized");
+  assert.equal(L.matchOption(["0-2", "3-5"], "10+"), null);
+});
+
+test("planFill precedence and exclusions", () => {
+  const plan = L.planFill([
+    { label: "First Name" }, { label: "Full name" }, { label: "Email*" },
+    { label: "Will you require visa sponsorship?", options: ["Yes", "No"] },
+    { label: "Are you legally authorized to work in the US?", options: ["Yes", "No"] },
+    { label: "What is your notice period?" },
+    { label: "Why Acme?" },
+    { label: "Gender", options: ["Woman", "Man"] },
+    { label: "Social Security Number" },
+    { label: "Years of Python", options: ["0-2", "3-5"] },
+  ], PROFILE, { "Why Acme?": "Agents.", "Years of Python": "10+" });
+  const by = Object.fromEntries(plan.map((p) => [p.label, [p.value, p.source]]));
+  assert.deepEqual(by["First Name"], ["Ada", "profile"]);
+  assert.deepEqual(by["Full name"], ["Ada Lovelace", "profile"]);
+  assert.deepEqual(by["Email*"], ["ada@x.com", "profile"]);
+  assert.deepEqual(by["Will you require visa sponsorship?"], ["No", "profile"]);
+  assert.deepEqual(by["Are you legally authorized to work in the US?"], ["Yes", "profile"]);
+  assert.deepEqual(by["What is your notice period?"], ["Two weeks", "bank"]);
+  assert.deepEqual(by["Why Acme?"], ["Agents.", "claude"]);
+  assert.deepEqual(by["Gender"], [null, "eeo"]);
+  assert.deepEqual(by["Social Security Number"], [null, "sensitive"]);
+  assert.deepEqual(by["Years of Python"], [null, null]); // Claude's answer fits no option: left for you/Claude
 });

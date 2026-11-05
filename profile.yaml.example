@@ -15,6 +15,7 @@ fields:
   location: Boston, MA
   work_authorization: "Yes"     # "Are you legally authorized to work in ...?"
   sponsorship: "No"             # "Will you now or in the future require sponsorship?"
+  resume_filename: Ada_Lovelace_Resume.pdf   # name the uploaded résumé gets (default: <tag>.pdf)
 
 # Answer bank: `match` is a case-insensitive regex tested against the question's
 # label. First match wins. Claude Code can generate these from star.json; keep
