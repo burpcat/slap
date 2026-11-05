@@ -68,15 +68,24 @@ test("isConfirmation by URL or page text", () => {
   assert.ok(!L.isConfirmation("https://jobs.lever.co/acme/1/apply", "Submit your application"));
 });
 
-test("badgeLines summarizes lead state and prior contacts", () => {
-  assert.deepEqual(L.badgeLines({ lead: null, company_contacts: [] }), ["No prior contact found"]);
-  assert.deepEqual(L.badgeLines({ lead: { resume: "ai", campaign: "hiring-manager" },
+test("badgeLines: posting state plus prior contacts", () => {
+  assert.deepEqual(L.badgeLines({ lead: null, company_contacts: [] }), ["No prior contact at this company"]);
+  assert.deepEqual(L.badgeLines({ lead: { jd: "x", staged_to: [] },
     company_contacts: [{ recipient: "jane@acme.com", status: "active", replied_at: "t" }] }),
-    ['Matched résumé: "ai" (hiring-manager)', "Already contacted jane@acme.com (active, replied)"]);
-  assert.deepEqual(L.badgeLines({ lead: { resume: "ai", applied_resume: "ds" }, company_contacts: [] }),
-    ['Applied with "ds"']);
-  assert.deepEqual(L.badgeLines({ lead: { jd: "x" }, company_contacts: [], suggested_resume: { tag: "ai" } }),
-    ["Captured, not matched yet: run slap_leads in Claude Code", 'Likely résumé: "ai" (local guess)']);
+    ["Captured", "Already contacted jane@acme.com (active, replied)"]);
+  assert.deepEqual(L.badgeLines({ lead: { applied_resume: "b", staged_to: [] }, company_contacts: [] }),
+    ['Applied with "b"', "No prior contact at this company"]);
+  assert.equal(L.badgeLines({ lead: { staged_to: ["hm@x.com"] }, company_contacts: [] })[0], "Reach-out staged to hm@x.com");
+});
+
+test("emailStatus says what the reach-out waits for", () => {
+  const lead = (extra) => ({ campaign: "hm", staged_to: [], applied_resume: null, ...extra });
+  assert.equal(L.emailStatus({ lead: null }), "");
+  assert.match(L.emailStatus({ lead: lead({ campaign: "" }) }), /Pick a campaign/);
+  assert.match(L.emailStatus({ lead: lead(), email: { missing: ["contact email", "why_line"] } }), /contact's email/);
+  assert.match(L.emailStatus({ lead: lead(), email: { missing: ["why_line"] } }), /write the drop/);
+  assert.match(L.emailStatus({ lead: lead(), email: { missing: [] } }), /stages when you click Applied/);
+  assert.match(L.emailStatus({ lead: lead({ staged_to: ["a@b.co"] }) }), /staged to a@b.co/);
 });
 
 const PROFILE = {

@@ -77,21 +77,33 @@
     return CONFIRM_URL.test(new URL(href).pathname + "/") || CONFIRM_TEXT.test(pageText || "");
   }
 
-  /** Badge lines from a GET /api/check response. */
+  /** Badge lines from a GET /api/check response: prior contact + where this posting stands. */
   function badgeLines(check) {
     const lines = [];
     const lead = check.lead;
-    if (lead && lead.applied_resume) lines.push(`Applied with "${lead.applied_resume}"`);
-    else if (lead && lead.resume) lines.push(`Matched résumé: "${lead.resume}" (${lead.campaign})`);
-    else if (lead) {
-      lines.push("Captured, not matched yet: run slap_leads in Claude Code");
-      if (check.suggested_resume) lines.push(`Likely résumé: "${check.suggested_resume.tag}" (local guess)`);
-    }
+    if (lead && lead.staged_to && lead.staged_to.length) lines.push(`Reach-out staged to ${lead.staged_to[0]}`);
+    else if (lead && lead.applied_resume) lines.push(`Applied with "${lead.applied_resume}"`);
+    else if (lead && lead.jd) lines.push("Captured");
     for (const c of check.company_contacts || []) {
       lines.push(`Already contacted ${c.recipient} (${c.status}${c.replied_at ? ", replied" : ""})`);
     }
-    if (!lead && !(check.company_contacts || []).length) lines.push("No prior contact found");
+    if (!(check.company_contacts || []).length) lines.push("No prior contact at this company");
     return lines;
+  }
+
+  /** One sentence on what the reach-out is waiting for. */
+  function emailStatus(check) {
+    const lead = check.lead;
+    const email = check.email;
+    if (!lead) return "";
+    if (lead.staged_to && lead.staged_to.length) return `Reach-out staged to ${lead.staged_to[0]}. It sends on the next runner.`;
+    if (!lead.campaign) return "Pick a campaign so slap can set up the reach-out.";
+    if (!email) return "";
+    if (email.error) return email.error;
+    const missing = email.missing || [];
+    if (missing.includes("contact email")) return "Add the contact's email to send a reach-out.";
+    if (missing.length) return "Waiting for the drop: in Claude Code, ask it to write the drop for this application.";
+    return lead.applied_resume ? "Email ready." : "Email ready. It stages when you click Applied.";
   }
 
   // --- form filling ---------------------------------------------------------
@@ -187,7 +199,7 @@
     return (dot > 0 && dot < 90 ? t.slice(0, dot + 1) : t.slice(0, 87).trimEnd() + "…");
   }
 
-  const api = { canonicalJobUrl, displayLabel, isStepPage, htmlToText, parseJobPosting, isConfirmation, badgeLines,
+  const api = { canonicalJobUrl, displayLabel, emailStatus, isStepPage, htmlToText, parseJobPosting, isConfirmation, badgeLines,
                 matchOption, planFill };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.slapLib = api;

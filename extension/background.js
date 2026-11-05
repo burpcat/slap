@@ -41,10 +41,13 @@ async function handle(msg, sender) {
   switch (msg.type) {
     case "check":
       return api(`/api/check?${new URLSearchParams({ company: msg.company || "", url: msg.url })}`);
-    case "resumes":
-      return api("/api/resumes");
+    case "campaignOptions":
+      return api("/api/campaign-options");
     case "capture":
       return post("/api/leads", msg.job);
+    case "details":
+      return post("/api/leads/details", { url: msg.url, campaign: msg.campaign, resume: msg.resume,
+                                          contact_email: msg.contact_email, contact_name: msg.contact_name });
     case "profile":
       return api("/api/profile");
     case "questions":
@@ -52,7 +55,8 @@ async function handle(msg, sender) {
     case "resumeFile":
       return resumeFile(msg.tag);
     case "applied":
-      return post("/api/leads/applied", { url: msg.url, resume: msg.resume });
+      return post("/api/leads/applied", { url: msg.url, resume: msg.resume,
+                                          acknowledge_warnings: Boolean(msg.acknowledge_warnings) });
     case "rememberJob": // the posting this tab is applying to, for its later apply/confirmation pages
       await chrome.storage.session.set({ [tabKey]: msg.job });
       return { ok: true };

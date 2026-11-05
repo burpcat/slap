@@ -1,7 +1,8 @@
-// On-page panel: capture this posting into slap, show prior contact + the
-// matched résumé, prepare form answers for your review, attach the résumé,
-// and record the application once you've submitted. Never clicks Submit and
-// never fills or records anything without your click.
+// On-page panel. On a posting: capture it with its campaign, résumé and
+// contact. On an application form: prepare answers from your config.yaml
+// profile for review, fill the ticked ones, attach the résumé, and send the
+// leftovers to Claude. Clicking Applied is what stages the reach-out email.
+// Never clicks Submit and never fills or records anything without your click.
 (() => {
   if (window.__slap) return;
   window.__slap = true;
@@ -111,65 +112,112 @@
   root.innerHTML = `
     <style>
       .p{font:13px/1.4 system-ui,sans-serif;background:#fff;color:#1a1a1a;border:1px solid #d0d0d0;
-         border-radius:10px;box-shadow:0 4px 18px rgba(0,0,0,.15);padding:10px 12px;width:320px;
-         max-height:70vh;overflow:auto}
-      .h{display:flex;justify-content:space-between;font-weight:600;margin-bottom:4px}
-      .job{color:#555;margin-bottom:6px}.lines div{margin:2px 0}.err{color:#b00020}
-      .confirm{background:#fff6d6;border-radius:6px;padding:6px;margin:6px 0}
-      button,select,input{font:inherit}button{cursor:pointer;margin-top:6px}
-      .x{border:0;background:none;color:#888;margin:0}
-      .row{border-top:1px solid #eee;padding:4px 0}.row b{font-weight:500}.row input.v,.row select.v{width:100%;box-sizing:border-box}
-      .src{color:#888;font-size:11px}
+         border-radius:10px;box-shadow:0 4px 18px rgba(0,0,0,.15);padding:10px 12px;width:330px;
+         max-height:75vh;overflow:auto;display:flex;flex-direction:column;gap:8px}
+      .h{display:flex;justify-content:space-between;font-weight:600}
+      .job{color:#555}.lines div{margin:1px 0}.err{color:#b00020}.muted{color:#777;font-size:12px}
+      .box{border-top:1px solid #e3e3e3;padding-top:8px;display:flex;flex-direction:column;gap:6px}
+      .grid{display:grid;grid-template-columns:auto 1fr;gap:4px 8px;align-items:center}
+      .grid input,.grid select{width:100%;box-sizing:border-box}
+      .confirm{background:#fff6d6;border-radius:6px;padding:6px}
+      button,select,input{font:inherit}button{cursor:pointer;align-self:flex-start}
+      .x{border:0;background:none;color:#888}
+      .row{border-top:1px solid #eee;padding:4px 0}.row b{font-weight:500}
+      .row input.v,.row select.v{width:100%;box-sizing:border-box}.src{color:#888;font-size:11px}
+      pre{white-space:pre-wrap;font:12px/1.4 ui-monospace,Menlo,monospace;margin:4px 0 0}
       @media (prefers-color-scheme:dark){.p{background:#1f1f1f;color:#eee;border-color:#444}.job{color:#aaa}
-        .confirm{background:#3a3110}.row{border-color:#333}}
+        .confirm{background:#3a3110}.row,.box{border-color:#333}}
     </style>
     <div class="p">
-      <div class="h"><span>slap</span><button class="x" title="Hide">✕</button></div>
-      <div class="job"></div><div class="lines"></div>
-      <div class="confirm" hidden>Looks like you submitted. Record it so the held email can go out.</div>
-      <div><button class="capture" hidden>Send to slap</button></div>
-      <div class="res" hidden>
-        <select aria-label="Résumé"></select>
-        <button class="attach" hidden>Attach to form</button>
-        <button class="mark">Mark applied</button>
+      <div class="h"><span>slap</span><button class="x" title="Hide (the toolbar icon brings it back)">✕</button></div>
+      <div class="job"></div>
+      <div class="lines"></div>
+
+      <div class="box setup">
+        <div class="grid">
+          <label for="campaign">Campaign</label><select id="campaign"></select>
+          <label for="resume">Résumé</label><select id="resume"></select>
+          <label for="cemail">Contact email</label><input id="cemail" type="email" placeholder="who gets the reach-out">
+          <label for="cname">Contact name</label><input id="cname" placeholder="first name">
+        </div>
+        <div><button class="capture">Capture</button> <button class="save" hidden>Save details</button></div>
+        <div class="muted capture-hint" hidden>Open the job posting page to capture it.</div>
       </div>
-      <div class="fill" hidden>
-        <button class="prep">Prepare answers</button>
+
+      <div class="box mail" hidden>
+        <div class="email-status"></div>
+        <details class="preview" hidden><summary>Preview email</summary><div class="subj"></div><pre class="body"></pre></details>
+      </div>
+
+      <div class="box form" hidden>
+        <div><button class="attach" hidden>Attach résumé</button></div>
+        <label class="muted"><input type="checkbox" class="auto"> Auto-send unanswered questions to Claude after filling</label>
         <div class="rows"></div>
-        <button class="go" hidden>Fill checked</button>
-        <button class="ask" hidden></button>
+        <div><button class="go">Fill checked</button> <button class="ask" hidden></button> <button class="recheck">Re-check answers</button></div>
+      </div>
+
+      <div class="box applied-box">
+        <div class="confirm" hidden></div>
+        <div><button class="applied">Applied</button> <button class="anyway" hidden>Stage anyway</button></div>
       </div>
       <div class="status"></div>
     </div>`;
   const $ = (sel) => root.querySelector(sel);
   // Only a real click from you counts. A page script calling .click() makes an
-  // untrusted event, and filling a form or recording an application (which can
-  // release a held email) must never happen on the page's say-so. The test hook
-  // is safe in Chrome: content scripts run in an isolated world, so the page
+  // untrusted event, and filling a form or recording an application (which
+  // stages an email) must never happen on the page's say-so. The test hook is
+  // safe in Chrome: content scripts run in an isolated world, so the page
   // can't set globals the extension reads.
+  const trusted = (e) => e.isTrusted || globalThis.__slapTrustSyntheticClicksForTests === true;
   const onClick = (sel, fn) => {
     $(sel).onclick = (e) => {
-      if (!e.isTrusted && globalThis.__slapTrustSyntheticClicksForTests !== true) return;
+      if (!trusted(e)) return;
       Promise.resolve(fn(e)).catch((err) => status(String(err.message || err), true));
     };
   };
+  const status = (text, isErr) => { $(".status").textContent = text || ""; $(".status").className = isErr ? "status err" : "status"; };
+  const el = (tag, props, ...kids) => { const e = Object.assign(document.createElement(tag), props); e.append(...kids); return e; };
+  document.documentElement.appendChild(host);
+
   onClick(".x", () => { host.style.display = "none"; });
   // The toolbar icon brings a closed panel back (background.js sends "show").
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg && msg.type === "show") { host.style.display = ""; safeRender(); }
   });
-  document.documentElement.appendChild(host);
 
-  const status = (text, isErr) => { $(".status").textContent = text || ""; $(".status").className = isErr ? "status err" : "status"; };
-  const el = (tag, props, ...kids) => { const e = Object.assign(document.createElement(tag), props); e.append(...kids); return e; };
-
-  let job = null;
-  let lead = null;
-  let chosenTag = null; // your pick in the résumé select survives re-renders
+  let job = null;          // this page's posting (or the one this tab came from)
+  let lead = null;         // slap's record of it
+  let campaigns = [];      // [{name, resumes}]
+  let detailsDirty = false; // your unsaved edits survive re-renders
   let questions = [];
   let plan = [];
-  const safeRender = () => render().catch((e) => status(String(e), true));
-  $(".res select").onchange = (e) => { chosenTag = e.target.value; };
+  let preparedSig = "";
+  let autoAsk = false;
+  const safeRender = () => render().catch((e) => status(String(e.message || e), true));
+
+  chrome.storage.local.get("autoAskClaude").then((v) => { autoAsk = Boolean(v.autoAskClaude); $(".auto").checked = autoAsk; },
+                                                  () => {});
+  $(".auto").onchange = (e) => {
+    if (!trusted(e)) return;
+    autoAsk = e.target.checked;
+    chrome.storage.local.set({ autoAskClaude: autoAsk });
+  };
+  for (const id of ["#campaign", "#resume", "#cemail", "#cname"]) {
+    $(id).addEventListener("input", (e) => { if (trusted(e)) detailsDirty = true; });
+    $(id).addEventListener("change", (e) => { if (trusted(e)) detailsDirty = true; });
+  }
+  $("#campaign").addEventListener("change", () => fillResumeOptions($("#resume").value));
+
+  function fillResumeOptions(preferred) {
+    const camp = campaigns.find((c) => c.name === $("#campaign").value);
+    const tags = camp ? camp.resumes : [];
+    $("#resume").replaceChildren(...tags.map((t) => new Option(t, t, false, t === preferred)));
+  }
+
+  function details() {
+    return { campaign: $("#campaign").value, resume: $("#resume").value,
+             contact_email: $("#cemail").value.trim(), contact_name: $("#cname").value.trim() };
+  }
 
   async function render() {
     const page = extractJob();
@@ -184,67 +232,70 @@
     }
     $(".job").textContent = [job.company, job.role].filter(Boolean).join(" · ") || job.url;
 
-    const [check, resumes] = await Promise.all([
-      send({ type: "check", company: job.company, url: job.url }), send({ type: "resumes" })]);
+    const [check, opts] = await Promise.all([
+      send({ type: "check", company: job.company, url: job.url }), send({ type: "campaignOptions" })]);
     if (!check.ok) return status(check.error, true);
+    if (!opts.ok) return status(opts.error, true);
     lead = check.data.lead;
+    campaigns = opts.data.campaigns;
+
     const lines = L.badgeLines(check.data);
     if (!page && !lead) lines.unshift(`Not tied to a captured posting: anything you record here goes to ${job.url}`);
     $(".lines").replaceChildren(...lines.map((t) => el("div", { textContent: t })));
-    if (!resumes.ok) status(resumes.error, true);
 
-    $(".capture").hidden = Boolean(lead && lead.jd) || !job.jd;
-    const tags = resumes.ok ? resumes.data.resumes.map((r) => r.tag) : [];
-    const preferred = chosenTag || (lead && (lead.applied_resume || lead.resume));
-    $(".res select").replaceChildren(...tags.map((t) => new Option(t, t, false, t === preferred)));
-    $(".res").hidden = !tags.length;
-    $(".mark").hidden = Boolean(lead && lead.applied_resume);
+    // setup: campaign / résumé / contact (left alone while you're editing)
+    const staged = Boolean(lead && lead.staged_to && lead.staged_to.length);
+    if (!detailsDirty) {
+      $("#campaign").replaceChildren(new Option("Choose…", ""),
+        ...campaigns.map((c) => new Option(c.name, c.name, false, lead && c.name === lead.campaign)));
+      fillResumeOptions(lead && (lead.applied_resume || lead.resume));
+      $("#cemail").value = (lead && lead.contact_email) || "";
+      $("#cname").value = (lead && lead.contact_name) || "";
+    }
+    const captured = Boolean(lead && lead.jd);
+    $(".capture").hidden = captured;
+    $(".capture").disabled = !job.jd;
+    $(".capture-hint").hidden = captured || Boolean(job.jd);
+    $(".save").hidden = !lead;
+    for (const id of ["#campaign", "#resume", "#cemail", "#cname"]) $(id).disabled = staged;
+    $(".save").disabled = staged;
+
+    // reach-out status + preview
+    const email = check.data.email;
+    $(".mail").hidden = !lead;
+    $(".email-status").textContent = L.emailStatus(check.data);
+    const showPreview = Boolean(email && email.subject);
+    $(".preview").hidden = !showPreview;
+    if (showPreview) {
+      $(".subj").textContent = `To: ${email.to || "(no contact yet)"} · Subject: ${email.subject} · Attaches ${email.attachment}`;
+      $(".body").textContent = email.body;
+    }
+
+    // application form tools
+    const found = scanForm();
+    $(".form").hidden = !found.length;
     $(".attach").hidden = !resumeInput();
-    $(".fill").hidden = !scanForm().length;
-    $(".confirm").hidden = !(L.isConfirmation(location.href, document.body.innerText) && !(lead && lead.applied_resume));
+    const sig = found.map((q) => q.label).join("|");
+    if (found.length && sig !== preparedSig) await prepare(found, sig);
+
+    $(".applied").hidden = staged;
+    $(".applied").textContent = lead && lead.applied_resume ? "Applied ✓ (stage again)" : "Applied";
+    if (L.isConfirmation(location.href, document.body.innerText) && !(lead && lead.applied_resume)) {
+      status("Looks like you submitted. Click Applied to record it and stage the reach-out.");
+    }
   }
 
-  onClick(".capture", async () => {
-    const r = await send({ type: "capture", job });
-    r.ok ? status(r.data.created ? "Captured. Run slap_leads in Claude Code to match and draft." : "Already captured.")
-         : status(r.error, true);
-    safeRender();
-  });
-
-  onClick(".mark", async () => {
-    const resume = $(".res select").value;
-    const r = await send({ type: "applied", url: job.url, resume });
-    r.ok ? status(`Recorded: applied with "${resume}".`) : status(r.error, true);
-    safeRender();
-  });
-
-  onClick(".attach", async () => {
-    const input = resumeInput();
-    if (!input) return status("The résumé upload field is gone from the page.", true);
-    const tag = $(".res select").value;
-    const [file, profile] = await Promise.all([send({ type: "resumeFile", tag }), send({ type: "profile" })]);
-    if (!file.ok) return status(file.error, true);
-    if (!profile.ok) return status(profile.error, true);
-    const name = profile.data.fields.resume_filename || file.data.filename;
-    const bytes = Uint8Array.from(atob(file.data.base64), (c) => c.charCodeAt(0));
-    const dt = new DataTransfer();
-    dt.items.add(new File([bytes], name, { type: "application/pdf" }));
-    input.files = dt.files;
-    for (const t of ["input", "change"]) input.dispatchEvent(new Event(t, { bubbles: true }));
-    chosenTag = tag;
-    status(`Attached "${tag}" as ${name}. Mark applied with the same résumé after you submit.`);
-  });
-
-  const SOURCE_NOTE = { claude: "Claude", bank: "answer bank", profile: "profile",
-                        sensitive: "sensitive: fill it yourself", eeo: "self-ID: your call, never auto-filled",
-                        null: "no answer yet" };
-
-  onClick(".prep", async () => {
-    await render(); // fresh lead: picks up answers Claude saved since the last render
+  async function prepare(found, sig) {
     const profile = await send({ type: "profile" });
     if (!profile.ok) return status(profile.error, true);
-    questions = scanForm();
-    plan = L.planFill(questions, profile.data, lead && lead.answers);
+    questions = found;
+    preparedSig = sig;
+    try {
+      plan = L.planFill(questions, profile.data, lead && lead.answers);
+    } catch (e) {
+      plan = [];
+      return status(e.message, true);
+    }
     $(".rows").replaceChildren(...plan.map((p, i) => {
       const q = questions[i];
       const locked = p.source === "sensitive" || p.source === "eeo";
@@ -254,17 +305,64 @@
              ...q.options.map((o) => new Option(o, o, false, o === p.value)))
         : el("input", { className: "v", value: p.value || "", disabled: locked });
       value.oninput = value.onchange = () => { box.checked = Boolean(value.value); };
-      return el("div", { className: "row" }, el("label", {}, box, " ", el("b", { textContent: L.displayLabel(p.label), title: p.label })),
-                value, el("div", { className: "src", textContent: SOURCE_NOTE[p.source] }));
+      return el("div", { className: "row" },
+        el("label", {}, box, " ", el("b", { textContent: L.displayLabel(p.label), title: p.label })),
+        value, el("div", { className: "src", textContent: SOURCE_NOTE[p.source] }));
     }));
-    const open = plan.filter((p) => p.source === null).length;
-    $(".go").hidden = !plan.length;
-    $(".ask").hidden = !open || !job.url;
+    const open = openQuestions().length;
+    $(".ask").hidden = !open;
     $(".ask").textContent = `Ask Claude (${open})`;
-    status("Review every value, then Fill checked. You submit the form yourself.");
+  }
+
+  const SOURCE_NOTE = { claude: "Claude", bank: "answer bank", profile: "profile",
+                        sensitive: "sensitive: fill it yourself", eeo: "self-ID: your call, never auto-filled",
+                        null: "no answer yet" };
+
+  const openQuestions = () => questions.filter((q, i) => plan[i] && plan[i].source === null)
+    .map((q) => ({ label: q.label, kind: q.kind, options: q.options || [] }));
+
+  async function askClaude() {
+    const open = openQuestions();
+    if (!open.length) return status("No unanswered questions.");
+    const r = await send({ type: "questions", url: job.url, questions: open });
+    r.ok ? status(`Sent ${open.length} question(s). In Claude Code, ask it to answer this application's questions, then click Re-check answers.`)
+         : status(r.error, true);
+  }
+
+  onClick(".capture", async () => {
+    const r = await send({ type: "capture", job: { ...job, ...details() } });
+    if (!r.ok) return status(r.error, true);
+    detailsDirty = false;
+    status(r.data.created ? "Captured." : "Already captured; details saved.");
+    safeRender();
   });
 
-  onClick(".go", () => {
+  onClick(".save", async () => {
+    const r = await send({ type: "details", url: job.url, ...details() });
+    if (!r.ok) return status(r.error, true);
+    detailsDirty = false;
+    status("Details saved.");
+    safeRender();
+  });
+
+  onClick(".attach", async () => {
+    const input = resumeInput();
+    if (!input) return status("The résumé upload field is gone from the page.", true);
+    const tag = $("#resume").value;
+    if (!tag) return status("Pick a campaign and résumé first.", true);
+    const [file, profile] = await Promise.all([send({ type: "resumeFile", tag }), send({ type: "profile" })]);
+    if (!file.ok) return status(file.error, true);
+    if (!profile.ok) return status(profile.error, true);
+    const name = profile.data.fields.resume_filename || file.data.filename;
+    const bytes = Uint8Array.from(atob(file.data.base64), (c) => c.charCodeAt(0));
+    const dt = new DataTransfer();
+    dt.items.add(new File([bytes], name, { type: "application/pdf" }));
+    input.files = dt.files;
+    for (const t of ["input", "change"]) input.dispatchEvent(new Event(t, { bubbles: true }));
+    status(`Attached "${tag}" as ${name}.`);
+  });
+
+  onClick(".go", async () => {
     let filled = 0;
     root.querySelectorAll(".row").forEach((row, i) => {
       const box = row.querySelector("input[type=checkbox]");
@@ -272,15 +370,50 @@
       if (box.checked && !box.disabled && value && fillOne(questions[i], value)) filled++;
     });
     status(`Filled ${filled} field(s). Check the form, then submit it yourself.`);
+    if (autoAsk && openQuestions().length) await askClaude();
   });
 
-  onClick(".ask", async () => {
-    const open = questions.filter((q, i) => plan[i].source === null)
-      .map((q) => ({ label: q.label, kind: q.kind, options: q.options || [] }));
-    const r = await send({ type: "questions", url: job.url, questions: open });
-    r.ok ? status(`Sent ${open.length} question(s). In Claude Code, run slap_pending_questions, then Prepare answers again.`)
-         : status(r.error, true);
-  });
+  onClick(".ask", askClaude);
+  onClick(".recheck", async () => { preparedSig = ""; await render(); status("Answers re-checked."); });
+
+  async function markApplied(acknowledge) {
+    const resume = $("#resume").value;
+    if (!resume) return status("Pick the campaign and résumé you applied with.", true);
+    const saveDetails = async () => {
+      const saved = lead ? await send({ type: "details", url: job.url, ...details() })
+                         : await send({ type: "capture", job: { ...job, ...details() } });
+      if (saved.ok) detailsDirty = false;
+      return saved;
+    };
+    if (detailsDirty && (lead || job.jd)) {
+      const saved = await saveDetails();
+      if (!saved.ok) return status(saved.error, true);
+    }
+    const apply = () => send({ type: "applied", url: job.url, resume, acknowledge_warnings: acknowledge });
+    let r = await apply();
+    if (!r.ok) return status(r.error, true);
+    if (detailsDirty) { // applied before capturing: the lead exists now, so save details and stage
+      lead = { lead_id: r.data.lead_id };
+      const saved = await saveDetails();
+      if (!saved.ok) return status(saved.error, true);
+      r = await apply();
+      if (!r.ok) return status(r.error, true);
+    }
+    const o = r.data.outreach;
+    $(".confirm").hidden = o.status !== "needs_confirm";
+    $(".anyway").hidden = o.status !== "needs_confirm";
+    if (o.status === "needs_confirm") $(".confirm").textContent = `Before staging: ${o.warnings.join(" · ")}`;
+    status({
+      staged: `Applied with "${resume}". Reach-out staged to ${o.to}; it sends on the next runner.`,
+      already_staged: `Already staged to ${o.to}.`,
+      incomplete: `Applied with "${resume}". The reach-out stages once it has: ${(o.missing || []).join(", ")}.`,
+      needs_confirm: "Applied. Check the warning above, then Stage anyway or leave it.",
+    }[o.status] || `Applied (${o.status}).`);
+    safeRender();
+  }
+
+  onClick(".applied", () => markApplied(false));
+  onClick(".anyway", () => markApplied(true));
 
   // After a submit click, single-page sites (Ashby, Workday) swap in their
   // confirmation without navigating: re-check for a minute.
@@ -289,7 +422,7 @@
     const t = setInterval(() => { safeRender(); if (++n >= 30) clearInterval(t); }, 2000);
   }, true);
 
-  // SPA navigation (Workday): re-render when the URL changes.
+  // SPA navigation (Workday pages): re-render when the URL changes.
   let last = location.href;
   setInterval(() => { if (location.href !== last) { last = location.href; safeRender(); } }, 1000);
 
