@@ -46,6 +46,7 @@ import importlib.util
 import re
 from datetime import date, datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from flask import jsonify, request, send_file
 from flask.json.provider import DefaultJSONProvider
@@ -56,6 +57,27 @@ from slap.config import discover_campaigns
 from slap.domains import check_recipient, contacts_at_company
 from slap.followups import FollowupError, discover_followups, load_followup, save_followup
 from slap.queue import QueueError, resend_bounced
+
+LOCAL_HOSTNAMES = {"127.0.0.1", "localhost", "::1"}
+
+
+def request_block_reason(host: str, origin: str | None, extension_id: str | None) -> str | None:
+    """Why a request to the local API must be refused, or None if allowed.
+    Host must be localhost (defeats DNS rebinding). An Origin, which browsers
+    send on every cross-site request, must be a localhost page or the pinned
+    extension (defeats cross-site form/fetch posts from any open tab).
+    No Origin (curl, the MCP server, same-origin GETs) is fine."""
+    if urlsplit("//" + (host or "")).hostname not in LOCAL_HOSTNAMES:
+        return f"host {host!r} is not localhost"
+    if origin is None:
+        return None
+    parts = urlsplit(origin)
+    if parts.scheme in ("http", "https") and parts.hostname in LOCAL_HOSTNAMES:
+        return None
+    if extension_id and origin == f"chrome-extension://{extension_id}":
+        return None
+    return f"origin {origin!r} is not allowed"
+
 
 # Cache for the lazily-loaded top-level CLI module (slap.py). See _load_cli().
 _cli_module = None
@@ -276,6 +298,12 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, ima
     from slap import dashboard
 
     app.json = ApiJSONProvider(app)
+
+    @app.before_request
+    def _local_only():
+        reason = request_block_reason(request.host, request.headers.get("Origin"), global_config.extension_id)
+        if reason:
+            return jsonify({"error": f"refused: {reason}"}), 403
 
     # --- read endpoints ------------------------------------------------
 

@@ -700,3 +700,34 @@ def test_api_resume_file_serves_send_tag_and_404s_unknown(tmp_path, monkeypatch)
     assert resp.status_code == 200 and resp.data == b"%PDF-1.4 ai" and resp.mimetype == "application/pdf"
     assert c.get("/api/resumes/nope").status_code == 404
     assert c.get("/api/resumes/gone").status_code == 404  # tag defined, file missing
+
+
+# --- local-only request guard (DNS rebinding + cross-site posts) --------------
+
+EXT = "a" * 32
+
+
+@pytest.mark.parametrize("host,origin,ext,blocked", [
+    ("127.0.0.1:5050", None, None, False),                       # curl / MCP / same-origin GET
+    ("localhost:5050", "http://localhost:5173", None, False),    # Vite dev server
+    ("[::1]:5050", "http://[::1]:5050", None, False),
+    ("evil.example:5050", None, None, True),                     # DNS rebinding
+    ("127.0.0.1:5050", "https://evil.example", None, True),      # cross-site post from a tab
+    ("127.0.0.1:5050", "null", None, True),                      # sandboxed iframe / file://
+    ("127.0.0.1:5050", f"chrome-extension://{EXT}", EXT, False), # our extension
+    ("127.0.0.1:5050", f"chrome-extension://{'b' * 32}", EXT, True),  # someone else's
+    ("127.0.0.1:5050", f"chrome-extension://{EXT}", None, True),      # unpinned -> refused
+])
+def test_request_block_reason(host, origin, ext, blocked):
+    from slap.api import request_block_reason
+    assert (request_block_reason(host, origin, ext) is not None) is blocked
+
+
+def test_guard_refuses_cross_site_write_before_it_runs(app):
+    c = app.test_client()
+    resp = c.post("/api/leads", json={"url": "https://x.com/j/1", "jd": "J"},
+                  headers={"Origin": "https://evil.example"})
+    assert resp.status_code == 403
+    assert connect(app.db_path).execute("SELECT COUNT(*) FROM events WHERE type='lead'").fetchone()[0] == 0
+    assert c.get("/api/check", headers={"Host": "evil.example"}).status_code == 403
+    assert c.get("/api/check").status_code == 200

@@ -56,6 +56,11 @@ send_tags:
 # that the MCP server (slap_mcp.py) serves to Claude. Omit if you don't use MCP.
 # references_dir: ~/path/to/reference-files
 
+# Optional — the Chrome extension allowed to call the local dashboard API
+# (chrome://extensions shows its 32-letter ID). Omit and extension requests are
+# refused; localhost pages, curl and the MCP server are always allowed.
+# extension_id: abcdefghijklmnopabcdefghijklmnop
+
 # Optional — the command `slap.py send custom` (and `remind --new`) uses to open
 # a scratch file for authoring. Defaults to "code --wait" if omitted. Use a FULL
 # command: GUI editors need a blocking flag (VS Code: `code --wait`, Sublime:
