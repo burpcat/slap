@@ -559,7 +559,7 @@ def due_for_followup(conn, global_config, *, today: date = None) -> list:
         if next_stage > len(cadence):
             continue  # sequence exhausted
         fire_date = stages.stage_fire_date(
-            datetime.fromisoformat(row["first_sent_at"]).date(), cadence, next_stage)
+            datetime.fromisoformat(row["first_sent_at"]).astimezone().date(), cadence, next_stage)  # local day, as the dashboard counts it
         if fire_date <= today:
             due.append(dict(row))
     return due

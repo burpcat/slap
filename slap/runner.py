@@ -224,7 +224,7 @@ def _estimate_followups_firing_today(conn, global_config, today: date) -> int:
         if next_stage > len(cadence):
             continue  # sequence already exhausted
         fire_date = stages.stage_fire_date(
-            datetime.fromisoformat(row["first_sent_at"]).date(), cadence, next_stage)
+            datetime.fromisoformat(row["first_sent_at"]).astimezone().date(), cadence, next_stage)  # local day, as the dashboard counts it
         if fire_date == today:
             count += 1
     return count
