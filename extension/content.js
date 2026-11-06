@@ -188,7 +188,14 @@
       .row b{font-weight:500;overflow-wrap:anywhere}
       .row .v{height:30px;width:100%;padding:0 8px;border:1px solid var(--border);border-radius:6px;background:var(--bg)}
       .row .v:disabled{background:var(--muted)}
+      .cap{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:20px}
       .src{font-size:11px;color:var(--muted-fg)}
+      .learn{border:0;background:transparent;color:var(--accent);font:inherit;font-size:11px;font-weight:500;cursor:pointer;padding:2px 4px;border-radius:4px}
+      .learn:hover{background:var(--accent-soft)}
+      .learn:focus-visible{outline:2px solid var(--ring);outline-offset:1px}
+      .learnbox{display:flex;flex-direction:column;gap:6px;padding:8px;border-radius:6px;background:var(--muted)}
+      .learnbox label{font-size:11px;color:var(--muted-fg)}
+      .learnbox .btn{height:28px;font-size:12px}
       .src[data-src="claude"]{color:var(--accent)}
       .src[data-src="sensitive"],.src[data-src="eeo"]{color:var(--warn)}
       .ft{border-top:1px solid var(--border);padding:12px 14px;display:flex;flex-direction:column;gap:8px;background:var(--bg)}
@@ -412,14 +419,50 @@
         ? el("select", { className: "v", disabled: locked }, new Option("—", ""),
              ...q.options.map((o) => new Option(o, o, false, o === p.value)))
         : el("input", { className: "v", value: p.value || "", disabled: locked });
-      value.oninput = value.onchange = () => { box.checked = Boolean(value.value); };
-      return el("div", { className: "row" },
+      const note = srcNote(p.source);
+      const learn = el("button", { type: "button", className: "learn", textContent: "Save to bank",
+                                   title: "Fill this answer automatically on future forms" });
+      // Worth saving: Claude's answer, or one you typed/changed. Profile and
+      // bank values are already saved; sensitive/self-ID rows never are.
+      const canLearn = () => !locked && p.source !== "bank" && Boolean(value.value.trim())
+        && (p.source === "claude" || value.value !== String(p.value ?? ""));
+      learn.hidden = !canLearn();
+      value.oninput = value.onchange = () => { box.checked = Boolean(value.value); learn.hidden = !canLearn(); };
+      const row = el("div", { className: "row" },
         el("label", {}, box, " ", el("b", { textContent: L.displayLabel(p.label), title: p.label })),
-        value, srcNote(p.source));
+        value, el("div", { className: "cap" }, note, learn));
+      learn.onclick = (e) => { if (trusted(e)) openLearnBox(row, learn, note, p.label, () => value.value); };
+      return row;
     }));
     const open = openQuestions().length;
     $(".ask").hidden = !open;
     $(".ask").textContent = `Ask Claude (${open})`;
+  }
+
+  function openLearnBox(row, learn, note, label, getAnswer) {
+    if (row.querySelector(".learnbox")) return;
+    const phrase = el("input", { className: "in phrase", value: L.suggestMatch(label) });
+    phrase.setAttribute("aria-label", "Words a question must contain");
+    const save = el("button", { type: "button", className: "btn primary", textContent: "Save" });
+    const cancel = el("button", { type: "button", className: "btn ghost", textContent: "Cancel" });
+    const box = el("div", { className: "learnbox" },
+      el("label", { textContent: "Fill this answer whenever a question contains:" }), phrase,
+      el("div", { className: "actions" }, save, cancel));
+    row.append(box);
+    phrase.focus();
+    cancel.onclick = (e) => { if (trusted(e)) box.remove(); };
+    save.onclick = async (e) => {
+      if (!trusted(e)) return;
+      const words = phrase.value.trim();
+      if (!words) return status("Type the words a matching question contains.", true);
+      const r = await send({ type: "saveAnswer", match: words, answer: getAnswer().trim() });
+      if (!r.ok) return status(r.error, true);
+      box.remove();
+      learn.hidden = true;
+      note.textContent = "answer bank · saved";
+      note.dataset.src = "bank";
+      status(`Saved. Questions containing "${words}" will fill this from now on.`);
+    };
   }
 
   const srcNote = (source) => {

@@ -65,6 +65,7 @@ const baseReplies = (lead) => ({
     work_authorization: "Yes" }, answers: [] } },
   questions: { ok: true, data: { lead_id: "L" } },
   details: { ok: true, data: { lead_id: "L" } },
+  saveAnswer: (m) => ({ ok: true, data: { saved: { match: m.match, answer: m.answer } } }),
   capture: { ok: true, data: { lead_id: "L", created: true } },
   applied: { ok: true, data: { lead_id: "L", outreach: { status: "staged", to: "sam@acme.com" } } },
 });
@@ -113,6 +114,23 @@ test("application page: answers prepared on load, fill, ask Claude, Applied stag
     $(".ask").click(); await tick();
     const q = t.sent.find((m) => m.type === "questions");
     assert.deepEqual(JSON.parse(JSON.stringify(q.questions)).map((x) => x.label), ["Describe a hard bug you fixed", "Location"]);
+
+    // Save to bank: hidden on an unedited profile row, offered once you type an answer
+    const rowFor = (label) => [...root.querySelectorAll(".row")].find((r) => r.querySelector("b").title === label);
+    assert.equal(rowFor("First Name*").querySelector(".learn").hidden, true);
+    const loc = rowFor("Location");
+    assert.equal(loc.querySelector(".learn").hidden, true);              // empty
+    const v = loc.querySelector(".v");
+    v.value = "Boston, MA"; v.dispatchEvent(new t.w.Event("input"));
+    assert.equal(loc.querySelector(".learn").hidden, false);
+    assert.equal(rowFor("Why Acme?").querySelector(".learn").hidden, false); // Claude's answer
+    loc.querySelector(".learn").click();
+    assert.equal(loc.querySelector(".phrase").value, "location");
+    loc.querySelector(".learnbox .primary").click(); await tick();
+    assert.deepEqual(JSON.parse(JSON.stringify(t.sent.find((m) => m.type === "saveAnswer"))),
+      { type: "saveAnswer", match: "location", answer: "Boston, MA" });
+    assert.equal(loc.querySelector(".src").textContent, "answer bank · saved");
+    assert.equal(loc.querySelector(".learnbox"), null);
 
     $(".applied").click(); await tick();
     const a = t.sent.find((m) => m.type === "applied");

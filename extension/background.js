@@ -54,6 +54,8 @@ async function handle(msg, sender) {
       return post("/api/leads/questions", { url: msg.url, questions: msg.questions });
     case "resumeFile":
       return resumeFile(msg.tag);
+    case "saveAnswer":
+      return post("/api/answers", { match: msg.match, answer: msg.answer });
     case "applied":
       return post("/api/leads/applied", { url: msg.url, resume: msg.resume,
                                           acknowledge_warnings: Boolean(msg.acknowledge_warnings) });

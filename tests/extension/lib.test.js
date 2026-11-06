@@ -61,6 +61,15 @@ test("parseJobPosting decodes escaped titles", () => {
   assert.deepEqual(L.parseJobPosting([JSON.stringify(job)]), { role: "Architect, AI & Agentic", company: "A & B", jd: "x" });
 });
 
+test("suggestMatch keeps a question's key words", () => {
+  assert.equal(L.suggestMatch("What is your notice period?"), "notice period");
+  assert.equal(L.suggestMatch("Will you now or in the future require visa sponsorship?*"), "require visa sponsorship");
+  assert.equal(L.suggestMatch("Are you legally authorized to work in the US?"), "legally authorized to work in the us");
+  assert.equal(L.suggestMatch("How many years of Python experience do you have?"), "years of python experience");
+  assert.equal(L.suggestMatch("How did you hear about us?"), "how did you hear about us");
+  assert.equal(L.suggestMatch("Location"), "location");
+});
+
 test("isConfirmation by URL or page text", () => {
   assert.ok(L.isConfirmation("https://boards.greenhouse.io/acme/jobs/9/confirmation", ""));
   assert.ok(L.isConfirmation("https://jobs.lever.co/acme/1/thanks", ""));

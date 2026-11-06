@@ -199,7 +199,20 @@
     return (dot > 0 && dot < 90 ? t.slice(0, dot + 1) : t.slice(0, 87).trimEnd() + "…");
   }
 
-  const api = { canonicalJobUrl, displayLabel, emailStatus, isStepPage, htmlToText, parseJobPosting, isConfirmation, badgeLines,
+  // Question filler trimmed off the front of a label, and dangling words off the end.
+  const LEAD_FILLER = /^(please|what('s| is| are)?|which|how (many|much|long)|do|does|are|is|will|would|can|could|have|has|you|your|the|a|an|tell us|enter|select|provide|list|currently|(now or )?in the future|now)\b\s*/i;
+  const TAIL_FILLER = /\s+((do|did|are|will|would|can|could) you( \w+)?|the|a|an|to|in|of|for|at|with|and|or|your|you)$/i;
+
+  /** Key words of a question label, for "Save to bank": "What is your notice period?" -> "notice period". */
+  function suggestMatch(label) {
+    let t = displayLabel(label).toLowerCase().replace(/[?*:.!]+$/, "").trim();
+    for (let prev = ""; prev !== t;) { prev = t; t = t.replace(LEAD_FILLER, "").trim(); }
+    t = t.split(/\s+/).slice(0, 8).join(" ");
+    for (let prev = ""; prev !== t;) { prev = t; t = t.replace(TAIL_FILLER, ""); }
+    return t;
+  }
+
+  const api = { canonicalJobUrl, displayLabel, emailStatus, suggestMatch, isStepPage, htmlToText, parseJobPosting, isConfirmation, badgeLines,
                 matchOption, planFill };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.slapLib = api;
