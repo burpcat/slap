@@ -54,9 +54,10 @@ from flask.json.provider import DefaultJSONProvider
 
 from slap import archive, gmass_cache, leads, outreach, tracking, ui_state
 from slap.color import campaign_colors
-from slap.config import ConfigError, discover_campaigns, load_campaign
+from slap.config import ConfigError, discover_campaigns, load_campaign, load_global_config
 from slap.domains import check_recipient, contacts_at_company
 from slap.followups import FollowupError, discover_followups, load_followup, save_followup
+from slap.profile import LEARNED_FILE, ProfileError, save_learned
 from slap.queue import QueueError, resend_bounced
 
 LOCAL_HOSTNAMES = {"127.0.0.1", "localhost", "::1"}
@@ -767,6 +768,22 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, ima
         except leads.LeadError as e:
             return jsonify({"error": str(e)}), 400
         return jsonify({"lead_id": lead_id})
+
+    @app.route("/api/answers", methods=["POST"])
+    def api_save_answer():
+        # "Save to bank" from the panel: persist to answers.yaml and take effect
+        # now (no dashboard restart). Config.yaml's own answers keep priority.
+        data = request.get_json(silent=True) or {}
+        try:
+            entry = save_learned(Path(global_config.path).parent / LEARNED_FILE,
+                                 data.get("match", ""), data.get("answer", ""))
+        except ProfileError as e:
+            return jsonify({"error": str(e)}), 400
+        try:  # re-read exactly as startup does: config.yaml answers first, then answers.yaml
+            global_config.profile = load_global_config(global_config.path).profile
+        except ConfigError as e:
+            return jsonify({"error": f"saved, but {global_config.path} no longer loads: {e}"}), 500
+        return jsonify({"saved": entry})
 
     @app.route("/api/profile")
     def api_profile():

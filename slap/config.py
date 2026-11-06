@@ -14,7 +14,7 @@ from pathlib import Path
 
 import yaml
 
-from slap.profile import ProfileError, parse_profile
+from slap.profile import LEARNED_FILE, ProfileError, load_learned, parse_profile
 
 from slap.templates import CONFIG_SOURCED_KEYS, extract_placeholder_keys, find_malformed_placeholders
 
@@ -349,6 +349,7 @@ def load_global_config(path: Path = CONFIG_PATH) -> GlobalConfig:
 
     try:
         profile = parse_profile(raw.get("profile"), path)
+        profile["answers"] += load_learned(Path(path).parent / LEARNED_FILE)  # config.yaml's own answers win
     except ProfileError as e:
         raise ConfigError(str(e)) from e
 

@@ -7,10 +7,19 @@ section, which the browser extension fills forms from (always after review).
 
 `match` is a case-insensitive regex tested against a form question's label
 (the extension runs it as a JavaScript regex).
+
+Answers saved from the extension panel ("Save to bank") live in a separate,
+slap-managed answers.yaml next to config.yaml, so the hand-written config is
+never rewritten. They load after config.yaml's answers, which therefore win.
 """
 from __future__ import annotations
 
 import re
+from pathlib import Path
+
+import yaml
+
+LEARNED_FILE = "answers.yaml"
 
 class ProfileError(Exception):
     """A malformed profile (fail loud, never fill from a guess)."""
@@ -39,3 +48,23 @@ def parse_profile(raw, path="config.yaml") -> dict:
             raise ProfileError(f"{path}: answers[{i}].match is not a valid regex ({e})") from e
     return {"fields": {k: str(v) for k, v in fields.items()},
             "answers": [{"match": a["match"], "answer": a["answer"]} for a in answers]}
+
+
+def load_learned(path: Path) -> list:
+    """Answers saved from the panel: a YAML list of {match, answer}. Missing file -> []."""
+    if not path.exists():
+        return []
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or []
+    return parse_profile({"answers": raw}, str(path))["answers"]
+
+
+def save_learned(path: Path, phrase: str, answer: str) -> dict:
+    """Save one answer, matched on a plain phrase (escaped, so no regex needed).
+    Saving the same phrase again replaces its answer. Returns the entry."""
+    phrase, answer = (phrase or "").strip(), (answer or "").strip()
+    if not phrase or not answer:
+        raise ProfileError("both the matching words and the answer are required")
+    entry = {"match": re.escape(phrase), "answer": answer}
+    entries = [e for e in load_learned(path) if e["match"] != entry["match"]] + [entry]
+    path.write_text(yaml.safe_dump(entries, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    return entry

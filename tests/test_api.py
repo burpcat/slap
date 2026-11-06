@@ -837,3 +837,21 @@ def test_api_extension_flow_capture_details_applied(tmp_path, monkeypatch):
     out = c.post("/api/leads/applied", json={"url": url, "resume": "a"}).get_json()
     assert out["outreach"] == {"status": "staged", "to": "sam@acme.com"}
     assert conn.execute("SELECT COUNT(*) FROM events WHERE type='queued'").fetchone()[0] == 1
+
+
+def test_api_save_answer_takes_effect_without_restart(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.yaml").write_text(
+        "sender: {from_email: a@gmail.com, from_name: A}\nsignature: A\npersonas: {recruiter: {stages: [2]}}\n"
+        "schedule: {fire_window_start: '09:00', fire_window_end: '09:15', send_delay_min: 1, send_delay_max: 1,\n"
+        "  daily_cap: 5, drain_retries: 0, active_days: [mon]}\ntracking: {consumer_domains_file: c.txt}\n"
+        "profile: {fields: {first_name: Ada}}\n")
+    from slap.config import load_global_config
+    cfg = load_global_config(tmp_path / "config.yaml")
+    db_path = tmp_path / "test.db"
+    connect(db_path).close()
+    c = create_app(db_path, cfg, consumer_domains=set(), imap_config="fake-imap", redis_client=FakeRedis()).test_client()
+    assert c.post("/api/answers", json={"match": "notice period", "answer": " "}).status_code == 400
+    assert c.post("/api/answers", json={"match": "notice period", "answer": "Two weeks."}).status_code == 200
+    assert c.get("/api/profile").get_json()["answers"] == [{"match": "notice\\ period", "answer": "Two weeks."}]
+    assert (tmp_path / "answers.yaml").exists()

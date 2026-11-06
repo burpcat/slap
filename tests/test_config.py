@@ -616,3 +616,10 @@ def test_profile_section_parsed_and_validated(tmp_path):
     path.write_text(path.read_text() + "  answers: [{match: '(', answer: x}]\n")
     with pytest.raises(ConfigError, match="profile"):
         load_global_config(path)
+
+
+def test_saved_answers_load_after_config_answers(tmp_path):
+    path = write_global_config(tmp_path)
+    path.write_text(path.read_text() + "profile:\n  fields: {first_name: Ada}\n  answers: [{match: notice, answer: config wins}]\n")
+    (tmp_path / "answers.yaml").write_text("- {match: notice, answer: saved}\n- {match: relocate, answer: 'Yes'}\n")
+    assert [a["answer"] for a in load_global_config(path).profile["answers"]] == ["config wins", "saved", "Yes"]
