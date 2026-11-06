@@ -43,11 +43,15 @@ class FakeIMAP:
             return ("NO", [b""])
         return ("OK", [b" ".join(str(i + 1).encode() for i in range(len(self._messages)))])
 
-    def fetch(self, num, spec):
-        idx = int(num) - 1
-        if idx < 0 or idx >= len(self._messages):
-            return ("NO", [None])
-        return ("OK", [(b"%s (BODY[HEADER])" % num, self._messages[idx])])
+    def fetch(self, msg_set, spec):
+        # imaplib's shape for a range fetch: (envelope, bytes) per message, each followed by b")"
+        self.fetch_calls = getattr(self, "fetch_calls", 0) + 1
+        lo, _, hi = (msg_set.decode() if isinstance(msg_set, bytes) else msg_set).partition(":")
+        out = []
+        for n in range(int(lo), int(hi or lo) + 1):
+            if 1 <= n <= len(self._messages):
+                out += [(b"%d (BODY[HEADER.FIELDS (...)] {%d}" % (n, len(self._messages[n - 1])), self._messages[n - 1]), b")"]
+        return ("OK", out)
 
     def logout(self):
         self.logged_out = True
@@ -174,3 +178,13 @@ def test_poll_bounces_empty_recipients_short_circuits_without_connecting():
     def exploding_factory(*a, **k):
         raise AssertionError("must not connect when there is nothing to match")
     assert poll_bounces(CFG, set(), imap_factory=exploding_factory) == []
+
+
+
+def test_scan_is_one_batched_fetch_newest_first():
+    raws = [_raw(f"<r{i}@corp.com>", in_reply_to=f"<init{i}@gmail.com>") for i in range(400)]
+    fake = FakeIMAP(raws)
+    out = poll_replies(CFG, {f"<init{i}@gmail.com>" for i in range(400)}, imap_factory=fake.factory())
+    assert fake.fetch_calls == 1                         # one round trip, not one per message
+    assert len(out) == 300                               # DEFAULT_SCAN_LIMIT window
+    assert out[0]["reply_message_id"] == "<r399@corp.com>"  # newest first

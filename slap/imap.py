@@ -41,6 +41,9 @@ DEFAULT_TIMEOUT = 30
 # poll fast regardless of total mailbox size — we never need to walk years of
 # history to catch a reply to something we sent this week.
 DEFAULT_SCAN_LIMIT = 300
+# The only headers poll_replies / poll_bounces read.
+HEADER_FIELDS = ("MESSAGE-ID", "IN-REPLY-TO", "REFERENCES", "FROM", "DATE", "SUBJECT", "CONTENT-TYPE",
+                 "X-FAILED-RECIPIENTS")
 
 
 class ImapError(Exception):
@@ -104,13 +107,19 @@ def _scan_recent(imap_config: ImapConfig, scan_limit: int, imap_factory):
             if typ != "OK":
                 raise ImapError(f"IMAP search failed: {typ!r}")
             seq_nums = data[0].split()
-            # search() returns ascending sequence numbers; scan only the most
-            # recent window, newest first.
-            for num in reversed(seq_nums[-scan_limit:]):
-                typ, msg_data = server.fetch(num, "(BODY.PEEK[HEADER])")
-                if typ != "OK" or not msg_data or msg_data[0] is None:
-                    continue
-                yield email.message_from_bytes(msg_data[0][1])
+            window = seq_nums[-scan_limit:]
+            if not window:
+                return
+            # ONE round trip for the whole window, and only the headers the
+            # reply/bounce matchers read. Fetching message by message cost
+            # ~200ms each against Gmail: ~60s per 300-message scan, twice a drain.
+            msg_set = b"%s:%s" % (window[0], window[-1])
+            typ, msg_data = server.fetch(msg_set, f"(BODY.PEEK[HEADER.FIELDS ({' '.join(HEADER_FIELDS)})])")
+            if typ != "OK":
+                raise ImapError(f"IMAP fetch failed: {typ!r}")
+            headers = [part[1] for part in msg_data or [] if isinstance(part, tuple) and len(part) == 2]
+            for raw in reversed(headers):  # newest first
+                yield email.message_from_bytes(raw)
         finally:
             try:
                 server.logout()
