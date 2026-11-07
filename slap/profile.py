@@ -1,19 +1,20 @@
-"""The owner's application-form profile: config.yaml's optional `profile:`
-section, which the browser extension fills forms from (always after review).
+"""The owner's standard application answers: config.yaml's optional
+`profile:` section, which Claude reads (slap_mcp's slap_profile) when the
+owner pastes an application form's questions.
 
     profile:
       fields:   {first_name: Ada, email: ..., current_company: ..., work_authorization: ...}
       answers:  [{match: "notice period|start date", answer: "Two weeks"}, ...]
 
-`match` is a case-insensitive regex tested against a form question's label
-(the extension runs it as a JavaScript regex).
+`match` is a case-insensitive regex naming the questions an answer is for.
 
-Answers saved from the extension panel ("Save to bank") live in a separate,
+Answers saved through slap_save_answer live in a separate,
 slap-managed answers.yaml next to config.yaml, so the hand-written config is
 never rewritten. They load after config.yaml's answers, which therefore win.
 """
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -51,10 +52,13 @@ def parse_profile(raw, path="config.yaml") -> dict:
 
 
 def load_learned(path: Path) -> list:
-    """Answers saved from the panel: a YAML list of {match, answer}. Missing file -> []."""
+    """Saved answers: a YAML list of {match, answer}. Missing file -> []."""
     if not path.exists():
         return []
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or []
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or []
+    except yaml.YAMLError as e:
+        raise ProfileError(f"{path} is not valid YAML ({e})") from e
     return parse_profile({"answers": raw}, str(path))["answers"]
 
 
@@ -66,5 +70,7 @@ def save_learned(path: Path, phrase: str, answer: str) -> dict:
         raise ProfileError("both the matching words and the answer are required")
     entry = {"match": re.escape(phrase), "answer": answer}
     entries = [e for e in load_learned(path) if e["match"] != entry["match"]] + [entry]
-    path.write_text(yaml.safe_dump(entries, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    tmp = path.with_name(path.name + ".tmp")  # whole file or nothing: config loading (and the runner) reads it
+    tmp.write_text(yaml.safe_dump(entries, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    os.replace(tmp, path)
     return entry

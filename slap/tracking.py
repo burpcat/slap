@@ -125,9 +125,9 @@ CONTROL_SHEET.md, revisit when steps 6/9/10 wire in real callers):
   Cache-inert (`_apply_event_to_cache` bumps only last_event_at, like `click`)
   — never a status transition, so it needs no changes to any active-only query;
   its current-state is derived live from the log by dashboard read helpers.
-- `lead` (post-MCP: browser-extension job capture, `slap.leads`). One new
+- `lead` (post-MCP: job capture through Claude Code, `slap.leads`). One new
   CHECK literal for the whole lead lifecycle, discriminated by
-  `meta["stage"]` ∈ {captured, matched, applied} and keyed by
+  `meta["stage"]` (slap.leads.STAGES) and keyed by
   `meta["lead_id"]` (the `interaction`/`channel` precedent). Recipientless
   (a lead exists before any contact address does) and cache-inert; current
   lead state is the latest event per lead_id, derived live by slap.leads.

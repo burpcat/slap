@@ -691,7 +691,7 @@ def test_api_companies_index_and_timeline(app):
     conn = connect(app.db_path)
     t0 = datetime(2026, 11, 1, tzinfo=timezone.utc)
     lead_id, _ = leads.capture(conn, url="https://jobs.lever.co/acme/1", jd="JD", company="Acme", role="ml eng")
-    leads.mark_applied(conn, url="https://jobs.lever.co/acme/1", resume="ai")
+    leads.mark_applied(conn, lead_id, resume="ai")
     append_event(conn, type="queued", recipient="jane@acme.com", campaign="hm", stage=0,
                  meta={"persona": "recruiter", "company": "acme"}, timestamp=t0 + timedelta(days=10))
     append_event(conn, type="sent", recipient="jane@acme.com", campaign="hm", stage=0,

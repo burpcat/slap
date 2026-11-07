@@ -1,14 +1,15 @@
-"""The extension flow end to end at the slap level: capture (with campaign,
-résumé, contact) -> Claude writes the drop -> applying stages the reach-out,
-exactly once. MCP tool functions are called directly (MCPServer.tool()
-returns the undecorated function)."""
+"""The whole flow through the MCP tools, as Claude Code drives it: capture
+(with the owner's campaign, résumé, contact) -> Claude writes the drop ->
+the owner applies -> slap_applied stages the reach-out, exactly once. Tool
+functions are called directly (MCPServer.tool() returns the undecorated
+function)."""
 import json
 
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
 import slap_mcp
-from slap import leads, outreach, runner, smtp, tracking
+from slap import runner, smtp, tracking
 from slap.config import load_global_config
 from slap.latex import recipient_workdir
 from slap.queue import load_manifest
@@ -72,18 +73,14 @@ def repo(tmp_path, monkeypatch):
 
 
 def _capture(**details):
-    conn = tracking.connect()
-    lead_id, _ = leads.capture(conn, url=JOB, jd="Build agents", company="Acme", role="ML Engineer",
-                               **{"campaign": "test-hm", "resume": "resume-a", "contact_email": CONTACT,
-                                  "contact_name": "Sam", **details})
-    return conn, lead_id
+    app = slap_mcp.slap_capture(**{"url": JOB, "jd": "Build agents", "company": "Acme", "role": "ML Engineer",
+                                   "campaign": "test-hm", "resume": "resume-a", "contact_email": CONTACT,
+                                   "contact_name": "Sam", **details})
+    return tracking.connect(), app["lead_id"]
 
 
-def _apply(conn, resume="resume-a"):
-    """What POST /api/leads/applied does."""
-    pdf = "docs/a.pdf" if resume == "resume-a" else "docs/b.pdf"
-    lead_id = leads.mark_applied(conn, url=JOB, resume=resume, resume_sha256=outreach._sha256(pdf))
-    return outreach.stage(conn, load_global_config(), lead_id)
+def _apply(lead_id, resume="resume-a", to=CONTACT, **kw):
+    return slap_mcp.slap_applied(lead_id, resume, to, **kw)
 
 
 def _queued(conn):
@@ -97,59 +94,97 @@ def test_application_is_the_current_one_and_only_one(repo):
     with pytest.raises(ToolError, match="capture a posting"):
         slap_mcp.slap_application()
     _, lead_id = _capture()
-    leads.capture(tracking.connect(), url="https://jobs.lever.co/other/9", jd="Other JD", company="Other")
+    other = slap_mcp.slap_capture("https://jobs.lever.co/other/9", jd="Other JD", company="Other")
+    assert other["created"] and "jd" not in other  # Claude already has the JD it passed in
     app = slap_mcp.slap_application()  # the most recently touched one
-    assert app["company"] == "Other" and app["campaign"] is None and "no campaign" in app["drop"]
+    assert app["company"] == "Other" and app["campaign"] is None and "campaign_options" in app["drop"]
+    assert app["campaign_options"] == [{"name": "test-hm", "persona": "hiring_manager",
+                                        "resumes": ["resume-a", "resume-b"]}]
     app = slap_mcp.slap_application(lead_id)
     assert app["company"] == "Acme" and app["status"].startswith("not applied")
     assert [f["key"] for f in app["drop_fields"]] == ["role_catted", "company", "why_line", "signal"]
     assert app["stars"] == [{"id": "s1", "title": "Shipped X", "tags": ["llm"]}]
     assert app["email_preview"]["missing"] == ["why_line"]
+    assert app["warnings"] == []
     assert "jobs.lever.co/other" not in json.dumps(app)  # nothing about the other application
+
+
+def test_capture_validates_the_owners_picks_and_updates_without_the_jd(repo):
+    with pytest.raises(ToolError, match="unknown campaign 'nope'.*test-hm"):
+        _capture(campaign="nope")
+    with pytest.raises(ToolError, match="jd is empty"):
+        _capture(jd="")
+    conn, lead_id = _capture(resume="", contact_email="", contact_name="")
+    with pytest.raises(ToolError, match="doesn't offer résumé 'resume-z'"):
+        slap_mcp.slap_capture(JOB, resume="resume-z")  # checked against the lead's campaign
+    app = slap_mcp.slap_capture(JOB, contact_email=CONTACT, contact_name="Sam")  # no JD the second time
+    assert not app["created"] and app["contact"] == {"email": CONTACT, "name": "Sam"}
+    assert conn.execute("SELECT COUNT(*) FROM events WHERE type='lead'").fetchone()[0] == 2
 
 
 def test_drop_before_applied_then_applying_stages_once(repo):
     conn, lead_id = _capture()
     out = slap_mcp.slap_save_drop(lead_id, DROP)
-    assert out["outreach"] == {"status": "not_applied"}
+    assert out["status"].startswith("not applied")
     assert out["email"]["subject"] == "Your ml engineer opening at Acme"
     assert "Hi Sam," in out["email"]["body"] and out["email"]["missing"] == []
     assert _queued(conn) == []
 
-    assert _apply(conn) == {"status": "staged", "to": CONTACT}
+    assert _apply(lead_id) == {"status": "staged", "to": CONTACT}
     (row,) = _queued(conn)
     assert row["recipient"] == CONTACT and json.loads(row["meta"])["lead_id"] == lead_id
     manifest = load_manifest(recipient_workdir("test-hm", CONTACT))
     assert manifest["subject"] == out["email"]["subject"] and manifest["stage_bodies"] == ["Bump Sam", "Last Sam"]
 
-    assert _apply(conn)["status"] == "already_staged"
+    assert _apply(lead_id)["status"] == "already_staged"
     with pytest.raises(ToolError, match="already staged"):
         slap_mcp.slap_save_drop(lead_id, DROP)
     assert len(_queued(conn)) == 1
 
 
-def test_applied_first_then_saving_the_drop_stages(repo):
+def test_applied_first_then_the_drop_then_applied_again_stages(repo):
     conn, lead_id = _capture()
-    assert _apply(conn) == {"status": "incomplete", "missing": ["why_line"]}
-    assert slap_mcp.slap_save_drop(lead_id, DROP)["outreach"] == {"status": "staged", "to": CONTACT}
+    assert _apply(lead_id) == {"status": "incomplete", "missing": ["why_line"]}
+    out = slap_mcp.slap_save_drop(lead_id, DROP)  # saving never stages
+    assert out["status"].startswith("applied with résumé 'resume-a'") and _queued(conn) == []
+    assert _apply(lead_id) == {"status": "staged", "to": CONTACT}
+
+
+def test_applied_must_name_the_contact_it_goes_to(repo):
+    conn, lead_id = _capture()
+    slap_mcp.slap_save_drop(lead_id, DROP)
+    with pytest.raises(ToolError, match="goes to the application's contact"):
+        _apply(lead_id, to="someone+slaptest@gmail.com")
+    assert _queued(conn) == []
+    assert _apply(lead_id, to=CONTACT.upper())["status"] == "staged"
 
 
 def test_no_contact_waits_and_details_unblock_it(repo):
-    conn, lead_id = _capture(contact_email=None)
+    _, lead_id = _capture(contact_email="")
     slap_mcp.slap_save_drop(lead_id, DROP)
-    assert _apply(conn) == {"status": "incomplete", "missing": ["contact email"]}
-    leads.set_details(conn, lead_id, contact_email=CONTACT)
-    assert outreach.stage(conn, load_global_config(), lead_id)["status"] == "staged"
+    assert _apply(lead_id, to="") == {"status": "incomplete", "missing": ["contact email"]}
+    slap_mcp.slap_capture(JOB, contact_email=CONTACT)
+    assert _apply(lead_id)["status"] == "staged"
 
 
 def test_already_contacted_needs_confirm(repo):
     conn, lead_id = _capture()
-    tracking.append_event(conn, type="queued", recipient=CONTACT, campaign="old", stage=0, meta={"persona": "x"})
+    tracking.append_event(conn, type="queued", recipient=CONTACT, campaign="old", stage=0,
+                          meta={"persona": "x", "company": "Acme"})
     tracking.append_event(conn, type="sent", recipient=CONTACT, campaign="old", stage=0, message_id="<o@x>")
+    assert slap_mcp.slap_application(lead_id)["warnings"][0].startswith("Already contacted " + CONTACT)
     slap_mcp.slap_save_drop(lead_id, DROP)
-    out = _apply(conn)
+    out = _apply(lead_id)
     assert out["status"] == "needs_confirm" and out["warnings"][0].startswith("Already contacted")
-    assert slap_mcp.slap_save_drop(lead_id, DROP, acknowledge_warnings=True)["outreach"]["status"] == "staged"
+    assert _apply(lead_id, acknowledge_warnings=True)["status"] == "staged"
+
+
+def test_someone_else_at_the_company_is_a_warning(repo):
+    conn, lead_id = _capture()
+    tracking.append_event(conn, type="queued", recipient="jane+slaptest@gmail.com", campaign="old", stage=0,
+                          meta={"persona": "x", "company": "acme "})
+    (warning,) = slap_mcp.slap_application(lead_id)["warnings"]
+    assert warning.startswith("Already contacted at Acme: jane+slaptest@gmail.com")
 
 
 def test_drop_rejects_unknown_fields_and_contact_keys(repo):
@@ -160,20 +195,42 @@ def test_drop_rejects_unknown_fields_and_contact_keys(repo):
         slap_mcp.slap_save_drop(lead_id, {"why_lin": "typo"})
 
 
+def test_applied_needs_a_resume_the_campaign_offers(repo):
+    conn, lead_id = _capture()
+    with pytest.raises(ToolError, match="unknown résumé tag 'resume-z'"):
+        _apply(lead_id, resume="resume-z")
+    narrow = repo / "campaigns" / "test-narrow"
+    narrow.mkdir()
+    for f in (repo / "campaigns" / "test-hm").iterdir():
+        (narrow / f.name).write_text(f.read_text())
+    (narrow / "campaign.yaml").write_text(CAMPAIGN + "resumes: [resume-a]\n")
+    with pytest.raises(ToolError, match="doesn't offer résumé 'resume-b'"):
+        slap_mcp.slap_capture(JOB, campaign="test-narrow", resume="resume-b")
+    slap_mcp.slap_capture(JOB, campaign="test-narrow")  # keeps resume-a, which it offers
+    with pytest.raises(ToolError, match="doesn't offer résumé 'resume-b'"):
+        _apply(lead_id, resume="resume-b")
+    assert slap_mcp.slap_application(lead_id)["status"].startswith("not applied")  # nothing recorded
+    _apply(lead_id)
+    with pytest.raises(ToolError, match="already applied with résumé 'resume-a'"):
+        slap_mcp.slap_capture(JOB, resume="resume-b")
+
+
 def test_resume_edited_after_applying_is_refused(repo):
     conn, lead_id = _capture()
-    slap_mcp.slap_save_drop(lead_id, DROP)
-    leads.mark_applied(conn, url=JOB, resume="resume-a", resume_sha256=outreach._sha256("docs/a.pdf"))
+    _apply(lead_id)  # incomplete: no drop yet, but the PDF's hash is pinned
     (repo / "docs" / "a.pdf").write_bytes(b"%PDF-1.4 edited")
-    with pytest.raises(outreach.OutreachError, match="changed since you applied"):
-        outreach.stage(conn, load_global_config(), lead_id)
+    slap_mcp.slap_save_drop(lead_id, DROP)
+    with pytest.raises(ToolError, match="changed since you applied"):
+        _apply(lead_id)  # re-applying can't quietly re-pin the new bytes
     assert _queued(conn) == []
+    (repo / "docs" / "a.pdf").write_bytes(b"%PDF-1.4 resume a")  # restored
+    assert _apply(lead_id)["status"] == "staged"
 
 
 def test_applied_resume_is_the_one_attached(repo):
-    conn, lead_id = _capture()
+    _, lead_id = _capture()
     slap_mcp.slap_save_drop(lead_id, DROP)
-    assert _apply(conn, resume="resume-b")["status"] == "staged"
+    assert _apply(lead_id, resume="resume-b")["status"] == "staged"
     manifest = load_manifest(recipient_workdir("test-hm", CONTACT))
     snapshot = manifest["attachment_source"]
     assert snapshot.endswith("applied-resume.pdf")
@@ -183,7 +240,7 @@ def test_applied_resume_is_the_one_attached(repo):
 def test_editing_docs_after_staging_doesnt_change_what_is_sent(repo):
     conn, lead_id = _capture()
     slap_mcp.slap_save_drop(lead_id, DROP)
-    _apply(conn)
+    _apply(lead_id)
     (repo / "docs" / "a.pdf").write_bytes(b"%PDF-1.4 re-exported for another job")
     attached = []
 
@@ -201,16 +258,16 @@ def test_contact_with_an_unsent_reach_out_is_busy(repo):
     conn, lead_id = _capture()
     tracking.append_event(conn, type="queued", recipient=CONTACT, campaign="other", stage=0, meta={"persona": "x"})
     slap_mcp.slap_save_drop(lead_id, DROP)
-    out = _apply(conn)
+    out = _apply(lead_id)
     assert out["status"] == "busy" and "already has an unsent reach-out" in out["reason"]
 
 
 def test_staged_application_cant_switch_resume(repo):
-    conn, lead_id = _capture()
+    _, lead_id = _capture()
     slap_mcp.slap_save_drop(lead_id, DROP)
-    _apply(conn)
-    with pytest.raises(leads.LeadError, match="already staged"):
-        leads.mark_applied(conn, url=JOB, resume="resume-b", resume_sha256=outreach._sha256("docs/b.pdf"))
+    _apply(lead_id)
+    with pytest.raises(ToolError, match="already staged"):
+        _apply(lead_id, resume="resume-b")
 
 
 def test_empty_lead_id_is_refused_for_writes(repo):
@@ -218,23 +275,30 @@ def test_empty_lead_id_is_refused_for_writes(repo):
     with pytest.raises(ToolError, match="lead_id is required"):
         slap_mcp.slap_save_drop("", DROP)
     with pytest.raises(ToolError, match="lead_id is required"):
-        slap_mcp.slap_answer_questions("", {"x": "y"})
+        slap_mcp.slap_applied("", "resume-a", CONTACT)
 
 
-def test_questions_roundtrip(repo):
-    conn, lead_id = _capture()
-    leads.record_questions(conn, url=JOB, questions=[{"label": "Why Acme?", "kind": "textarea"}])
-    assert slap_mcp.slap_application()["open_questions"][0]["label"] == "Why Acme?"
-    slap_mcp.slap_answer_questions(lead_id, {"Why Acme?": "Agents."})
-    assert slap_mcp.slap_application()["open_questions"] == []
-    with pytest.raises(ToolError, match="not among"):
-        slap_mcp.slap_answer_questions(lead_id, {"Typo?": "x"})
+def test_profile_and_answer_bank(repo):
+    with pytest.raises(ToolError, match="no profile yet"):
+        slap_mcp.slap_profile()
+    with pytest.raises(ToolError, match="required"):
+        slap_mcp.slap_save_answer("notice period", " ")
+    assert slap_mcp.slap_save_answer("notice period", "Two weeks.") == {"match": "notice\\ period",
+                                                                        "answer": "Two weeks."}
+    slap_mcp.slap_save_answer("notice period", "Three weeks.")  # same words: replaced
+    assert slap_mcp.slap_profile() == {"fields": {}, "answers": [{"match": "notice\\ period",
+                                                                  "answer": "Three weeks."}]}
+    (repo / "config.yaml").write_text(CONFIG + "profile: {fields: {first_name: Test}, answers: "
+                                               "[{match: notice period, answer: One week.}]}\n")
+    profile = slap_mcp.slap_profile()
+    assert profile["fields"] == {"first_name": "Test"}
+    assert profile["answers"][0]["answer"] == "One week."  # config.yaml's own answers win
 
 
 def test_staged_reach_out_sends_on_the_next_drain(repo):
     conn, lead_id = _capture()
     slap_mcp.slap_save_drop(lead_id, DROP)
-    _apply(conn)
+    _apply(lead_id)
     sent = []
 
     def send_message_fn(smtp_config, *, recipient, attachment=None, **kw):

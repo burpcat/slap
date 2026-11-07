@@ -906,7 +906,7 @@ def test_message_id_migration_is_idempotent(tmp_path):
     connect(path).close()  # second connect on an already-migrated db must not raise
 
 
-# --- 'lead' event type (browser-extension job capture) ------------------------
+# --- 'lead' event type (job capture through Claude Code) ----------------------
 
 def test_lead_is_recipientless_and_cache_inert(conn):
     append_event(conn, type="lead", meta={"lead_id": "L1", "stage": "captured", "url": "https://x/job"})

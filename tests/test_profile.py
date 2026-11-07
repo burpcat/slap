@@ -35,3 +35,7 @@ def test_saved_answers_replace_by_phrase_and_escape_regex(tmp_path):
     assert re.search(learned[1]["match"], "How many C++ (years) of experience?", re.I)
     with pytest.raises(ProfileError, match="required"):
         save_learned(path, " ", "x")
+    assert sorted(f.name for f in tmp_path.iterdir()) == ["answers.yaml"]  # no temp file left behind
+    path.write_text("- match: [unclosed\n")
+    with pytest.raises(ProfileError, match="not valid YAML"):  # a hand-edit typo fails loud, as a ProfileError
+        load_learned(path)

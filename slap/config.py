@@ -169,7 +169,8 @@ class GlobalConfig:
     # server serves to Claude. Optional: None -> slap_mcp's reference tools
     # fail loud when called; nothing else reads it.
     references_dir: Path | None = None
-    # Form-fill profile for the browser extension (slap.profile.parse_profile).
+    # The owner's standard application answers, served to Claude by slap_mcp
+    # (slap.profile.parse_profile).
     profile: dict = field(default_factory=lambda: {"fields": {}, "answers": []})
 
 

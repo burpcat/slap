@@ -1,11 +1,11 @@
 """A captured lead's reach-out email: rendered from its campaign's templates
-plus the drop Claude wrote and the contact from the panel, and staged ONLY
-once the owner has applied (the hard rule of the extension flow).
+plus the drop Claude wrote and the contact the owner gave, and staged ONLY
+once the owner has applied (the hard rule of this flow).
 
-Callers: slap.api (the panel's Applied button) and slap_mcp (saving a drop
-after the application was already recorded). Both route through stage(),
-which is idempotent per lead and serialised across processes by a file lock,
-so the same posting can never be staged twice.
+Caller: slap_mcp's slap_applied, the only way anything stages. apply() is
+idempotent per lead and serialised across processes by a file lock (every
+Claude Code session runs its own MCP server), so the same posting can never
+be staged twice.
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import shutil
 from pathlib import Path
 
 from slap import archive, doctor, domains, leads
-from slap.config import ConfigError, load_campaign
+from slap.config import ConfigError, discover_campaigns, load_campaign
 from slap.latex import WORKDIR_ROOT, recipient_workdir
 from slap.queue import due_recipients, stage_recipient
 from slap.templates import fill_template, merge_config_values
@@ -43,6 +43,36 @@ def dedup_warnings(conn, global_config, recipient: str) -> list:
     return warnings
 
 
+def campaign_options(global_config) -> list:
+    """The campaigns a lead can use (static-résumé ones) and their résumés.
+    A campaign that doesn't load is listed with its error, not hidden."""
+    options = []
+    for name in discover_campaigns():
+        try:
+            camp = load_campaign(name, global_config)
+        except ConfigError as e:
+            options.append({"name": name, "error": str(e)})
+            continue
+        if not camp.latex_enabled:
+            options.append({"name": name, "persona": camp.persona, "resumes": list(camp.resume_paths)})
+    return options
+
+
+def check_details(details: dict, global_config) -> None:
+    """Campaign and résumé names checked against the real campaigns and
+    send_tags before they're recorded on a lead (OutreachError on a bad one)."""
+    campaign, resume = details.get("campaign"), details.get("resume")
+    if campaign:
+        if campaign not in discover_campaigns():
+            raise OutreachError(f"unknown campaign {campaign!r} (options: {campaign_options(global_config)})")
+        camp = campaign_for({"campaign": campaign}, global_config)
+        if resume and resume not in camp.resume_paths:
+            raise OutreachError(f"campaign '{camp.name}' doesn't offer résumé '{resume}' "
+                                f"(offers: {list(camp.resume_paths)})")
+    elif resume and resume not in global_config.send_tags:
+        raise OutreachError(f"unknown résumé tag {resume!r} (known: {sorted(global_config.send_tags)})")
+
+
 def campaign_for(lead, global_config):
     if not lead["campaign"]:
         return None
@@ -51,14 +81,14 @@ def campaign_for(lead, global_config):
     except ConfigError as e:
         raise OutreachError(str(e)) from e
     if camp.latex_enabled:
-        raise OutreachError(f"campaign '{camp.name}' compiles LaTeX per recipient; the extension flow "
+        raise OutreachError(f"campaign '{camp.name}' compiles LaTeX per recipient; this flow "
                             f"needs a static-résumé campaign")
     return camp
 
 
 def drop_fields(camp) -> list:
     """The fields Claude writes. Email and the greeting name come from the
-    panel's contact, so they're not part of the drop."""
+    lead's contact, so they're not part of the drop."""
     return [f for f in camp.fields if f.key not in ("email", camp.name_field)]
 
 
@@ -102,58 +132,76 @@ def public(rendered: dict) -> dict:
     return {k: v for k, v in rendered.items() if not k.startswith("_")}
 
 
-def stage(conn, global_config, lead_id: str, *, acknowledge_warnings: bool = False,
+def apply(conn, global_config, lead_id: str, resume: str, *, to: str, acknowledge_warnings: bool = False,
           workdir_root: Path = WORKDIR_ROOT) -> dict:
-    """Stage this lead's reach-out if it's ready. Returns {"status": ...}:
-    staged | already_staged | not_applied | incomplete (+missing) |
-    busy (+reason) | needs_confirm (+warnings). Never stages twice, and
-    snapshots the applied résumé's bytes so a later edit in docs/ can't
-    change what the company receives."""
+    """The owner applied with résumé `resume` (a send_tag): pin that PDF's
+    bytes on the lead, then stage the reach-out to `to` if the drop and
+    contact are ready. `to` must be the lead's contact, so the caller's
+    confirm names the recipient. Returns {"status": ...}: staged |
+    already_staged | incomplete (+missing) | busy (+reason) | needs_confirm
+    (+warnings). Never stages twice, and snapshots the applied résumé's bytes
+    so a later edit in docs/ can't change what the company receives."""
+    lead = leads.get(conn, lead_id)
+    if lead is None:
+        raise OutreachError(f"unknown lead {lead_id!r}")
+    if resume not in global_config.send_tags:
+        raise OutreachError(f"unknown résumé tag {resume!r} (known: {sorted(global_config.send_tags)})")
+    camp = campaign_for(lead, global_config)
+    if camp and resume not in camp.resume_paths:
+        raise OutreachError(f"campaign '{camp.name}' doesn't offer résumé '{resume}' "
+                            f"(offers: {list(camp.resume_paths)})")
+    path = Path(global_config.docs_dir) / global_config.send_tags[resume]
+    if not path.is_file():
+        raise OutreachError(f"{path} not found")
     workdir_root.mkdir(parents=True, exist_ok=True)
     with open(workdir_root / LOCK_FILE, "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)  # dashboard + MCP server are separate processes
-        lead = leads.get(conn, lead_id)
-        if lead is None:
-            raise OutreachError(f"unknown lead {lead_id!r}")
-        if lead["staged_to"]:
-            return {"status": "already_staged", "to": lead["staged_to"][0]}
-        if not lead["applied_resume"]:
-            return {"status": "not_applied"}
-        r = render(lead, global_config)
-        if r["missing"]:
-            return {"status": "incomplete", "missing": r["missing"]}
-        if r["to"] in {row["recipient"] for row in due_recipients(conn)}:
-            return {"status": "busy", "reason": f"{r['to']} already has an unsent reach-out queued; "
-                                                f"stage this one after that sends"}
-        warnings = dedup_warnings(conn, global_config, r["to"])
-        if warnings and not acknowledge_warnings:
-            return {"status": "needs_confirm", "warnings": warnings, "email": public(r)}
-        camp, values = r["_camp"], r["_values"]
-        failures = [c for c in doctor.run_global_checks(global_config, conn) + doctor.run_campaign_checks(camp)
-                    if not c.ok]
-        if failures:
-            raise OutreachError("doctor preflight failed: " + "; ".join(f"{c.name}: {c.detail}" for c in failures))
-        attachment = camp.resume_paths[r["resume"]]
-        if not lead["applied_sha256"]:
-            raise OutreachError("this application has no recorded résumé hash; click Applied again in the panel")
-        if _sha256(attachment) != lead["applied_sha256"]:
-            raise OutreachError(f"résumé file {attachment} changed since you applied; the email would attach "
-                                f"a different PDF than the company got")
-        # Snapshot the exact bytes you applied with: the runner reads this copy at
-        # send time, not docs/, which you may re-export before the next drain.
-        snapshot = recipient_workdir(camp.name, r["to"], root=workdir_root) / "applied-resume.pdf"
-        shutil.copyfile(attachment, snapshot)
-        attachment = snapshot
-        stage_recipient(
-            conn, campaign=camp.name, recipient=r["to"], persona=camp.persona, cadence=camp.cadence,
-            subject=r["subject"], body=r["body"], stage_bodies=[f["body"] for f in r["followups"]],
-            attachment_path=attachment, attachment_name=camp.attachment_name, latex_enabled=False,
-            company=lead["company"], role=values.get("role_catted", lead["role"]),
-            name=values.get(camp.name_field, "") if camp.name_field else "",
-            archive_dir=archive.archive_dir_from_env(), field_values=values, workdir_root=workdir_root,
-            extra_meta={"lead_id": lead_id, "resume": r["resume"]},
-        )
-        return {"status": "staged", "to": r["to"]}
+        fcntl.flock(lock, fcntl.LOCK_EX)  # one MCP server process per Claude Code session
+        leads.mark_applied(conn, lead_id, resume=resume, resume_sha256=_sha256(path))
+        return _stage(conn, global_config, leads.get(conn, lead_id), to=to,
+                      acknowledge_warnings=acknowledge_warnings, workdir_root=workdir_root)
+
+
+def _stage(conn, global_config, lead, *, to, acknowledge_warnings, workdir_root) -> dict:
+    """apply()'s second half, under its lock."""
+    if lead["staged_to"]:
+        return {"status": "already_staged", "to": lead["staged_to"][0]}
+    r = render(lead, global_config)
+    if r["missing"]:
+        return {"status": "incomplete", "missing": r["missing"]}
+    if r["to"].lower() != (to or "").strip().lower():
+        raise OutreachError(f"this reach-out goes to the application's contact {r['to']}, not {to!r}; "
+                            f"check the contact with the owner")
+    if r["to"] in {row["recipient"] for row in due_recipients(conn)}:
+        return {"status": "busy", "reason": f"{r['to']} already has an unsent reach-out queued; "
+                                            f"stage this one after that sends"}
+    warnings = dedup_warnings(conn, global_config, r["to"])
+    if warnings and not acknowledge_warnings:
+        return {"status": "needs_confirm", "warnings": warnings, "email": public(r)}
+    camp, values = r["_camp"], r["_values"]
+    failures = [c for c in doctor.run_global_checks(global_config, conn) + doctor.run_campaign_checks(camp)
+                if not c.ok]
+    if failures:
+        raise OutreachError("doctor preflight failed: " + "; ".join(f"{c.name}: {c.detail}" for c in failures))
+    if not lead["applied_sha256"]:
+        raise OutreachError("this application has no recorded résumé hash; record it again with slap_applied")
+    # Snapshot the exact bytes you applied with, then verify the snapshot: the
+    # runner reads this copy at send time, not docs/, which you may re-export.
+    snapshot = recipient_workdir(camp.name, r["to"], root=workdir_root) / "applied-resume.pdf"
+    shutil.copyfile(camp.resume_paths[r["resume"]], snapshot)
+    if _sha256(snapshot) != lead["applied_sha256"]:
+        snapshot.unlink()
+        raise OutreachError(f"résumé file {camp.resume_paths[r['resume']]} changed since you applied; the email "
+                            f"would attach a different PDF than the company got")
+    stage_recipient(
+        conn, campaign=camp.name, recipient=r["to"], persona=camp.persona, cadence=camp.cadence,
+        subject=r["subject"], body=r["body"], stage_bodies=[f["body"] for f in r["followups"]],
+        attachment_path=snapshot, attachment_name=camp.attachment_name, latex_enabled=False,
+        company=lead["company"], role=values.get("role_catted", lead["role"]),
+        name=values.get(camp.name_field, "") if camp.name_field else "",
+        archive_dir=archive.archive_dir_from_env(), field_values=values, workdir_root=workdir_root,
+        extra_meta={"lead_id": lead["lead_id"], "resume": r["resume"]},
+    )
+    return {"status": "staged", "to": r["to"]}
 
 
 def _sha256(path: Path) -> str:

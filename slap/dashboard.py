@@ -2327,15 +2327,13 @@ def create_app(db_path: Path, global_config, consumer_domains: set, imap_config:
     return app
 
 
-# --- companies: leads + reach-outs per company (browser-extension era) -------
+# --- companies: leads + reach-outs per company ------------------------------
 
 _LEAD_NODE = {
     "captured": ("Posting captured", "neutral"),
     "details": ("Campaign / contact set", "neutral"),
     "drafted": ("Claude wrote the drop", "neutral"),
     "applied": ("Applied", "good"),
-    "questions": ("Form questions sent to Claude", "neutral"),
-    "answered": ("Claude answered form questions", "neutral"),
 }
 
 

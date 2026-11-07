@@ -57,12 +57,11 @@ send_tags:
 # references_dir: ~/path/to/reference-files
 
 
-# Optional — application-form profile for the browser extension. It fills
-# standard fields from this, always after you review every value. It never
-# fills passwords, payment or government-ID fields, or EEO self-identification
-# questions; you answer those yourself.
+# Optional — your standard application answers. Claude reads them (MCP
+# slap_profile) when you paste an application form's questions. It never answers
+# self-identification, salary, legal or ID questions; you answer those yourself.
 profile:
-  # Matched to form labels by name (first name, email, current company, ...).
+  # Free-form facts; name them however reads clearly.
   fields:
     first_name: Ada
     last_name: Lovelace
@@ -76,11 +75,10 @@ profile:
     current_title: Software Engineer
     work_authorization: "Yes"     # "Are you legally authorized to work in ...?"
     sponsorship: "No"             # "Will you now or in the future require sponsorship?"
-    resume_filename: Ada_Lovelace_Resume.pdf   # name the uploaded résumé gets (default: <tag>.pdf)
 
-  # Answer bank: `match` is a case-insensitive regex tested against the question's
-  # label. First match wins. Claude Code can generate these from star.json; keep
-  # every claim inside what star.json supports.
+  # Answer bank: `match` is a case-insensitive regex naming the questions an answer
+  # is for. Answers you save through Claude (slap_save_answer) go to answers.yaml
+  # next to this file; these win over those. Keep every claim inside star.json.
   answers:
     - match: "notice period|earliest start|when can you start"
       answer: "Two weeks from offer."

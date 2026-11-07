@@ -1,15 +1,13 @@
-"""Captured job postings: browser extension -> slap -> Claude Code (MCP).
+"""Job postings the owner works through in Claude Code (slap_mcp).
 
 Event-sourced like everything else: one recipientless `lead` event per step,
 keyed by meta["lead_id"] (derived from the posting URL), meta["stage"] in
 STAGES. A lead's current state is a fold of its events, never stored apart.
 
-    captured   the extension captured the posting (JD, role, company, URL),
-               optionally with the details below
-    details    campaign, résumé, contact email/name (from the panel; latest wins)
+    captured   the posting (JD, role, company, URL), optionally with the
+               details below
+    details    campaign, résumé, contact email/name (the owner's picks; latest wins)
     drafted    the drop: campaign field values Claude wrote for this lead
-    questions  form questions the extension couldn't fill (latest set wins)
-    answered   Claude's answers to those questions
     applied    the owner applied; this is what lets the reach-out stage
                (slap.outreach)
 
@@ -25,10 +23,10 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from slap.tracking import append_event
 
 # A step of a posting (apply form, confirmation) folds into the posting's own
-# URL. Keep in sync with extension/lib.js STEP.
+# URL, so pasting either one finds the same lead.
 _STEP = re.compile(r"^(/.*[^/].*?)/(apply|application|confirmation|thanks|thank-you|submitted|success)(/.*)?$", re.I)
 
-STAGES = ("captured", "details", "drafted", "questions", "answered", "applied")
+STAGES = ("captured", "details", "drafted", "applied")
 DETAIL_KEYS = ("campaign", "resume", "contact_email", "contact_name")
 
 
@@ -67,13 +65,13 @@ def lead_events(conn, lead_id: str) -> list:
 def _fold(lead_id: str, events: list, staged_to: list) -> dict:
     lead = {"lead_id": lead_id, "stage": None, "url": "", "jd": "", "company": "", "role": "",
             "captured_at": None, **{k: "" for k in DETAIL_KEYS}, "drop": {}, "drop_at": None,
-            "questions": [], "answers": {}, "applied_resume": None, "applied_sha256": None,
+            "applied_resume": None, "applied_sha256": None,
             "applied_at": None, "staged_to": staged_to, "last_activity": None}
     for e in events:
         stage = e["stage"]
         lead["last_activity"] = e["timestamp"]
         if stage == "applied" or (stage == "captured" and lead["stage"] != "applied"):
-            lead["stage"] = stage  # the lifecycle the panel shows; capturing after applying keeps "applied"
+            lead["stage"] = stage  # the lifecycle; capturing after applying keeps "applied"
         if stage == "captured":
             lead.update(url=e["url"], jd=e["jd"], company=e.get("company", ""), role=e.get("role", ""),
                         captured_at=e["timestamp"])
@@ -81,15 +79,9 @@ def _fold(lead_id: str, events: list, staged_to: list) -> dict:
             lead.update({k: e[k] for k in DETAIL_KEYS if e.get(k)})
         elif stage == "drafted":
             lead.update(drop=e["fields"], drop_at=e["timestamp"])
-        elif stage == "questions":
-            lead["questions"] = e["questions"]
-            lead["url"] = lead["url"] or e["url"]
-        elif stage == "answered":
-            lead["answers"].update(e["answers"])
         elif stage == "applied":
             lead.update(applied_resume=e["resume"], applied_sha256=e.get("resume_sha256"),
                         applied_at=e["timestamp"])
-            lead["url"] = lead["url"] or e["url"]
     return lead
 
 
@@ -122,18 +114,19 @@ def _clean_details(details: dict) -> dict:
     return clean
 
 
-def capture(conn, *, url: str, jd: str, company: str = "", role: str = "", **details) -> tuple[str, bool]:
-    """Record a posting (plus any details from the panel). Idempotent per URL:
-    a re-capture appends nothing, though new details are recorded. The caller
-    validates campaign/résumé names. Returns (lead_id, created)."""
-    if not (jd or "").strip():
-        raise LeadError("jd is empty — capture the posting page, not the form")
+def capture(conn, *, url: str, jd: str = "", company: str = "", role: str = "", **details) -> tuple[str, bool]:
+    """Record a posting (plus any details the owner gave). Idempotent per URL:
+    a re-capture appends nothing, though new details are recorded, so the JD
+    is only needed the first time. The caller validates campaign/résumé
+    names. Returns (lead_id, created)."""
     clean = _clean_details(details)
     lead_id = lead_id_for(url)
     if any(e["stage"] == "captured" for e in lead_events(conn, lead_id)):
         if clean:
             set_details(conn, lead_id, **clean)
         return lead_id, False
+    if not (jd or "").strip():
+        raise LeadError("jd is empty — pass the posting's description text")
     append_event(conn, type="lead", meta={"lead_id": lead_id, "stage": "captured", "url": normalize_url(url),
                                           "jd": jd.strip(), "company": company.strip(), "role": role.strip(),
                                           **clean})
@@ -165,23 +158,27 @@ def save_drop(conn, lead_id: str, fields: dict) -> None:
     append_event(conn, type="lead", meta={"lead_id": lead_id, "stage": "drafted", "fields": fields})
 
 
-def mark_applied(conn, *, url: str, resume: str, resume_sha256: str = None) -> str:
-    """Record that the owner submitted an application with `resume` (a
+def mark_applied(conn, lead_id: str, *, resume: str, resume_sha256: str = None) -> None:
+    """Record that the owner submitted this application with `resume` (a
     send_tag; the caller validates it). `resume_sha256` pins the PDF bytes.
-    Works for a never-captured posting too (apply-first). Re-marking with the
-    same résumé appends nothing. Returns the lead_id."""
+    Re-marking with the same résumé appends nothing; the same résumé with
+    different bytes is refused, since the company has the earlier PDF."""
     if not (resume or "").strip():
         raise LeadError("resume is empty — record which résumé was actually uploaded")
-    lead_id = lead_id_for(url)
     lead = get(conn, lead_id)
-    if lead and lead["applied_resume"] == resume.strip() and lead["applied_sha256"] == resume_sha256:
-        return lead_id
-    if lead and lead["staged_to"]:
+    if lead is None or not lead["captured_at"]:
+        raise LeadError(f"unknown lead {lead_id!r} — capture the posting first")
+    if lead["applied_resume"] == resume.strip():
+        if lead["applied_sha256"] == resume_sha256:
+            return
+        if lead["applied_sha256"]:
+            raise LeadError(f"résumé '{resume.strip()}' changed since you applied with it, and the company has "
+                            f"the earlier PDF; restore that file, or record the résumé you actually uploaded")
+    if lead["staged_to"]:
         raise LeadError(f"the reach-out is already staged with résumé '{lead['applied_resume']}'; "
                         f"it can't switch to '{resume.strip()}' now")
-    append_event(conn, type="lead", meta={"lead_id": lead_id, "stage": "applied", "url": normalize_url(url),
+    append_event(conn, type="lead", meta={"lead_id": lead_id, "stage": "applied",
                                           "resume": resume.strip(), "resume_sha256": resume_sha256})
-    return lead_id
 
 
 def current(conn) -> str | None:
@@ -189,42 +186,6 @@ def current(conn) -> str | None:
     row = conn.execute("SELECT json_extract(meta, '$.lead_id') FROM events WHERE type = 'lead' "
                        "ORDER BY id DESC LIMIT 1").fetchone()
     return row[0] if row else None
-
-
-def record_questions(conn, *, url: str, questions: list) -> str:
-    """Form questions the extension couldn't fill from the profile/answer bank,
-    queued for Claude Code (slap_application). Each: {label, kind, options?}.
-    The latest set replaces earlier ones. Returns the lead_id."""
-    if not isinstance(questions, list) or not questions:
-        raise LeadError("questions must be a non-empty list")
-    clean = []
-    for q in questions:
-        label = (q.get("label") if isinstance(q, dict) else "") or ""
-        if not label.strip():
-            raise LeadError(f"each question needs a label — got {q!r}")
-        options = q.get("options") or []
-        if not isinstance(options, list) or not all(isinstance(o, str) for o in options):
-            raise LeadError(f"question {label!r}: options must be a list of strings")
-        clean.append({"label": label.strip(), "kind": str(q.get("kind") or "text"), "options": options})
-    lead_id = lead_id_for(url)
-    append_event(conn, type="lead", meta={"lead_id": lead_id, "stage": "questions",
-                                          "url": normalize_url(url), "questions": clean})
-    return lead_id
-
-
-def answer_questions(conn, lead_id: str, answers: dict) -> None:
-    """Claude's answers, keyed by question label exactly as queued. Unknown
-    labels are refused so a typo can't silently never fill."""
-    lead = get(conn, lead_id)
-    if lead is None:
-        raise LeadError(f"unknown lead {lead_id!r}")
-    asked = {q["label"] for q in lead["questions"]}
-    unknown = sorted(set(answers) - asked)
-    if unknown:
-        raise LeadError(f"not among this lead's queued questions: {unknown} (asked: {sorted(asked)})")
-    if not all(isinstance(v, str) and v.strip() for v in answers.values()):
-        raise LeadError("every answer must be a non-empty string")
-    append_event(conn, type="lead", meta={"lead_id": lead_id, "stage": "answered", "answers": answers})
 
 
 def all_leads(conn) -> list:

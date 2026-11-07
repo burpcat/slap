@@ -74,7 +74,7 @@ export default function Companies() {
           />
           <div className={styles.roster}>
             {rows.length === 0 ? (
-              <p className={styles.empty}>No companies yet. Capture a posting with the extension.</p>
+              <p className={styles.empty}>No companies yet. Capture a posting in Claude Code (slap_capture).</p>
             ) : (
               rows.map((c) => (
                 <button
