@@ -660,111 +660,29 @@ def test_api_home_companies_include_all_companies_roster(app):
     assert isinstance(companies["all_companies"], list)
 
 
-# --- leads / check / résumé file (browser extension routes) ------------------
-
-def test_api_lead_capture_lookup_and_applied(app):
-    c = app.test_client()
-    url = "https://jobs.lever.co/acme/abc"
-    resp = c.post("/api/leads", json={"url": url, "jd": "Build agents", "company": "Acme", "role": "ml eng"})
-    assert resp.status_code == 201 and resp.get_json()["created"] is True
-    assert c.post("/api/leads", json={"url": url, "jd": "Build agents"}).status_code == 200  # idempotent
-    assert c.get("/api/leads", query_string={"url": url}).get_json()["company"] == "Acme"
-    assert c.get("/api/leads", query_string={"url": "https://jobs.lever.co/other"}).status_code == 404
-    assert c.post("/api/leads/applied", json={"url": url, "resume": "ai-eng"}).status_code == 400  # not a send_tag
-    assert c.post("/api/leads", json={"url": "ftp://x", "jd": "j"}).status_code == 400
-
-
-def test_api_check_combines_recipient_company_and_lead(app):
-    conn = connect(app.db_path)
-    seed_sent_recipient(conn, recipient="jane@acme.com", company="Acme")
-    c = app.test_client()
-    body = c.get("/api/check", query_string={"email": "jane@acme.com", "company": "acme",
-                                             "url": "https://x.com/jobs/1"}).get_json()
-    assert body["recipient"]["hard"]["recipient"] == "jane@acme.com"
-    assert [x["recipient"] for x in body["company_contacts"]] == ["jane@acme.com"]
-    assert body["lead"] is None
-
-
-def test_api_resume_file_serves_send_tag_and_404s_unknown(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "docs").mkdir()
-    (tmp_path / "docs" / "ai.pdf").write_bytes(b"%PDF-1.4 ai")
-    cfg = make_global_config()
-    cfg.docs_dir, cfg.send_tags = tmp_path / "docs", {"ai": "ai.pdf", "gone": "gone.pdf"}
-    db_path = tmp_path / "test.db"
-    connect(db_path).close()
-    c = create_app(db_path, cfg, consumer_domains=set(), imap_config="fake-imap",
-                   redis_client=FakeRedis()).test_client()
-    resp = c.get("/api/resumes/ai")
-    assert resp.status_code == 200 and resp.data == b"%PDF-1.4 ai" and resp.mimetype == "application/pdf"
-    assert c.get("/api/resumes/nope").status_code == 404
-    assert c.get("/api/resumes/gone").status_code == 404  # tag defined, file missing
-    assert c.get("/api/resumes").get_json() == {"resumes": [{"tag": "ai", "file": "ai.pdf"},
-                                                            {"tag": "gone", "file": "gone.pdf"}]}
-
-
 # --- local-only request guard (DNS rebinding + cross-site posts) --------------
 
-EXT = "a" * 32
-
-
-@pytest.mark.parametrize("host,origin,ext,blocked", [
-    ("127.0.0.1:5050", None, None, False),                       # curl / MCP / same-origin GET
-    ("localhost:5050", "http://localhost:5173", None, False),    # Vite dev server
-    ("[::1]:5050", "http://[::1]:5050", None, False),
-    ("evil.example:5050", None, None, True),                     # DNS rebinding
-    ("127.0.0.1:5050", "https://evil.example", None, True),      # cross-site post from a tab
-    ("127.0.0.1:5050", "null", None, True),                      # sandboxed iframe / file://
-    ("127.0.0.1:5050", f"chrome-extension://{EXT}", EXT, False), # our extension
-    ("127.0.0.1:5050", f"chrome-extension://{'b' * 32}", EXT, True),  # someone else's
-    ("127.0.0.1:5050", f"chrome-extension://{EXT}", None, True),      # unpinned -> refused
+@pytest.mark.parametrize("host,origin,blocked", [
+    ("127.0.0.1:5050", None, False),                       # curl / same-origin GET
+    ("localhost:5050", "http://localhost:5173", False),    # Vite dev server
+    ("[::1]:5050", "http://[::1]:5050", False),
+    ("evil.example:5050", None, True),                     # DNS rebinding
+    ("127.0.0.1:5050", "https://evil.example", True),      # cross-site post from a tab
+    ("127.0.0.1:5050", "null", True),                      # sandboxed iframe / file://
+    ("127.0.0.1:5050", "chrome-extension://" + "a" * 32, True),  # no extension is trusted
 ])
-def test_request_block_reason(host, origin, ext, blocked):
+def test_request_block_reason(host, origin, blocked):
     from slap.api import request_block_reason
-    assert (request_block_reason(host, origin, ext) is not None) is blocked
+    assert (request_block_reason(host, origin) is not None) is blocked
 
 
 def test_guard_refuses_cross_site_write_before_it_runs(app):
     c = app.test_client()
-    resp = c.post("/api/leads", json={"url": "https://x.com/j/1", "jd": "J"},
-                  headers={"Origin": "https://evil.example"})
+    resp = c.post("/api/reachouts/jane@acme.com/stop", headers={"Origin": "https://evil.example"})
     assert resp.status_code == 403
-    assert connect(app.db_path).execute("SELECT COUNT(*) FROM events WHERE type='lead'").fetchone()[0] == 0
-    assert c.get("/api/check", headers={"Host": "evil.example"}).status_code == 403
-    assert c.get("/api/check").status_code == 200
-
-
-def test_api_applied_pins_resume_sha(tmp_path, monkeypatch):
-    import hashlib
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "docs").mkdir()
-    (tmp_path / "docs" / "ai.pdf").write_bytes(b"%PDF-1.4 ai")
-    cfg = make_global_config()
-    cfg.docs_dir, cfg.send_tags = tmp_path / "docs", {"ai": "ai.pdf"}
-    db_path = tmp_path / "test.db"
-    connect(db_path).close()
-    c = create_app(db_path, cfg, consumer_domains=set(), imap_config="fake-imap",
-                   redis_client=FakeRedis()).test_client()
-    url = "https://jobs.lever.co/acme/abc"
-    assert c.post("/api/leads/applied", json={"url": url, "resume": "ai"}).status_code == 200
-    lead = c.get("/api/leads", query_string={"url": url}).get_json()
-    assert lead["applied_resume"] == "ai"
-    assert lead["applied_sha256"] == hashlib.sha256(b"%PDF-1.4 ai").hexdigest()
-
-
-def test_api_questions_and_profile(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    cfg = make_global_config()
-    db_path = tmp_path / "test.db"
-    connect(db_path).close()
-    c = create_app(db_path, cfg, consumer_domains=set(), imap_config="fake-imap", redis_client=FakeRedis()).test_client()
-    url = "https://jobs.lever.co/acme/q1"
-    assert c.get("/api/profile").status_code == 500  # no profile section yet: fail loud
-    cfg.profile = {"fields": {"first_name": "Ada"}, "answers": []}
-    assert c.get("/api/profile").get_json()["fields"] == {"first_name": "Ada"}
-    assert c.post("/api/leads/questions", json={"url": url, "questions": []}).status_code == 400
-    assert c.post("/api/leads/questions", json={"url": url, "questions": [{"label": "Why us?"}]}).status_code == 200
-    assert c.get("/api/leads", query_string={"url": url}).get_json()["questions"][0]["label"] == "Why us?"
+    assert connect(app.db_path).execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+    assert c.get("/api/companies", headers={"Host": "evil.example"}).status_code == 403
+    assert c.get("/api/companies").status_code == 200
 
 
 def test_api_companies_index_and_timeline(app):
@@ -794,64 +712,3 @@ def test_api_companies_index_and_timeline(app):
     assert [k for k, _ in kinds[2:]] == ["email"] * (len(kinds) - 2)
     assert all(n["recipient"] == "jane@acme.com" for n in body["timeline"][2:])
     assert c.get("/api/companies/nobody").status_code == 404
-
-
-def test_api_extension_flow_capture_details_applied(tmp_path, monkeypatch):
-    from slap import leads
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("GMAIL_APP_PASSWORD", "x")
-    (tmp_path / "docs").mkdir()
-    (tmp_path / "docs" / "a.pdf").write_bytes(b"%PDF-1.4 a")
-    (tmp_path / "consumer_domains.txt").write_text("gmail.com\n")
-    camp = tmp_path / "campaigns" / "hm"
-    camp.mkdir(parents=True)
-    (camp / "campaign.yaml").write_text(
-        "persona: hiring_manager\ncadence: [2]\nlatex: {enabled: false, attachment_name: R.pdf}\nname_field: name\n"
-        "fields:\n  - {key: email, label: Email}\n  - {key: company, label: Company}\n"
-        "  - {key: name, label: Name}\n  - {key: why_line, label: Why}\n")
-    (camp / "initial.txt").write_text("Subject: Hi {{company}}\n\nHi {{name}}, {{why_line}}\n")
-    (camp / "stage1.txt").write_text("Bump\n")
-    cfg = make_global_config()
-    cfg.docs_dir, cfg.send_tags = tmp_path / "docs", {"a": "a.pdf"}
-    db_path = tmp_path / "test.db"
-    connect(db_path).close()
-    c = create_app(db_path, cfg, consumer_domains={"gmail.com"}, imap_config="fake-imap",
-                   redis_client=FakeRedis()).test_client()
-    url = "https://jobs.lever.co/acme/7"
-
-    assert c.get("/api/campaign-options").get_json()["campaigns"] == [
-        {"name": "hm", "persona": "hiring_manager", "resumes": ["a"]}]
-    assert c.post("/api/leads", json={"url": url, "jd": "JD", "company": "Acme", "campaign": "nope"}).status_code == 400
-    assert c.post("/api/leads", json={"url": url, "jd": "JD", "company": "Acme", "campaign": "hm",
-                                      "resume": "a"}).status_code == 201
-    assert c.post("/api/leads/details", json={"url": url, "contact_email": "sam@acme.com",
-                                              "contact_name": "Sam"}).status_code == 200
-    body = c.get("/api/check", query_string={"url": url, "company": "Acme"}).get_json()
-    assert body["email"]["subject"] == "Hi Acme" and body["email"]["missing"] == ["why_line"]
-
-    # Applied before the drop: recorded, not staged yet
-    out = c.post("/api/leads/applied", json={"url": url, "resume": "a"}).get_json()
-    assert out["outreach"] == {"status": "incomplete", "missing": ["why_line"]}
-    conn = connect(db_path)
-    leads.save_drop(conn, out["lead_id"], {"why_line": "agents."})
-    out = c.post("/api/leads/applied", json={"url": url, "resume": "a"}).get_json()
-    assert out["outreach"] == {"status": "staged", "to": "sam@acme.com"}
-    assert conn.execute("SELECT COUNT(*) FROM events WHERE type='queued'").fetchone()[0] == 1
-
-
-def test_api_save_answer_takes_effect_without_restart(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "config.yaml").write_text(
-        "sender: {from_email: a@gmail.com, from_name: A}\nsignature: A\npersonas: {recruiter: {stages: [2]}}\n"
-        "schedule: {fire_window_start: '09:00', fire_window_end: '09:15', send_delay_min: 1, send_delay_max: 1,\n"
-        "  daily_cap: 5, drain_retries: 0, active_days: [mon]}\ntracking: {consumer_domains_file: c.txt}\n"
-        "profile: {fields: {first_name: Ada}}\n")
-    from slap.config import load_global_config
-    cfg = load_global_config(tmp_path / "config.yaml")
-    db_path = tmp_path / "test.db"
-    connect(db_path).close()
-    c = create_app(db_path, cfg, consumer_domains=set(), imap_config="fake-imap", redis_client=FakeRedis()).test_client()
-    assert c.post("/api/answers", json={"match": "notice period", "answer": " "}).status_code == 400
-    assert c.post("/api/answers", json={"match": "notice period", "answer": "Two weeks."}).status_code == 200
-    assert c.get("/api/profile").get_json()["answers"] == [{"match": "notice\\ period", "answer": "Two weeks."}]
-    assert (tmp_path / "answers.yaml").exists()

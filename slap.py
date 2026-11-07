@@ -753,8 +753,6 @@ def cmd_plist(args):
         sys.exit(1)
     if args.job == "sync":
         print(launchd.render_sync_plist(Path.cwd(), sys.executable), end="")
-    elif args.job == "dashboard":
-        print(launchd.render_dashboard_plist(Path.cwd(), sys.executable), end="")
     else:
         print(launchd.render_plist(global_config, Path.cwd(), sys.executable), end="")
 
@@ -1269,9 +1267,9 @@ def build_parser():
     ).set_defaults(func=cmd_sync)
 
     p_plist = sub.add_parser(
-        "plist", help="Print the launchd .plist for the unattended runner (or --job sync/dashboard), see LAUNCHD.md"
+        "plist", help="Print the launchd .plist for the unattended runner (or --job sync), see LAUNCHD.md"
     )
-    p_plist.add_argument("--job", choices=["runner", "sync", "dashboard"], default="runner",
+    p_plist.add_argument("--job", choices=["runner", "sync"], default="runner",
                           help="Which job's plist to print (default: runner)")
     p_plist.set_defaults(func=cmd_plist)
 

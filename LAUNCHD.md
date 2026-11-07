@@ -82,21 +82,6 @@ the dashboard's on-open fallback still works without this job ever running at al
 by polling GMass live whenever the cache turns out to be stale — this job only exists to
 make that the *uncommon* case instead of the *every* case.
 
-## The always-on dashboard (browser extension)
-
-The Chrome extension (`extension/`) posts captured postings and applications to the
-dashboard's local API, so the dashboard must be running whenever you browse jobs. This job
-starts it at login and restarts it if it exits:
-
-```
-python slap.py plist --job dashboard > ~/Library/LaunchAgents/com.slap.dashboard.plist
-launchctl load ~/Library/LaunchAgents/com.slap.dashboard.plist
-```
-
-Logs land at `dashboard.log`/`dashboard.err.log`. `slap.py dashboard` fails loud on a
-missing `GMAIL_APP_PASSWORD` or an unbuilt frontend bundle; launchd then keeps retrying
-(about every 10s), so check `dashboard.err.log` if the extension says slap isn't reachable.
-
 ## How the timing works
 
 - Each `StartCalendarInterval` array entry fires at a **fixed anchor time** (the

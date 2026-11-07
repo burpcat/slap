@@ -21,7 +21,6 @@ __pycache__/
 # is missing (same convention as requiring .env/config.yaml first), so it's
 # rebuilt via `npm --prefix slap/frontend run build`.
 slap/frontend/node_modules/
-tests/extension/node_modules/
 slap/static/dist/
 
 # probe outputs (raw captures are auditable but not committed)
@@ -44,8 +43,6 @@ runner.log
 runner.err.log
 sync.log
 sync.err.log
-dashboard.log
-dashboard.err.log
 
 # local marketing/screenshot mockups — real campaign names, never committed
 marketing_dashboard_sample.html

@@ -42,41 +42,37 @@ changes zero existing template output.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib.util
 import re
 from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from flask import jsonify, request, send_file
+from flask import jsonify, request
 from flask.json.provider import DefaultJSONProvider
 
-from slap import archive, gmass_cache, leads, outreach, tracking, ui_state
+from slap import archive, gmass_cache, tracking, ui_state
 from slap.color import campaign_colors
-from slap.config import ConfigError, discover_campaigns, load_campaign, load_global_config
-from slap.domains import check_recipient, contacts_at_company
+from slap.config import discover_campaigns
+from slap.domains import check_recipient
 from slap.followups import FollowupError, discover_followups, load_followup, save_followup
-from slap.profile import LEARNED_FILE, ProfileError, save_learned
 from slap.queue import QueueError, resend_bounced
 
 LOCAL_HOSTNAMES = {"127.0.0.1", "localhost", "::1"}
 
 
-def request_block_reason(host: str, origin: str | None, extension_id: str | None) -> str | None:
+def request_block_reason(host: str, origin: str | None) -> str | None:
     """Why a request to the local API must be refused, or None if allowed.
     Host must be localhost (defeats DNS rebinding). An Origin, which browsers
-    send on every cross-site request, must be a localhost page or the pinned
-    extension (defeats cross-site form/fetch posts from any open tab).
-    No Origin (curl, the MCP server, same-origin GETs) is fine."""
+    send on every cross-site request, must be a localhost page (defeats
+    cross-site form/fetch posts from any open tab). No Origin (curl,
+    same-origin GETs) is fine."""
     if urlsplit("//" + (host or "")).hostname not in LOCAL_HOSTNAMES:
         return f"host {host!r} is not localhost"
     if origin is None:
         return None
     parts = urlsplit(origin)
     if parts.scheme in ("http", "https") and parts.hostname in LOCAL_HOSTNAMES:
-        return None
-    if extension_id and origin == f"chrome-extension://{extension_id}":
         return None
     return f"origin {origin!r} is not allowed"
 
@@ -303,7 +299,7 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, ima
 
     @app.before_request
     def _local_only():
-        reason = request_block_reason(request.host, request.headers.get("Origin"), global_config.extension_id)
+        reason = request_block_reason(request.host, request.headers.get("Origin"))
         if reason:
             return jsonify({"error": f"refused: {reason}"}), 403
 
@@ -670,170 +666,3 @@ def register_api(app, *, get_conn, db_path, global_config, consumer_domains, ima
             return jsonify({"ok": False, "reason": "redis_unavailable"})
         dashboard._spawn_background_refresh(db_path, imap_config, consumer_domains, redis_client)
         return jsonify({"ok": True})
-
-    # --- leads: browser extension -> slap (slap.leads) -------------------
-
-    def _details(data) -> dict:
-        """Campaign / résumé / contact from the panel, with names checked
-        against the real campaigns and send_tags (LeadError on a bad one)."""
-        details = {k: data[k] for k in leads.DETAIL_KEYS if data.get(k)}
-        if details.get("campaign") and details["campaign"] not in discover_campaigns():
-            raise leads.LeadError(f"unknown campaign {details['campaign']!r}")
-        if details.get("campaign"):
-            try:
-                camp = load_campaign(details["campaign"], global_config)
-            except ConfigError as e:
-                raise leads.LeadError(str(e)) from e
-            if details.get("resume") and details["resume"] not in camp.resume_paths:
-                raise leads.LeadError(f"campaign '{camp.name}' doesn't offer résumé '{details['resume']}' "
-                                      f"(offers: {list(camp.resume_paths)})")
-        elif details.get("resume") and details["resume"] not in global_config.send_tags:
-            raise leads.LeadError(f"unknown résumé tag {details['resume']!r}")
-        return details
-
-    @app.route("/api/campaign-options")
-    def api_campaign_options():
-        # The panel's campaign + résumé pickers: static-résumé campaigns only.
-        options, errors = [], []
-        for name in discover_campaigns():
-            try:
-                camp = load_campaign(name, global_config)
-            except ConfigError as e:
-                errors.append({"campaign": name, "error": str(e)})
-                continue
-            if not camp.latex_enabled:
-                options.append({"name": name, "persona": camp.persona, "resumes": list(camp.resume_paths)})
-        return jsonify({"campaigns": options, "errors": errors})
-
-    @app.route("/api/leads", methods=["POST"])
-    def api_lead_capture():
-        data = request.get_json(silent=True) or {}
-        try:
-            lead_id, created = leads.capture(get_conn(), url=data.get("url", ""), jd=data.get("jd", ""),
-                                             company=data.get("company", ""), role=data.get("role", ""),
-                                             **_details(data))
-        except leads.LeadError as e:
-            return jsonify({"error": str(e)}), 400
-        return jsonify({"lead_id": lead_id, "created": created}), 201 if created else 200
-
-    @app.route("/api/leads/details", methods=["POST"])
-    def api_lead_details():
-        data = request.get_json(silent=True) or {}
-        conn = get_conn()
-        try:
-            lead_id = leads.lead_id_for(data.get("url", ""))
-            leads.set_details(conn, lead_id, **_details(data))
-        except leads.LeadError as e:
-            return jsonify({"error": str(e)}), 400
-        return jsonify({"lead_id": lead_id})
-
-    @app.route("/api/leads")
-    def api_lead_by_url():
-        try:
-            lead = leads.by_url(get_conn(), request.args.get("url", ""))
-        except leads.LeadError as e:
-            return jsonify({"error": str(e)}), 400
-        if lead is None:
-            return jsonify({"error": "no lead for this url"}), 404
-        return jsonify(lead)
-
-    @app.route("/api/leads/applied", methods=["POST"])
-    def api_lead_applied():
-        data = request.get_json(silent=True) or {}
-        tag = data.get("resume", "")
-        if tag not in global_config.send_tags:
-            return jsonify({"error": f"unknown résumé tag {tag!r}", "known": sorted(global_config.send_tags)}), 400
-        path = Path(global_config.docs_dir) / global_config.send_tags[tag]
-        if not path.is_file():
-            return jsonify({"error": f"{path} not found"}), 400
-        conn = get_conn()
-        try:
-            lead_id = leads.mark_applied(conn, url=data.get("url", ""), resume=tag,
-                                         resume_sha256=hashlib.sha256(path.read_bytes()).hexdigest())
-            # Applying is what lets the reach-out go: stage it now if the drop and
-            # contact are ready (otherwise saving the drop later stages it).
-            result = outreach.stage(conn, global_config, lead_id,
-                                    acknowledge_warnings=bool(data.get("acknowledge_warnings")))
-        except leads.LeadError as e:
-            return jsonify({"error": str(e)}), 400
-        except outreach.OutreachError as e:
-            return jsonify({"error": str(e)}), 409
-        return jsonify({"lead_id": lead_id, "outreach": result})
-
-    @app.route("/api/leads/questions", methods=["POST"])
-    def api_lead_questions():
-        data = request.get_json(silent=True) or {}
-        try:
-            lead_id = leads.record_questions(get_conn(), url=data.get("url", ""), questions=data.get("questions"))
-        except leads.LeadError as e:
-            return jsonify({"error": str(e)}), 400
-        return jsonify({"lead_id": lead_id})
-
-    @app.route("/api/answers", methods=["POST"])
-    def api_save_answer():
-        # "Save to bank" from the panel: persist to answers.yaml and take effect
-        # now (no dashboard restart). Config.yaml's own answers keep priority.
-        data = request.get_json(silent=True) or {}
-        try:
-            entry = save_learned(Path(global_config.path).parent / LEARNED_FILE,
-                                 data.get("match", ""), data.get("answer", ""))
-        except ProfileError as e:
-            return jsonify({"error": str(e)}), 400
-        try:  # re-read exactly as startup does: config.yaml answers first, then answers.yaml
-            global_config.profile = load_global_config(global_config.path).profile
-        except ConfigError as e:
-            return jsonify({"error": f"saved, but {global_config.path} no longer loads: {e}"}), 500
-        return jsonify({"saved": entry})
-
-    @app.route("/api/profile")
-    def api_profile():
-        if not global_config.profile["fields"]:
-            return jsonify({"error": f"no profile fields — add a `profile:` section to {global_config.path} "
-                                     f"(see config.yaml.example)"}), 500
-        return jsonify(global_config.profile)
-
-    @app.route("/api/check")
-    def api_check():
-        # One call backs the on-page badge: exact-recipient + same-domain warns
-        # (when an email is known), same-company contacts (when only the company
-        # is), and this posting's lead state + its email preview. Warn-only.
-        conn = get_conn()
-        email, company, url = (request.args.get(k, "").strip() for k in ("email", "company", "url"))
-        out = {"recipient": None, "company_contacts": [], "lead": None, "email": None, "email_warnings": []}
-        if email:
-            dedup = check_recipient(conn, email, consumer_domains)
-            out["recipient"] = {"hard": dedup.hard_warning,
-                                "soft_domain": dedup.soft_warning_domain,
-                                "soft": dedup.soft_warning_contacts or []}
-        if company:
-            out["company_contacts"] = contacts_at_company(conn, company)
-        if url:
-            try:
-                out["lead"] = leads.by_url(conn, url)
-            except leads.LeadError as e:
-                return jsonify({"error": str(e)}), 400
-            lead = out["lead"]
-            if lead and lead["campaign"]:  # the reach-out as it would be staged right now
-                try:
-                    out["email"] = outreach.public(outreach.render(lead, global_config))
-                    if lead["contact_email"] and not lead["staged_to"]:
-                        out["email_warnings"] = outreach.dedup_warnings(conn, global_config, lead["contact_email"])
-                except outreach.OutreachError as e:
-                    out["email"] = {"error": str(e)}
-        return jsonify(out)
-
-    @app.route("/api/resumes")
-    def api_resumes():
-        return jsonify({"resumes": [{"tag": t, "file": f} for t, f in global_config.send_tags.items()]})
-
-    @app.route("/api/resumes/<string:tag>")
-    def api_resume_file(tag):
-        # The one résumé store (docs_dir + send_tags) — the extension uploads
-        # exactly the file the email will attach.
-        filename = global_config.send_tags.get(tag)
-        if filename is None:
-            return jsonify({"error": f"unknown résumé tag {tag!r}", "known": sorted(global_config.send_tags)}), 404
-        path = (Path(global_config.docs_dir) / filename).resolve()
-        if not path.is_file():
-            return jsonify({"error": f"{path} not found"}), 404
-        return send_file(path, mimetype="application/pdf", download_name=filename)

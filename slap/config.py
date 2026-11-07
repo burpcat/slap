@@ -7,8 +7,6 @@ required files present with the right shape) — not external system state like
 """
 from __future__ import annotations
 
-import re
-
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -171,9 +169,6 @@ class GlobalConfig:
     # server serves to Claude. Optional: None -> slap_mcp's reference tools
     # fail loud when called; nothing else reads it.
     references_dir: Path | None = None
-    # Chrome extension ID allowed to call the local API (Origin
-    # chrome-extension://<id>). None -> no extension origin is accepted.
-    extension_id: str | None = None
     # Form-fill profile for the browser extension (slap.profile.parse_profile).
     profile: dict = field(default_factory=lambda: {"fields": {}, "answers": []})
 
@@ -342,11 +337,6 @@ def load_global_config(path: Path = CONFIG_PATH) -> GlobalConfig:
         raise ConfigError(f"{path}: 'references_dir' must be a non-empty string — got {references_dir_raw!r}")
     references_dir = Path(references_dir_raw).expanduser() if references_dir_raw else None
 
-    extension_id = raw.get("extension_id")
-    if extension_id is not None and not re.fullmatch(r"[a-p]{32}", str(extension_id)):
-        raise ConfigError(f"{path}: 'extension_id' must be a 32-letter Chrome extension ID (a-p) — "
-                          f"got {extension_id!r}")
-
     try:
         profile = parse_profile(raw.get("profile"), path)
         profile["answers"] += load_learned(Path(path).parent / LEARNED_FILE)  # config.yaml's own answers win
@@ -369,7 +359,6 @@ def load_global_config(path: Path = CONFIG_PATH) -> GlobalConfig:
         docs_dir=docs_dir,
         send_tags=send_tags,
         references_dir=references_dir,
-        extension_id=extension_id,
         profile=profile,
     )
 

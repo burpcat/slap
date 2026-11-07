@@ -598,16 +598,6 @@ def test_load_campaign_name_field_unknown_key_fails_loud(tmp_path):
         load_campaign("coldpost", global_config, campaigns_dir)
 
 
-def test_extension_id_optional_and_validated(tmp_path):
-    path = write_global_config(tmp_path)
-    assert load_global_config(path).extension_id is None
-    path.write_text(path.read_text() + "extension_id: " + "a" * 32 + "\n")
-    assert load_global_config(path).extension_id == "a" * 32
-    path.write_text(path.read_text().replace("a" * 32, "not-an-id"))
-    with pytest.raises(ConfigError, match="extension_id"):
-        load_global_config(path)
-
-
 def test_profile_section_parsed_and_validated(tmp_path):
     path = write_global_config(tmp_path)
     assert load_global_config(path).profile == {"fields": {}, "answers": []}

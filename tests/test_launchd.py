@@ -8,7 +8,7 @@ import plistlib
 import pytest
 
 from slap.config import GlobalConfig, ScheduleConfig
-from slap.launchd import LAUNCHD_WEEKDAY, LaunchdError, render_dashboard_plist, render_plist, render_sync_plist
+from slap.launchd import LAUNCHD_WEEKDAY, LaunchdError, render_plist, render_sync_plist
 
 
 def make_global_config(*, fire_window_start="09:00", active_days=None):
@@ -153,11 +153,3 @@ def test_render_sync_plist_and_render_plist_use_different_labels(tmp_path):
     sync_xml = render_sync_plist(tmp_path, "/usr/bin/python3")
     runner_xml = render_plist(make_global_config(), tmp_path, "/usr/bin/python3")
     assert plistlib.loads(sync_xml.encode())["Label"] != plistlib.loads(runner_xml.encode())["Label"]
-
-
-def test_render_dashboard_plist_keeps_dashboard_alive(tmp_path):
-    parsed = plistlib.loads(render_dashboard_plist(tmp_path, "/usr/bin/python3").encode())
-    assert parsed["Label"] == "com.slap.dashboard"
-    assert parsed["ProgramArguments"][-1] == "dashboard"
-    assert parsed["RunAtLoad"] is True and parsed["KeepAlive"] is True
-    assert "StartInterval" not in parsed and "StartCalendarInterval" not in parsed

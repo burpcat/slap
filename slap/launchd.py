@@ -134,39 +134,3 @@ def render_sync_plist(repo_root: Path, python_executable: str, *,
 </plist>
 """
 
-
-def render_dashboard_plist(repo_root: Path, python_executable: str, *,
-                            label: str = "com.slap.dashboard") -> str:
-    """Renders the launchd plist that keeps `slap.py dashboard` (the localhost
-    API the browser extension posts leads to) always running: started at
-    login (RunAtLoad) and restarted if it exits (KeepAlive)."""
-    repo_root = Path(repo_root).resolve()
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{label}</string>
-
-    <key>ProgramArguments</key>
-    <array>
-        <string>{python_executable}</string>
-        <string>{repo_root / "slap.py"}</string>
-        <string>dashboard</string>
-    </array>
-
-    <key>WorkingDirectory</key>
-    <string>{repo_root}</string>
-
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-
-    <key>StandardOutPath</key>
-    <string>{repo_root / "dashboard.log"}</string>
-    <key>StandardErrorPath</key>
-    <string>{repo_root / "dashboard.err.log"}</string>
-</dict>
-</plist>
-"""
