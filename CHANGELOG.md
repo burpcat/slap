@@ -1,55 +1,59 @@
 # Changelog
 
-## Unreleased — browser extension + Claude Code (MCP), one application at a time
+## Unreleased — Claude Code (MCP) front end, one application at a time
 
-Prep moves from pasting drops into `slap.py send` to a Chrome extension plus a
-narrow Claude Code role. The send engine (queue, runner, SMTP/IMAP,
-follow-ups, stop-on-reply) is unchanged.
+Prep moves from pasting drops into `slap.py send` to Claude Code driving slap
+through an MCP server, one application at a time. The send engine (queue,
+runner, SMTP/IMAP, follow-ups, stop-on-reply) is unchanged.
 
 ### The flow
 
-1. **Capture** (extension, on a posting): JD, role, company and URL, plus the
-   campaign, résumé and contact (email, name) you pick in the panel.
-2. **Apply** (extension, on the form): answers prepared from config.yaml's
-   `profile:` for review; **Fill checked**; leftovers go to Claude manually or
-   automatically (a per-browser switch).
-3. **Drop** (Claude Code + the `slap` skill): Claude writes the campaign's
+1. **Capture** (`slap_capture`): you paste a posting into Claude Code and name
+   the campaign, résumé and contact. Claude records the JD, role, company and
+   URL with them. Claude never picks these itself.
+2. **Drop** (`slap_save_drop`, the `slap` skill): Claude writes the campaign's
    field values for that one application.
-4. **Applied** (extension): records the résumé used and stages the reach-out
-   once it has a drop and a contact. Nothing is ever staged for a posting you
-   didn't apply to, and a posting is staged at most once.
+3. **Apply** (in your browser): paste the form's questions and Claude answers
+   them from your profile (`slap_profile`: config.yaml `profile:` plus
+   answers.yaml), the JD and star.json. `slap_save_answer` keeps a reusable answer.
+4. **Applied** (`slap_applied`): once you say you submitted, Claude records
+   the résumé you uploaded and stages the reach-out to the contact it names
+   (`to`), as long as it has a drop and a contact. It's the only tool that
+   stages. Nothing is ever staged for a posting you didn't apply to, and a
+   posting is staged at most once.
 
 ### Added
 
 - **`slap_mcp.py`** (stdio, `mcp` SDK 2.x), scoped to one application:
-  `slap_application`, `slap_save_drop`, `slap_answer_questions`,
-  `slap_stars`. Register with
+  `slap_capture`, `slap_application`, `slap_save_drop`, `slap_applied`,
+  `slap_profile`, `slap_save_answer`, `slap_stars`. Register with
   `claude mcp add --scope user slap -- <repo>/.venv/bin/python <repo>/slap_mcp.py`.
+  Keep `slap_applied` off the allowlist: its permission prompt, which names
+  the recipient, is your confirm.
 - **`skills/slap/SKILL.md`**: the workflow skill. Symlink it into `~/.claude/skills/slap`.
 - **Leads** (`slap/leads.py`): the recipientless `lead` event type,
-  `meta.stage` ∈ captured / details / drafted / questions / answered / applied.
-  The "current application" is the lead with the latest event.
+  `meta.stage` ∈ captured / details / drafted / applied. The "current
+  application" is the lead with the latest event.
 - **`slap/outreach.py`**: renders a lead's email from its campaign templates,
   and stages it only when the lead is applied, the drop is complete and a
-  contact is set. It's idempotent and file-locked across the dashboard and
-  MCP processes, and it refuses a résumé PDF edited since you applied.
-- **Local API routes**: `GET /api/campaign-options`, `POST/GET /api/leads`,
-  `POST /api/leads/details`, `POST /api/leads/applied` (stages),
-  `POST /api/leads/questions`, `GET /api/check` (badge + email preview),
-  `GET /api/resumes`, `GET /api/resumes/<tag>`, `GET /api/profile`,
-  `GET /api/companies`, `GET /api/companies/<name>`.
+  contact is set. It's idempotent and file-locked across MCP server processes,
+  and it refuses a résumé PDF edited since you applied, including when Applied
+  is recorded again.
 - **Local-only guard** on every dashboard route: a non-localhost `Host` (DNS
   rebinding) or a foreign `Origin` (cross-site posts from any open tab) gets 403.
-  The extension is allowed through `extension_id` in config.yaml.
-- **Chrome extension** (`extension/`): capture with details, an "already
-  contacted" badge, auto-prepared review-first form filling, résumé attach,
-  Ask Claude, email preview, and Applied. It ignores synthetic clicks from page
-  scripts, and never submits a form or fills sensitive/EEO fields.
 - **Companies dashboard page**: one timeline per company, merging leads and
-  reach-outs.
+  reach-outs (`GET /api/companies`, `GET /api/companies/<name>`).
 - **Config**: campaign field `hint:`; `resumes:` may be omitted (= all
-  `send_tags`); `references_dir` (star.json); `extension_id`; `profile:`.
-- **`slap.py plist --job dashboard`** keeps the API always on (see LAUNCHD.md).
+  `send_tags`); `references_dir` (star.json); `profile:`.
+
+### Removed
+
+- **The Chrome extension** that briefly fronted this flow (capture panel, form
+  autofill, résumé attach, Applied button), along with its local API routes
+  (`/api/leads*`, `/api/check`, `/api/resumes*`, `/api/profile`,
+  `/api/answers`, `/api/campaign-options`), the `extension_id` config key, and
+  `slap.py plist --job dashboard`. The MCP server writes to slap.db directly,
+  so the dashboard no longer has to stay running.
 
 ## Unreleased — Transport migration: GMass API → local Gmail SMTP + IMAP
 
